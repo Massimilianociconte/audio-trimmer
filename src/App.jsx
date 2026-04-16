@@ -384,11 +384,20 @@ export default function App() {
     let ffmpeg = null;
     const createdVirtualNames = [];
     let exportMode = 'multi-copy';
+    let outputExtension = audioFile.extension;
 
     try {
       ffmpeg = await ensureEngineReady();
       const segmentTimes = plan.cutPoints.map((value) => value.toFixed(3)).join(',');
-      const outputPattern = `${runPrefix}-%03d${audioFile.extension}`;
+      const outputPattern = `${runPrefix}-%03d${outputExtension}`;
+
+      async function cleanupExports() {
+        for (const virtualName of createdVirtualNames) {
+          await safeDelete(ffmpeg, virtualName);
+        }
+
+        createdVirtualNames.length = 0;
+      }
 
       const batchExitCode = await ffmpeg.exec([
         '-i',
@@ -408,7 +417,7 @@ export default function App() {
 
       if (batchExitCode === 0) {
         for (let index = 0; index < plan.segments.length; index += 1) {
-          createdVirtualNames.push(buildVirtualSegmentName(runPrefix, index, audioFile.extension));
+          createdVirtualNames.push(buildVirtualSegmentName(runPrefix, index, outputExtension));
         }
       } else {
         exportMode = 'single-copy';
@@ -419,8 +428,12 @@ export default function App() {
         setPhaseProgress(0.18);
 
         for (let index = 0; index < plan.segments.length; index += 1) {
+          await safeDelete(ffmpeg, buildVirtualSegmentName(runPrefix, index, outputExtension));
+        }
+
+        for (let index = 0; index < plan.segments.length; index += 1) {
           const segment = plan.segments[index];
-          const virtualName = buildVirtualSegmentName(runPrefix, index, audioFile.extension);
+          const virtualName = buildVirtualSegmentName(runPrefix, index, outputExtension);
           const segmentExitCode = await ffmpeg.exec([
             '-ss',
             formatFfmpegTime(segment.start),
@@ -440,9 +453,46 @@ export default function App() {
           ]);
 
           if (segmentExitCode !== 0) {
-            throw new Error(
-              'Non sono riuscito a tagliare questo file nel browser mantenendo il formato originale.',
+            await cleanupExports();
+            exportMode = 'lossless-flac';
+            outputExtension = '.flac';
+            setTechnicalLog(
+              'La copia diretta non è riuscita. Passo a un export FLAC lossless per completare il taglio.',
             );
+            setStatusText('Questo file richiede un export FLAC lossless. Continuo automaticamente...');
+            setPhaseProgress(0.32);
+
+            for (let fallbackIndex = 0; fallbackIndex < plan.segments.length; fallbackIndex += 1) {
+              const fallbackSegment = plan.segments[fallbackIndex];
+              const fallbackName = buildVirtualSegmentName(runPrefix, fallbackIndex, outputExtension);
+              const fallbackExitCode = await ffmpeg.exec([
+                '-ss',
+                formatFfmpegTime(fallbackSegment.start),
+                '-t',
+                formatFfmpegTime(fallbackSegment.duration),
+                '-i',
+                audioFile.virtualInputName,
+                '-map',
+                '0:a:0',
+                '-c:a',
+                'flac',
+                fallbackName,
+              ]);
+
+              if (fallbackExitCode !== 0) {
+                throw new Error(
+                  'Non sono riuscito a tagliare questo file nel browser neanche con il fallback lossless.',
+                );
+              }
+
+              createdVirtualNames.push(fallbackName);
+              setStatusText(
+                `Preparo parte ${fallbackIndex + 1} di ${plan.segments.length} in FLAC lossless...`,
+              );
+              setPhaseProgress(0.32 + ((fallbackIndex + 1) / plan.segments.length) * 0.38);
+            }
+
+            break;
           }
 
           createdVirtualNames.push(virtualName);
@@ -462,7 +512,7 @@ export default function App() {
       for (let index = 0; index < plan.segments.length; index += 1) {
         const virtualName = createdVirtualNames[index];
         const outputData = await ffmpeg.readFile(virtualName);
-        const downloadName = buildDownloadName(audioFile.baseName, index + 1, audioFile.extension);
+        const downloadName = buildDownloadName(audioFile.baseName, index + 1, outputExtension);
 
         zip.file(downloadName, outputData, { binary: true });
         exportedParts.push({
@@ -493,7 +543,9 @@ export default function App() {
       setTechnicalLog(
         exportMode === 'multi-copy'
           ? `Esportazione completata in copia diretta: ${exportedParts.length} file pronti.`
-          : `Esportazione completata con fallback parte per parte: ${exportedParts.length} file pronti.`,
+          : exportMode === 'single-copy'
+            ? `Esportazione completata con fallback parte per parte: ${exportedParts.length} file pronti.`
+            : `Esportazione completata con fallback FLAC lossless: ${exportedParts.length} file pronti.`,
       );
       setPhaseProgress(1);
     } catch (error) {
