@@ -55,6 +55,62 @@ function getAudioMime(file, extension) {
   return mimeByExtension[extension] ?? 'application/octet-stream';
 }
 
+function getFormatLabel(file, extension) {
+  if (file?.type?.startsWith('audio/')) {
+    return file.type.replace('audio/', '').toUpperCase();
+  }
+
+  if (extension) {
+    return extension.slice(1).toUpperCase();
+  }
+
+  return 'audio';
+}
+
+function readAudioDurationFromBrowser(objectUrl) {
+  return new Promise((resolve, reject) => {
+    const audio = document.createElement('audio');
+    let settled = false;
+
+    const timeoutId = window.setTimeout(() => {
+      finalize(() => reject(new Error('Timeout metadata browser')));
+    }, 15000);
+
+    function finalize(callback) {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      window.clearTimeout(timeoutId);
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      audio.onloadedmetadata = null;
+      audio.onerror = null;
+      callback();
+    }
+
+    audio.preload = 'metadata';
+    audio.onloadedmetadata = () => {
+      const duration = audio.duration;
+
+      if (Number.isFinite(duration) && duration > 0) {
+        finalize(() => resolve(duration));
+        return;
+      }
+
+      finalize(() => reject(new Error('Durata browser non valida')));
+    };
+
+    audio.onerror = () => {
+      finalize(() => reject(new Error('Metadata browser non disponibili')));
+    };
+
+    audio.src = objectUrl;
+  });
+}
+
 async function safeDelete(ffmpeg, path) {
   try {
     await ffmpeg.deleteFile(path);
@@ -155,6 +211,9 @@ export default function App() {
       return;
     }
 
+    let objectUrl = '';
+    let keepObjectUrl = false;
+
     setErrorText('');
     setLastResult(null);
     setIsBusy(true);
@@ -162,12 +221,25 @@ export default function App() {
     setPhaseProgress(0.12);
 
     try {
-      const ffmpeg = await ensureEngineReady();
       const extension = getExtension(file.name);
       const outputExtension = extension || '.audio';
       const baseName = stripExtension(file.name);
       const virtualInputName = `source-${Date.now()}${outputExtension}`;
       const probeOutputName = `probe-${Date.now()}.json`;
+      let duration = NaN;
+      let technicalMessage = 'File pronto.';
+      let formatLabel = getFormatLabel(file, outputExtension);
+
+      objectUrl = URL.createObjectURL(file);
+
+      try {
+        duration = await readAudioDurationFromBrowser(objectUrl);
+        technicalMessage = 'Durata recuperata direttamente dal browser.';
+      } catch {
+        technicalMessage = 'Il browser non legge la durata, provo con ffprobe.';
+      }
+
+      const ffmpeg = await ensureEngineReady();
 
       if (activeInputRef.current) {
         await safeDelete(ffmpeg, activeInputRef.current);
@@ -178,27 +250,30 @@ export default function App() {
 
       await ffmpeg.writeFile(virtualInputName, await fetchFile(file));
       activeInputRef.current = virtualInputName;
-      activeProbeRef.current = probeOutputName;
 
-      const exitCode = await ffmpeg.ffprobe([
-        '-v',
-        'error',
-        '-show_entries',
-        'format=duration,format_name',
-        '-of',
-        'json',
-        virtualInputName,
-        '-o',
-        probeOutputName,
-      ]);
+      if (!Number.isFinite(duration) || duration <= 0) {
+        activeProbeRef.current = probeOutputName;
 
-      if (exitCode !== 0) {
-        throw new Error('Impossibile leggere i metadati del file audio.');
+        const exitCode = await ffmpeg.ffprobe([
+          '-v',
+          'error',
+          '-show_entries',
+          'format=duration',
+          '-of',
+          'default=noprint_wrappers=1:nokey=1',
+          virtualInputName,
+          '-o',
+          probeOutputName,
+        ]);
+
+        if (exitCode !== 0) {
+          throw new Error('Impossibile leggere i metadati del file audio.');
+        }
+
+        const probeRaw = await ffmpeg.readFile(probeOutputName, 'utf8');
+        duration = Number(String(probeRaw).trim());
+        technicalMessage = 'Durata recuperata con ffprobe.';
       }
-
-      const probeRaw = await ffmpeg.readFile(probeOutputName, 'utf8');
-      const metadata = JSON.parse(probeRaw);
-      const duration = Number(metadata?.format?.duration);
 
       if (!Number.isFinite(duration) || duration <= 0) {
         throw new Error('Durata non valida. Prova con un file audio differente.');
@@ -207,16 +282,15 @@ export default function App() {
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
       }
-
-      const objectUrl = URL.createObjectURL(file);
       objectUrlRef.current = objectUrl;
+      keepObjectUrl = true;
 
       startTransition(() => {
         setAudioFile({
           baseName,
           duration,
           extension: outputExtension,
-          formatLabel: metadata?.format?.format_name ?? 'audio',
+          formatLabel,
           mimeType: getAudioMime(file, outputExtension),
           name: file.name,
           objectUrl,
@@ -231,13 +305,17 @@ export default function App() {
 
       setStatusText('File pronto. Scegli il tipo di taglio e scarica tutte le parti insieme.');
       setPhaseProgress(0);
-      setTechnicalLog('Metadati recuperati con ffprobe.');
+      setTechnicalLog(technicalMessage);
     } catch (error) {
       console.error(error);
       setErrorText(error.message || 'Non sono riuscito ad analizzare il file.');
       setStatusText('Qualcosa è andato storto durante l’analisi del file.');
       setPhaseProgress(0);
     } finally {
+      if (objectUrl && !keepObjectUrl) {
+        URL.revokeObjectURL(objectUrl);
+      }
+
       setIsBusy(false);
     }
   }
