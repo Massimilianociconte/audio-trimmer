@@ -130,6 +130,10 @@ function downloadBlob(blob, filename) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1200);
 }
 
+function formatFfmpegTime(seconds) {
+  return Math.max(0, seconds).toFixed(3);
+}
+
 export default function App() {
   const ffmpegRef = useRef(null);
   const audioRef = useRef(null);
@@ -377,13 +381,16 @@ export default function App() {
     setStatusText('Sto tagliando il file e preparando lo ZIP...');
 
     const runPrefix = `segment-${Date.now()}`;
+    let ffmpeg = null;
+    const createdVirtualNames = [];
+    let exportMode = 'multi-copy';
 
     try {
-      const ffmpeg = await ensureEngineReady();
+      ffmpeg = await ensureEngineReady();
       const segmentTimes = plan.cutPoints.map((value) => value.toFixed(3)).join(',');
       const outputPattern = `${runPrefix}-%03d${audioFile.extension}`;
 
-      const exitCode = await ffmpeg.exec([
+      const batchExitCode = await ffmpeg.exec([
         '-i',
         audioFile.virtualInputName,
         '-map',
@@ -399,10 +406,51 @@ export default function App() {
         outputPattern,
       ]);
 
-      if (exitCode !== 0) {
-        throw new Error(
-          'Il formato non supporta questo taglio in copia diretta nel browser. Prova con un altro contenitore audio.',
+      if (batchExitCode === 0) {
+        for (let index = 0; index < plan.segments.length; index += 1) {
+          createdVirtualNames.push(buildVirtualSegmentName(runPrefix, index, audioFile.extension));
+        }
+      } else {
+        exportMode = 'single-copy';
+        setTechnicalLog(
+          'Il taglio multiplo in blocco non è supportato da questo contenitore. Passo al taglio diretto parte per parte.',
         );
+        setStatusText('Questo formato richiede un taglio diretto parte per parte. Continuo automaticamente...');
+        setPhaseProgress(0.18);
+
+        for (let index = 0; index < plan.segments.length; index += 1) {
+          const segment = plan.segments[index];
+          const virtualName = buildVirtualSegmentName(runPrefix, index, audioFile.extension);
+          const segmentExitCode = await ffmpeg.exec([
+            '-ss',
+            formatFfmpegTime(segment.start),
+            '-t',
+            formatFfmpegTime(segment.duration),
+            '-i',
+            audioFile.virtualInputName,
+            '-map',
+            '0',
+            '-c',
+            'copy',
+            '-reset_timestamps',
+            '1',
+            '-avoid_negative_ts',
+            'make_zero',
+            virtualName,
+          ]);
+
+          if (segmentExitCode !== 0) {
+            throw new Error(
+              'Non sono riuscito a tagliare questo file nel browser mantenendo il formato originale.',
+            );
+          }
+
+          createdVirtualNames.push(virtualName);
+          setStatusText(
+            `Preparo parte ${index + 1} di ${plan.segments.length} senza ricodifica...`,
+          );
+          setPhaseProgress(0.18 + ((index + 1) / plan.segments.length) * 0.52);
+        }
       }
 
       setStatusText('Creo l’archivio ZIP finale con tutte le parti rinominate...');
@@ -412,7 +460,7 @@ export default function App() {
       const exportedParts = [];
 
       for (let index = 0; index < plan.segments.length; index += 1) {
-        const virtualName = buildVirtualSegmentName(runPrefix, index, audioFile.extension);
+        const virtualName = createdVirtualNames[index];
         const outputData = await ffmpeg.readFile(virtualName);
         const downloadName = buildDownloadName(audioFile.baseName, index + 1, audioFile.extension);
 
@@ -422,8 +470,6 @@ export default function App() {
           size: outputData.byteLength,
           duration: plan.segments[index].duration,
         });
-
-        await safeDelete(ffmpeg, virtualName);
       }
 
       const archiveName = `${audioFile.baseName} - parti.zip`;
@@ -444,7 +490,11 @@ export default function App() {
         parts: exportedParts,
       });
       setStatusText('Fatto. Ho scaricato tutte le parti in un solo ZIP, già rinominate.');
-      setTechnicalLog(`Esportazione completata: ${exportedParts.length} file pronti.`);
+      setTechnicalLog(
+        exportMode === 'multi-copy'
+          ? `Esportazione completata in copia diretta: ${exportedParts.length} file pronti.`
+          : `Esportazione completata con fallback parte per parte: ${exportedParts.length} file pronti.`,
+      );
       setPhaseProgress(1);
     } catch (error) {
       console.error(error);
@@ -452,6 +502,12 @@ export default function App() {
       setStatusText('Esportazione non completata.');
       setPhaseProgress(0);
     } finally {
+      if (ffmpeg) {
+        for (const virtualName of createdVirtualNames) {
+          await safeDelete(ffmpeg, virtualName);
+        }
+      }
+
       setIsBusy(false);
     }
   }
