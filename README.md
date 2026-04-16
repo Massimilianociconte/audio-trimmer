@@ -25,10 +25,10 @@ npm run build
 
 ## Deploy su GitHub Pages
 
-Il repository include già il workflow [`deploy.yml`](./.github/workflows/deploy.yml).
+Il build di produzione viene generato nella cartella `docs/`, pensata apposta per GitHub Pages.
 
-1. carica il progetto su GitHub
-2. assicurati che il branch principale sia `main`
+1. esegui `npm run build`
+2. fai commit anche della cartella `docs/`
 3. in GitHub vai su `Settings > Pages`
-4. come source seleziona `GitHub Actions`
-5. ogni push su `main` pubblicherà automaticamente il sito
+4. come source seleziona `Deploy from a branch`
+5. imposta branch `main` e cartella `/docs`
