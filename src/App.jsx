@@ -1,0 +1,700 @@
+import { startTransition, useEffect, useRef, useState } from 'react';
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile } from '@ffmpeg/util';
+import JSZip from 'jszip';
+import ffmpegCoreUrl from '@ffmpeg/core?url';
+import ffmpegWasmUrl from '@ffmpeg/core/wasm?url';
+import { buildDownloadName, buildPlan, buildVirtualSegmentName } from './lib/segments.js';
+import {
+  clamp,
+  formatBytes,
+  formatClock,
+  getExtension,
+  parseTimeInput,
+  stripExtension,
+} from './lib/time.js';
+
+const ACCEPTED_AUDIO_TYPES = [
+  'audio/*',
+  '.aac',
+  '.aif',
+  '.aiff',
+  '.alac',
+  '.amr',
+  '.flac',
+  '.m4a',
+  '.mp3',
+  '.ogg',
+  '.opus',
+  '.wav',
+  '.wma',
+].join(',');
+
+const INITIAL_MESSAGE = 'Carica un file audio e preparerò tutte le parti in un unico passaggio.';
+
+function createPointId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getAudioMime(file, extension) {
+  if (file?.type) {
+    return file.type;
+  }
+
+  const mimeByExtension = {
+    '.aac': 'audio/aac',
+    '.flac': 'audio/flac',
+    '.m4a': 'audio/mp4',
+    '.mp3': 'audio/mpeg',
+    '.ogg': 'audio/ogg',
+    '.opus': 'audio/ogg',
+    '.wav': 'audio/wav',
+    '.wma': 'audio/x-ms-wma',
+  };
+
+  return mimeByExtension[extension] ?? 'application/octet-stream';
+}
+
+async function safeDelete(ffmpeg, path) {
+  try {
+    await ffmpeg.deleteFile(path);
+  } catch {
+    return false;
+  }
+
+  return true;
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1200);
+}
+
+export default function App() {
+  const ffmpegRef = useRef(null);
+  const audioRef = useRef(null);
+  const inputRef = useRef(null);
+  const objectUrlRef = useRef('');
+  const activeInputRef = useRef('');
+  const activeProbeRef = useRef('');
+
+  const [engineState, setEngineState] = useState('idle');
+  const [statusText, setStatusText] = useState(INITIAL_MESSAGE);
+  const [phaseProgress, setPhaseProgress] = useState(0);
+  const [technicalLog, setTechnicalLog] = useState('');
+  const [dragActive, setDragActive] = useState(false);
+  const [isBusy, setIsBusy] = useState(false);
+  const [errorText, setErrorText] = useState('');
+  const [mode, setMode] = useState('equal');
+  const [equalParts, setEqualParts] = useState(2);
+  const [customCuts, setCustomCuts] = useState([]);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [lastResult, setLastResult] = useState(null);
+  const [audioFile, setAudioFile] = useState(null);
+
+  const plan = buildPlan({
+    duration: audioFile?.duration ?? 0,
+    mode,
+    equalParts,
+    customCuts,
+  });
+
+  useEffect(() => {
+    return () => {
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+      }
+
+      if (ffmpegRef.current) {
+        ffmpegRef.current.terminate();
+      }
+    };
+  }, []);
+
+  async function ensureEngineReady() {
+    let ffmpeg = ffmpegRef.current;
+
+    if (!ffmpeg) {
+      ffmpeg = new FFmpeg();
+      ffmpeg.on('log', ({ message }) => {
+        const compactMessage = message.trim();
+        if (compactMessage) {
+          setTechnicalLog(compactMessage);
+        }
+      });
+      ffmpeg.on('progress', ({ progress }) => {
+        setPhaseProgress((current) => Math.max(current, progress));
+      });
+      ffmpegRef.current = ffmpeg;
+    }
+
+    if (!ffmpeg.loaded) {
+      setEngineState('loading');
+      setStatusText('Carico il motore locale di taglio. Succede solo la prima volta.');
+      setPhaseProgress(0.08);
+
+      await ffmpeg.load({
+        coreURL: ffmpegCoreUrl,
+        wasmURL: ffmpegWasmUrl,
+      });
+
+      setEngineState('ready');
+      setStatusText('Motore pronto. Ora puoi analizzare e tagliare il file.');
+      setPhaseProgress(0);
+    }
+
+    return ffmpeg;
+  }
+
+  async function analyzeFile(file) {
+    if (!file) {
+      return;
+    }
+
+    setErrorText('');
+    setLastResult(null);
+    setIsBusy(true);
+    setStatusText('Analizzo il file e recupero la durata esatta...');
+    setPhaseProgress(0.12);
+
+    try {
+      const ffmpeg = await ensureEngineReady();
+      const extension = getExtension(file.name);
+      const outputExtension = extension || '.audio';
+      const baseName = stripExtension(file.name);
+      const virtualInputName = `source-${Date.now()}${outputExtension}`;
+      const probeOutputName = `probe-${Date.now()}.json`;
+
+      if (activeInputRef.current) {
+        await safeDelete(ffmpeg, activeInputRef.current);
+      }
+      if (activeProbeRef.current) {
+        await safeDelete(ffmpeg, activeProbeRef.current);
+      }
+
+      await ffmpeg.writeFile(virtualInputName, await fetchFile(file));
+      activeInputRef.current = virtualInputName;
+      activeProbeRef.current = probeOutputName;
+
+      const exitCode = await ffmpeg.ffprobe([
+        '-v',
+        'error',
+        '-show_entries',
+        'format=duration,format_name',
+        '-of',
+        'json',
+        virtualInputName,
+        '-o',
+        probeOutputName,
+      ]);
+
+      if (exitCode !== 0) {
+        throw new Error('Impossibile leggere i metadati del file audio.');
+      }
+
+      const probeRaw = await ffmpeg.readFile(probeOutputName, 'utf8');
+      const metadata = JSON.parse(probeRaw);
+      const duration = Number(metadata?.format?.duration);
+
+      if (!Number.isFinite(duration) || duration <= 0) {
+        throw new Error('Durata non valida. Prova con un file audio differente.');
+      }
+
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+      }
+
+      const objectUrl = URL.createObjectURL(file);
+      objectUrlRef.current = objectUrl;
+
+      startTransition(() => {
+        setAudioFile({
+          baseName,
+          duration,
+          extension: outputExtension,
+          formatLabel: metadata?.format?.format_name ?? 'audio',
+          mimeType: getAudioMime(file, outputExtension),
+          name: file.name,
+          objectUrl,
+          size: file.size,
+          virtualInputName,
+        });
+        setMode('equal');
+        setEqualParts(2);
+        setCustomCuts([]);
+        setCurrentTime(0);
+      });
+
+      setStatusText('File pronto. Scegli il tipo di taglio e scarica tutte le parti insieme.');
+      setPhaseProgress(0);
+      setTechnicalLog('Metadati recuperati con ffprobe.');
+    } catch (error) {
+      console.error(error);
+      setErrorText(error.message || 'Non sono riuscito ad analizzare il file.');
+      setStatusText('Qualcosa è andato storto durante l’analisi del file.');
+      setPhaseProgress(0);
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function handleInputChange(event) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (file) {
+      await analyzeFile(file);
+    }
+  }
+
+  async function handleDrop(event) {
+    event.preventDefault();
+    setDragActive(false);
+
+    const file = event.dataTransfer.files?.[0];
+    if (file) {
+      await analyzeFile(file);
+    }
+  }
+
+  function addCutAt(seconds) {
+    if (!audioFile?.duration) {
+      return;
+    }
+
+    const safeSeconds = clamp(seconds, 0.25, Math.max(0.25, audioFile.duration - 0.25));
+    setMode('custom');
+    setCustomCuts((previous) => [
+      ...previous,
+      {
+        id: createPointId(),
+        value: formatClock(safeSeconds),
+      },
+    ]);
+  }
+
+  function updateCutPoint(id, value) {
+    setCustomCuts((previous) =>
+      previous.map((point) => (point.id === id ? { ...point, value } : point)),
+    );
+  }
+
+  function removeCutPoint(id) {
+    setCustomCuts((previous) => previous.filter((point) => point.id !== id));
+  }
+
+  async function processAndDownload() {
+    if (!audioFile || plan.error || plan.segments.length < 2) {
+      setErrorText(plan.error || 'Definisci almeno due parti prima di esportare.');
+      return;
+    }
+
+    setErrorText('');
+    setLastResult(null);
+    setIsBusy(true);
+    setPhaseProgress(0.05);
+    setStatusText('Sto tagliando il file e preparando lo ZIP...');
+
+    const runPrefix = `segment-${Date.now()}`;
+
+    try {
+      const ffmpeg = await ensureEngineReady();
+      const segmentTimes = plan.cutPoints.map((value) => value.toFixed(3)).join(',');
+      const outputPattern = `${runPrefix}-%03d${audioFile.extension}`;
+
+      const exitCode = await ffmpeg.exec([
+        '-i',
+        audioFile.virtualInputName,
+        '-map',
+        '0',
+        '-c',
+        'copy',
+        '-f',
+        'segment',
+        '-segment_times',
+        segmentTimes,
+        '-reset_timestamps',
+        '1',
+        outputPattern,
+      ]);
+
+      if (exitCode !== 0) {
+        throw new Error(
+          'Il formato non supporta questo taglio in copia diretta nel browser. Prova con un altro contenitore audio.',
+        );
+      }
+
+      setStatusText('Creo l’archivio ZIP finale con tutte le parti rinominate...');
+      setPhaseProgress(0.78);
+
+      const zip = new JSZip();
+      const exportedParts = [];
+
+      for (let index = 0; index < plan.segments.length; index += 1) {
+        const virtualName = buildVirtualSegmentName(runPrefix, index, audioFile.extension);
+        const outputData = await ffmpeg.readFile(virtualName);
+        const downloadName = buildDownloadName(audioFile.baseName, index + 1, audioFile.extension);
+
+        zip.file(downloadName, outputData, { binary: true });
+        exportedParts.push({
+          name: downloadName,
+          size: outputData.byteLength,
+          duration: plan.segments[index].duration,
+        });
+
+        await safeDelete(ffmpeg, virtualName);
+      }
+
+      const archiveName = `${audioFile.baseName} - parti.zip`;
+      const zipBlob = await zip.generateAsync(
+        {
+          type: 'blob',
+          compression: 'STORE',
+        },
+        ({ percent }) => {
+          setPhaseProgress(0.78 + percent / 100 * 0.22);
+        },
+      );
+
+      downloadBlob(zipBlob, archiveName);
+
+      setLastResult({
+        archiveName,
+        parts: exportedParts,
+      });
+      setStatusText('Fatto. Ho scaricato tutte le parti in un solo ZIP, già rinominate.');
+      setTechnicalLog(`Esportazione completata: ${exportedParts.length} file pronti.`);
+      setPhaseProgress(1);
+    } catch (error) {
+      console.error(error);
+      setErrorText(error.message || 'Non sono riuscito a esportare le parti.');
+      setStatusText('Esportazione non completata.');
+      setPhaseProgress(0);
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  const canExport = Boolean(audioFile) && !plan.error && plan.segments.length >= 2 && !isBusy;
+  const helperChips = [
+    'Locale nel browser',
+    'Un solo upload',
+    'Copia diretta senza ricodifica',
+  ];
+
+  return (
+    <div className="shell">
+      <div className="aurora aurora-left" />
+      <div className="aurora aurora-right" />
+
+      <header className="topbar">
+        <div>
+          <p className="eyebrow">Audio cutter pensato per GitHub Pages</p>
+          <h1>
+            Taglia una volta,
+            <span> scarica tutto subito.</span>
+          </h1>
+        </div>
+        <p className="lead">
+          Carichi un audio una sola volta, scegli il taglio e scarichi tutte le parti
+          già rinominate come <strong>parte 1</strong>, <strong>parte 2</strong>,
+          <strong>parte 3</strong>.
+        </p>
+      </header>
+
+      <main className="workspace">
+        <section className="stage">
+          <div className="stage-header">
+            <div className="pill-group">
+              {helperChips.map((chip) => (
+                <span className="pill" key={chip}>
+                  {chip}
+                </span>
+              ))}
+            </div>
+
+            <button
+              className="ghost-button"
+              type="button"
+              onClick={() => inputRef.current?.click()}
+            >
+              Scegli un file
+            </button>
+          </div>
+
+          <label
+            className={`dropzone ${dragActive ? 'dropzone-active' : ''}`}
+            onDragEnter={() => setDragActive(true)}
+            onDragLeave={() => setDragActive(false)}
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={handleDrop}
+          >
+            <input
+              ref={inputRef}
+              type="file"
+              accept={ACCEPTED_AUDIO_TYPES}
+              onChange={handleInputChange}
+              hidden
+            />
+            <span className="dropzone-kicker">Drag & drop oppure click</span>
+            <strong>Carica un file audio</strong>
+            <p>
+              Supporto pensato per i formati più comuni. Il file resta locale e non viene
+              caricato su server esterni.
+            </p>
+          </label>
+
+          <div className="status-strip">
+            <div>
+              <span className={`status-dot status-${engineState}`} />
+              <strong>{engineState === 'ready' ? 'Motore pronto' : 'Motore locale'}</strong>
+            </div>
+            <p>{statusText}</p>
+          </div>
+
+          <div className="progress-track" aria-hidden="true">
+            <span
+              className={`progress-bar ${isBusy ? 'progress-bar-busy' : ''}`}
+              style={{ transform: `scaleX(${phaseProgress || 0.02})` }}
+            />
+          </div>
+
+          {audioFile ? (
+            <div className="loaded-file">
+              <div>
+                <p className="section-label">File caricato</p>
+                <h2>{audioFile.name}</h2>
+                <div className="meta-row">
+                  <span>{formatClock(audioFile.duration)}</span>
+                  <span>{formatBytes(audioFile.size)}</span>
+                  <span>{audioFile.formatLabel}</span>
+                </div>
+              </div>
+              <audio
+                ref={audioRef}
+                controls
+                preload="metadata"
+                src={audioFile.objectUrl}
+                onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+              />
+            </div>
+          ) : null}
+
+          <div className="editor-grid">
+            <div className="editor-column">
+              <div className="mode-switch">
+                <button
+                  type="button"
+                  className={mode === 'equal' ? 'mode-active' : ''}
+                  onClick={() => setMode('equal')}
+                >
+                  Parti uguali
+                </button>
+                <button
+                  type="button"
+                  className={mode === 'custom' ? 'mode-active' : ''}
+                  onClick={() => setMode('custom')}
+                >
+                  Punti personalizzati
+                </button>
+              </div>
+
+              {mode === 'equal' ? (
+                <div className="control-panel">
+                  <div className="quick-presets">
+                    {[2, 3, 4].map((value) => (
+                      <button
+                        key={value}
+                        type="button"
+                        className={equalParts === value ? 'preset-active' : ''}
+                        onClick={() => setEqualParts(value)}
+                      >
+                        {value} parti
+                      </button>
+                    ))}
+                  </div>
+
+                  <label className="field">
+                    <span>Numero di parti uguali</span>
+                    <input
+                      type="range"
+                      min="2"
+                      max="12"
+                      value={equalParts}
+                      onChange={(event) => setEqualParts(Number(event.target.value))}
+                    />
+                    <strong>{equalParts} parti</strong>
+                  </label>
+                </div>
+              ) : (
+                <div className="control-panel">
+                  <div className="custom-actions">
+                    <button type="button" onClick={() => addCutAt(currentTime)}>
+                      Usa la posizione corrente
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => addCutAt((audioFile?.duration ?? 0) / 2)}
+                    >
+                      Inserisci un taglio a metà
+                    </button>
+                  </div>
+
+                  <p className="helper-text">
+                    Puoi scrivere i punti in secondi oppure in formato <code>mm:ss</code>{' '}
+                    o <code>hh:mm:ss</code>.
+                  </p>
+
+                  <div className="cut-list">
+                    {customCuts.length === 0 ? (
+                      <p className="empty-text">
+                        Nessun punto inserito. Premi un pulsante sopra oppure aggiungi un
+                        tempo manuale.
+                      </p>
+                    ) : null}
+
+                    {customCuts.map((point) => (
+                      <div className="cut-row" key={point.id}>
+                        <input
+                          type="text"
+                          value={point.value}
+                          onChange={(event) => updateCutPoint(point.id, event.target.value)}
+                          placeholder="00:30"
+                        />
+                        <input
+                          type="range"
+                          min="0"
+                          max={audioFile?.duration ?? 0}
+                          step="0.1"
+                          value={clamp(
+                            parseTimeInput(point.value) ?? currentTime,
+                            0,
+                            audioFile?.duration ?? 0,
+                          )}
+                          onChange={(event) =>
+                            updateCutPoint(point.id, formatClock(Number(event.target.value)))
+                          }
+                        />
+                        <button type="button" onClick={() => removeCutPoint(point.id)}>
+                          Rimuovi
+                        </button>
+                      </div>
+                    ))}
+
+                    <button
+                      type="button"
+                      className="add-manual"
+                      onClick={() =>
+                        setCustomCuts((previous) => [
+                          ...previous,
+                          { id: createPointId(), value: '' },
+                        ])
+                      }
+                    >
+                      Aggiungi un punto manuale
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <aside className="summary-column">
+              <div className="summary-head">
+                <p className="section-label">Anteprima esportazione</p>
+                <strong>
+                  {plan.segments.length > 0 ? `${plan.segments.length} file pronti` : 'In attesa'}
+                </strong>
+              </div>
+
+              {plan.error ? <p className="error-text">{plan.error}</p> : null}
+              {errorText ? <p className="error-text">{errorText}</p> : null}
+
+              {plan.segments.length > 0 ? (
+                <div className="segment-stack">
+                  {plan.segments.map((segment) => (
+                    <div className="segment-row" key={segment.index}>
+                      <div>
+                        <strong>
+                          {buildDownloadName(
+                            audioFile?.baseName ?? 'audio',
+                            segment.index,
+                            audioFile?.extension ?? '',
+                          )}
+                        </strong>
+                        <p>{segment.rangeLabel}</p>
+                      </div>
+                      <span>{formatClock(segment.duration)}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <p className="empty-text">Le parti appariranno qui appena il piano è valido.</p>
+              )}
+
+              <button
+                type="button"
+                className="primary-button"
+                onClick={processAndDownload}
+                disabled={!canExport}
+              >
+                {isBusy ? 'Elaborazione in corso...' : 'Taglia e scarica tutto'}
+              </button>
+
+              <p className="helper-text">
+                Il download genera uno ZIP senza comprimere di nuovo l’audio, per restare più
+                rapido possibile.
+              </p>
+            </aside>
+          </div>
+        </section>
+
+        <section className="details">
+          <div className="detail">
+            <p className="section-label">Perché è più veloce</p>
+            <strong>Un solo file in ingresso, tutte le parti in uscita.</strong>
+            <p>
+              Il sito analizza il file una volta sola, applica tutti i punti di taglio in un
+              unico passaggio e prepara subito l’archivio finale.
+            </p>
+          </div>
+
+          <div className="detail">
+            <p className="section-label">Qualità</p>
+            <strong>Nessuna ricodifica quando il formato lo consente.</strong>
+            <p>
+              La strategia predefinita usa copia diretta dei flussi audio per evitare perdite
+              di qualità e tempi morti di esportazione.
+            </p>
+          </div>
+
+          <div className="detail">
+            <p className="section-label">Stato tecnico</p>
+            <strong>{technicalLog || 'In attesa del prossimo passaggio.'}</strong>
+            <p>
+              {lastResult
+                ? `Ultimo ZIP creato: ${lastResult.archiveName}`
+                : 'Qui comparirà l’ultimo messaggio utile del motore di elaborazione.'}
+            </p>
+          </div>
+        </section>
+
+        {lastResult ? (
+          <section className="result-banner">
+            <p className="section-label">Ultima esportazione</p>
+            <h3>{lastResult.archiveName}</h3>
+            <div className="result-list">
+              {lastResult.parts.map((part) => (
+                <span key={part.name}>
+                  {part.name} · {formatBytes(part.size)} · {formatClock(part.duration)}
+                </span>
+              ))}
+            </div>
+          </section>
+        ) : null}
+      </main>
+    </div>
+  );
+}
