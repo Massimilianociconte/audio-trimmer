@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-labelledby="title desc">
+  <title>Audio Cutter</title>
+  <desc>Icona circolare con onda sonora e taglio diagonale</desc>
+  <defs>
+    <linearGradient id="g" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffbf83" />
+      <stop offset="0.55" stop-color="#ef6c2f" />
+      <stop offset="1" stop-color="#c9490f" />
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="18" fill="#22170d" />
+  <circle cx="32" cy="32" r="23" fill="url(#g)" />
+  <path d="M17 38c4.5-9 8.5-13.5 15-13.5s10.5 4.5 15 13.5" fill="none" stroke="#fff7ef" stroke-width="4.5" stroke-linecap="round" />
+  <path d="M26 23.5h12" fill="none" stroke="#fff7ef" stroke-width="4.5" stroke-linecap="round" />
+  <path d="M39 16l9 9" fill="none" stroke="#fff7ef" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+</svg>
