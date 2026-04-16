@@ -454,12 +454,12 @@ export default function App() {
 
           if (segmentExitCode !== 0) {
             await cleanupExports();
-            exportMode = 'lossless-flac';
-            outputExtension = '.flac';
+            exportMode = 'lossy-aac';
+            outputExtension = '.m4a';
             setTechnicalLog(
-              'La copia diretta non è riuscita. Passo a un export FLAC lossless per completare il taglio.',
+              'La copia diretta non è riuscita. Passo a un export AAC in M4A per completare il taglio con file più leggeri.',
             );
-            setStatusText('Questo file richiede un export FLAC lossless. Continuo automaticamente...');
+            setStatusText('Questo file richiede una nuova codifica AAC in M4A. Continuo automaticamente...');
             setPhaseProgress(0.32);
 
             for (let fallbackIndex = 0; fallbackIndex < plan.segments.length; fallbackIndex += 1) {
@@ -475,19 +475,66 @@ export default function App() {
                 '-map',
                 '0:a:0',
                 '-c:a',
-                'flac',
+                'aac',
+                '-b:a',
+                '160k',
                 fallbackName,
               ]);
 
               if (fallbackExitCode !== 0) {
-                throw new Error(
-                  'Non sono riuscito a tagliare questo file nel browser neanche con il fallback lossless.',
+                await cleanupExports();
+                exportMode = 'lossless-flac';
+                outputExtension = '.flac';
+                setTechnicalLog(
+                  'Il fallback AAC non è riuscito. Passo a un export FLAC lossless come ultima opzione.',
                 );
+                setStatusText('Il file richiede un export FLAC lossless come ultima opzione...');
+                setPhaseProgress(0.45);
+
+                for (
+                  let losslessIndex = 0;
+                  losslessIndex < plan.segments.length;
+                  losslessIndex += 1
+                ) {
+                  const losslessSegment = plan.segments[losslessIndex];
+                  const losslessName = buildVirtualSegmentName(
+                    runPrefix,
+                    losslessIndex,
+                    outputExtension,
+                  );
+                  const losslessExitCode = await ffmpeg.exec([
+                    '-ss',
+                    formatFfmpegTime(losslessSegment.start),
+                    '-t',
+                    formatFfmpegTime(losslessSegment.duration),
+                    '-i',
+                    audioFile.virtualInputName,
+                    '-map',
+                    '0:a:0',
+                    '-c:a',
+                    'flac',
+                    losslessName,
+                  ]);
+
+                  if (losslessExitCode !== 0) {
+                    throw new Error(
+                      'Non sono riuscito a tagliare questo file nel browser neanche con il fallback finale.',
+                    );
+                  }
+
+                  createdVirtualNames.push(losslessName);
+                  setStatusText(
+                    `Preparo parte ${losslessIndex + 1} di ${plan.segments.length} in FLAC lossless...`,
+                  );
+                  setPhaseProgress(0.45 + ((losslessIndex + 1) / plan.segments.length) * 0.25);
+                }
+
+                break;
               }
 
               createdVirtualNames.push(fallbackName);
               setStatusText(
-                `Preparo parte ${fallbackIndex + 1} di ${plan.segments.length} in FLAC lossless...`,
+                `Preparo parte ${fallbackIndex + 1} di ${plan.segments.length} in AAC M4A...`,
               );
               setPhaseProgress(0.32 + ((fallbackIndex + 1) / plan.segments.length) * 0.38);
             }
@@ -545,7 +592,9 @@ export default function App() {
           ? `Esportazione completata in copia diretta: ${exportedParts.length} file pronti.`
           : exportMode === 'single-copy'
             ? `Esportazione completata con fallback parte per parte: ${exportedParts.length} file pronti.`
-            : `Esportazione completata con fallback FLAC lossless: ${exportedParts.length} file pronti.`,
+            : exportMode === 'lossy-aac'
+              ? `Esportazione completata con fallback AAC M4A: ${exportedParts.length} file pronti.`
+              : `Esportazione completata con fallback FLAC lossless: ${exportedParts.length} file pronti.`,
       );
       setPhaseProgress(1);
     } catch (error) {
