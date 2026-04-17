@@ -257,6 +257,12 @@ button {
     rgba(255, 255, 255, 0.75);
 }
 
+.dropzone-busy {
+  cursor: progress;
+  opacity: 0.78;
+  pointer-events: none;
+}
+
 .status-strip {
   padding: 0 4px;
 }

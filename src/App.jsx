@@ -126,7 +126,10 @@ function downloadBlob(blob, filename) {
   const link = document.createElement('a');
   link.href = url;
   link.download = filename;
+  link.rel = 'noopener';
+  document.body.appendChild(link);
   link.click();
+  link.remove();
   window.setTimeout(() => URL.revokeObjectURL(url), 1200);
 }
 
@@ -141,6 +144,7 @@ export default function App() {
   const objectUrlRef = useRef('');
   const activeInputRef = useRef('');
   const activeProbeRef = useRef('');
+  const dragDepthRef = useRef(0);
 
   const [engineState, setEngineState] = useState('idle');
   const [statusText, setStatusText] = useState(INITIAL_MESSAGE);
@@ -167,11 +171,16 @@ export default function App() {
     return () => {
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = '';
       }
 
       if (ffmpegRef.current) {
         ffmpegRef.current.terminate();
+        ffmpegRef.current = null;
       }
+
+      activeInputRef.current = '';
+      activeProbeRef.current = '';
     };
   }, []);
 
@@ -327,14 +336,42 @@ export default function App() {
   async function handleInputChange(event) {
     const file = event.target.files?.[0];
     event.target.value = '';
-    if (file) {
+    if (file && !isBusy) {
       await analyzeFile(file);
+    }
+  }
+
+  function handleDragEnter(event) {
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    if (!isBusy) {
+      setDragActive(true);
+    }
+  }
+
+  function handleDragLeave(event) {
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) {
+      setDragActive(false);
+    }
+  }
+
+  function handleDragOver(event) {
+    event.preventDefault();
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = isBusy ? 'none' : 'copy';
     }
   }
 
   async function handleDrop(event) {
     event.preventDefault();
+    dragDepthRef.current = 0;
     setDragActive(false);
+
+    if (isBusy) {
+      return;
+    }
 
     const file = event.dataTransfer.files?.[0];
     if (file) {
@@ -655,16 +692,17 @@ export default function App() {
               className="ghost-button"
               type="button"
               onClick={() => inputRef.current?.click()}
+              disabled={isBusy}
             >
               Scegli un file
             </button>
           </div>
 
           <label
-            className={`dropzone ${dragActive ? 'dropzone-active' : ''}`}
-            onDragEnter={() => setDragActive(true)}
-            onDragLeave={() => setDragActive(false)}
-            onDragOver={(event) => event.preventDefault()}
+            className={`dropzone ${dragActive ? 'dropzone-active' : ''} ${isBusy ? 'dropzone-busy' : ''}`}
+            onDragEnter={handleDragEnter}
+            onDragLeave={handleDragLeave}
+            onDragOver={handleDragOver}
             onDrop={handleDrop}
           >
             <input
@@ -672,6 +710,7 @@ export default function App() {
               type="file"
               accept={ACCEPTED_AUDIO_TYPES}
               onChange={handleInputChange}
+              disabled={isBusy}
               hidden
             />
             <span className="dropzone-kicker">Drag & drop oppure click</span>
