@@ -1,4 +1,4 @@
-import { useEffect, useImperativeHandle, useRef, forwardRef } from 'react';
+import { useEffect, useImperativeHandle, useRef, useState, forwardRef } from 'react';
 import WaveSurfer from 'wavesurfer.js';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.esm.js';
 import TimelinePlugin from 'wavesurfer.js/dist/plugins/timeline.esm.js';
@@ -35,6 +35,10 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
   const bookmarkRegionsRef = useRef(new Map());
   const loopRegionRef = useRef(null);
   const callbacksRef = useRef({});
+  const isReadyRef = useRef(false);
+  const latestRateRef = useRef(playbackRate);
+  const latestZoomRef = useRef(zoom);
+  const [readyRevision, setReadyRevision] = useState(0);
 
   callbacksRef.current = {
     onReady,
@@ -45,6 +49,19 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     onBookmarkJump,
     onWaveformClick,
   };
+  latestRateRef.current = playbackRate;
+  latestZoomRef.current = zoom;
+
+  function isInstanceReady(instance) {
+    if (!instance) {
+      return false;
+    }
+    try {
+      return instance.getDuration() > 0;
+    } catch (error) {
+      return false;
+    }
+  }
 
   useImperativeHandle(
     ref,
@@ -83,6 +100,8 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     if (!containerRef.current || !src) {
       return undefined;
     }
+
+    isReadyRef.current = false;
 
     const regionsPlugin = RegionsPlugin.create();
     const timelinePlugin = TimelinePlugin.create({
@@ -126,7 +145,25 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     loopRegionRef.current = null;
 
     const handleReady = () => {
+      isReadyRef.current = true;
+      try {
+        const rate = latestRateRef.current;
+        if (typeof rate === 'number' && rate > 0) {
+          instance.setPlaybackRate(rate, true);
+        }
+      } catch (error) {
+        // ignore: rate will be re-applied on the next prop update
+      }
+      try {
+        const nextZoom = latestZoomRef.current;
+        if (typeof nextZoom === 'number' && nextZoom > 0 && instance.getDuration() > 0) {
+          instance.zoom(nextZoom);
+        }
+      } catch (error) {
+        // ignore: zoom will re-apply when the user moves the slider
+      }
       callbacksRef.current.onReady?.(instance.getDuration());
+      setReadyRevision((revision) => revision + 1);
     };
     const handlePlay = () => callbacksRef.current.onPlayStateChange?.(true);
     const handlePause = () => callbacksRef.current.onPlayStateChange?.(false);
@@ -168,13 +205,18 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     });
 
     return () => {
+      isReadyRef.current = false;
       instance.un('ready', handleReady);
       instance.un('play', handlePlay);
       instance.un('pause', handlePause);
       instance.un('finish', handleFinish);
       instance.un('timeupdate', handleTime);
       instance.un('interaction', handleInteraction);
-      instance.destroy();
+      try {
+        instance.destroy();
+      } catch (error) {
+        // ignore: instance may already be torn down
+      }
       wsRef.current = null;
       regionsPluginRef.current = null;
       cutRegionsRef.current = new Map();
@@ -185,18 +227,33 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
 
   useEffect(() => {
     const ws = wsRef.current;
-    if (ws && typeof playbackRate === 'number' && playbackRate > 0) {
-      ws.setPlaybackRate(playbackRate, true);
+    if (!ws || typeof playbackRate !== 'number' || playbackRate <= 0) {
+      return;
     }
-  }, [playbackRate, src]);
+    if (!isInstanceReady(ws)) {
+      return;
+    }
+    try {
+      ws.setPlaybackRate(playbackRate, true);
+    } catch (error) {
+      // ignore: will be re-applied when ready fires
+    }
+  }, [playbackRate, readyRevision]);
 
   useEffect(() => {
     const ws = wsRef.current;
-    if (!ws || !zoom) {
+    if (!ws || typeof zoom !== 'number' || zoom <= 0) {
       return;
     }
-    ws.zoom(zoom);
-  }, [zoom, src]);
+    if (!isInstanceReady(ws)) {
+      return;
+    }
+    try {
+      ws.zoom(zoom);
+    } catch (error) {
+      // ignore: wavesurfer throws when the audio is not fully loaded yet
+    }
+  }, [zoom, readyRevision]);
 
   useEffect(() => {
     const regionsPlugin = regionsPluginRef.current;
@@ -237,11 +294,15 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
 
     registry.forEach((region, regionId) => {
       if (!nextIds.has(regionId)) {
-        region.remove();
+        try {
+          region.remove();
+        } catch (error) {
+          // ignore stale region
+        }
         registry.delete(regionId);
       }
     });
-  }, [cuts, src]);
+  }, [cuts, src, readyRevision]);
 
   useEffect(() => {
     const regionsPlugin = regionsPluginRef.current;
@@ -284,11 +345,15 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
 
     registry.forEach((region, regionId) => {
       if (!nextIds.has(regionId)) {
-        region.remove();
+        try {
+          region.remove();
+        } catch (error) {
+          // ignore stale region
+        }
         registry.delete(regionId);
       }
     });
-  }, [bookmarks, src]);
+  }, [bookmarks, src, readyRevision]);
 
   useEffect(() => {
     const regionsPlugin = regionsPluginRef.current;
@@ -296,7 +361,11 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       return;
     }
     if (loopRegionRef.current) {
-      loopRegionRef.current.remove();
+      try {
+        loopRegionRef.current.remove();
+      } catch (error) {
+        // ignore stale loop region
+      }
       loopRegionRef.current = null;
     }
     if (
@@ -305,17 +374,21 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       typeof loopRegion.end === 'number' &&
       loopRegion.end > loopRegion.start
     ) {
-      const region = regionsPlugin.addRegion({
-        id: 'loop-region',
-        start: loopRegion.start,
-        end: loopRegion.end,
-        color: LOOP_COLOR,
-        drag: false,
-        resize: false,
-      });
-      loopRegionRef.current = region;
+      try {
+        const region = regionsPlugin.addRegion({
+          id: 'loop-region',
+          start: loopRegion.start,
+          end: loopRegion.end,
+          color: LOOP_COLOR,
+          drag: false,
+          resize: false,
+        });
+        loopRegionRef.current = region;
+      } catch (error) {
+        // ignore: addRegion may throw before audio is loaded
+      }
     }
-  }, [loopRegion, src]);
+  }, [loopRegion, src, readyRevision]);
 
   useEffect(() => {
     const ws = wsRef.current;
