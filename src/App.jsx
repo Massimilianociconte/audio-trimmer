@@ -17,6 +17,8 @@ import { WaveformEditor } from './components/WaveformEditor.jsx';
 import { PlayerControls } from './components/PlayerControls.jsx';
 import { BookmarksPanel } from './components/BookmarksPanel.jsx';
 import { AutomationPanel } from './components/AutomationPanel.jsx';
+import { Recorder } from './components/Recorder.jsx';
+import { ProjectLibrary } from './components/ProjectLibrary.jsx';
 import {
   KEYBOARD_HINTS,
   useKeyboardShortcuts,
@@ -27,6 +29,12 @@ import {
   silencesToCutPoints,
 } from './lib/silence.js';
 import { buildCleanupFilter, getCleanupPreset } from './lib/cleanup.js';
+import {
+  deleteProject as deleteStoredProject,
+  listProjects,
+  loadProject as loadStoredProject,
+  saveProject as saveStoredProject,
+} from './lib/storage.js';
 
 const ACCEPTED_AUDIO_TYPES = [
   'audio/*',
@@ -186,6 +194,12 @@ export default function App() {
   const [cleanupPreset, setCleanupPreset] = useState('none');
   const [originalAudioBackup, setOriginalAudioBackup] = useState(null);
   const [lastDetectionSummary, setLastDetectionSummary] = useState('');
+  const [activeCapture, setActiveCapture] = useState('none');
+  const [projects, setProjects] = useState([]);
+  const [projectsLoading, setProjectsLoading] = useState(false);
+  const [projectsError, setProjectsError] = useState('');
+  const [currentProjectId, setCurrentProjectId] = useState(null);
+  const [saveStatus, setSaveStatus] = useState('');
 
   const plan = buildPlan({
     duration: audioFile?.duration ?? 0,
@@ -387,6 +401,7 @@ export default function App() {
     const file = event.target.files?.[0];
     event.target.value = '';
     if (file && !isBusy) {
+      setCurrentProjectId(null);
       await analyzeFile(file);
     }
   }
@@ -425,6 +440,7 @@ export default function App() {
 
     const file = event.dataTransfer.files?.[0];
     if (file) {
+      setCurrentProjectId(null);
       await analyzeFile(file);
     }
   }
@@ -832,6 +848,147 @@ export default function App() {
     }
   }
 
+  const refreshProjects = useCallback(async () => {
+    setProjectsLoading(true);
+    setProjectsError('');
+    try {
+      const list = await listProjects();
+      setProjects(list);
+    } catch (error) {
+      console.error(error);
+      setProjectsError(error.message || 'Non sono riuscito a leggere i progetti salvati.');
+    } finally {
+      setProjectsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (activeCapture === 'library') {
+      refreshProjects();
+    }
+  }, [activeCapture, refreshProjects]);
+
+  async function handleSaveProject() {
+    if (!audioFile || isBusy) {
+      return;
+    }
+    setSaveStatus('Salvo il progetto…');
+    try {
+      const response = await fetch(audioFile.objectUrl);
+      const audioBlob = await response.blob();
+      const now = Date.now();
+      const record = await saveStoredProject({
+        id: currentProjectId ?? undefined,
+        name: audioFile.baseName || audioFile.name,
+        audioName: audioFile.name,
+        audioExtension: audioFile.extension,
+        audioMimeType: audioFile.mimeType,
+        formatLabel: audioFile.formatLabel,
+        duration: audioFile.duration,
+        audioBlob,
+        mode,
+        equalParts,
+        customCuts: customCuts.map((cut) => ({
+          id: cut.id,
+          value: cut.value,
+          position:
+            typeof cut.position === 'number' && Number.isFinite(cut.position)
+              ? cut.position
+              : null,
+        })),
+        bookmarks: bookmarks.map((bookmark) => ({
+          id: bookmark.id,
+          position: bookmark.position,
+          note: bookmark.note ?? '',
+        })),
+        createdAt: currentProjectId ? undefined : now,
+      });
+      setCurrentProjectId(record.id);
+      setSaveStatus('Progetto salvato.');
+      window.setTimeout(() => setSaveStatus(''), 2500);
+    } catch (error) {
+      console.error(error);
+      setSaveStatus('');
+      setErrorText(error.message || 'Salvataggio progetto non riuscito.');
+    }
+  }
+
+  async function handleOpenProject(projectId) {
+    if (!projectId || isBusy) {
+      return;
+    }
+    try {
+      const record = await loadStoredProject(projectId);
+      if (!record || !record.audioBlob) {
+        setProjectsError('Progetto non trovato o corrotto.');
+        return;
+      }
+
+      const file = new File([record.audioBlob], record.audioName || `${record.name}.bin`, {
+        type: record.audioMimeType || record.audioBlob.type,
+      });
+      setActiveCapture('none');
+      setCurrentProjectId(record.id);
+      await analyzeFile(file);
+      if (Array.isArray(record.customCuts) && record.customCuts.length > 0) {
+        setCustomCuts(
+          record.customCuts.map((cut) => ({
+            id: cut.id ?? createPointId(),
+            value: cut.value ?? '',
+            position:
+              typeof cut.position === 'number' && Number.isFinite(cut.position)
+                ? cut.position
+                : null,
+          })),
+        );
+        if (record.mode) {
+          setMode(record.mode);
+        }
+      }
+      if (Array.isArray(record.bookmarks) && record.bookmarks.length > 0) {
+        setBookmarks(
+          record.bookmarks.map((bookmark) => ({
+            id: bookmark.id ?? createPointId(),
+            position: bookmark.position,
+            note: bookmark.note ?? '',
+          })),
+        );
+      }
+      if (typeof record.equalParts === 'number' && record.equalParts > 0) {
+        setEqualParts(record.equalParts);
+      }
+    } catch (error) {
+      console.error(error);
+      setProjectsError(error.message || 'Non sono riuscito ad aprire il progetto.');
+    }
+  }
+
+  async function handleDeleteProject(projectId) {
+    if (!projectId) {
+      return;
+    }
+    const confirmed = window.confirm('Eliminare definitivamente questo progetto?');
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await deleteStoredProject(projectId);
+      if (currentProjectId === projectId) {
+        setCurrentProjectId(null);
+      }
+      await refreshProjects();
+    } catch (error) {
+      console.error(error);
+      setProjectsError(error.message || 'Eliminazione non riuscita.');
+    }
+  }
+
+  async function handleRecordedFile(file) {
+    setActiveCapture('none');
+    setCurrentProjectId(null);
+    await analyzeFile(file);
+  }
+
   async function handleRestoreOriginal() {
     if (!originalAudioBackup || isBusy) {
       return;
@@ -1201,28 +1358,81 @@ export default function App() {
             </button>
           </div>
 
-          <label
-            className={`dropzone ${dragActive ? 'dropzone-active' : ''} ${isBusy ? 'dropzone-busy' : ''}`}
-            onDragEnter={handleDragEnter}
-            onDragLeave={handleDragLeave}
-            onDragOver={handleDragOver}
-            onDrop={handleDrop}
-          >
-            <input
-              ref={inputRef}
-              type="file"
-              accept={ACCEPTED_AUDIO_TYPES}
-              onChange={handleInputChange}
+          <div className="capture-switcher" role="tablist">
+            <button
+              type="button"
+              className={activeCapture === 'none' ? 'capture-tab capture-tab-active' : 'capture-tab'}
+              onClick={() => setActiveCapture('none')}
               disabled={isBusy}
-              hidden
+            >
+              Carica file
+            </button>
+            <button
+              type="button"
+              className={activeCapture === 'recorder' ? 'capture-tab capture-tab-active' : 'capture-tab'}
+              onClick={() => setActiveCapture(activeCapture === 'recorder' ? 'none' : 'recorder')}
+              disabled={isBusy}
+            >
+              Registra
+            </button>
+            <button
+              type="button"
+              className={activeCapture === 'library' ? 'capture-tab capture-tab-active' : 'capture-tab'}
+              onClick={() => setActiveCapture(activeCapture === 'library' ? 'none' : 'library')}
+              disabled={isBusy}
+            >
+              Progetti salvati
+            </button>
+          </div>
+
+          {activeCapture === 'recorder' ? (
+            <Recorder
+              onRecorded={handleRecordedFile}
+              disabled={isBusy}
+              onClose={() => setActiveCapture('none')}
             />
-            <span className="dropzone-kicker">Drag & drop oppure click</span>
-            <strong>Carica un file audio</strong>
-            <p>
-              Supporto pensato per i formati più comuni. Il file resta locale e non viene
-              caricato su server esterni.
-            </p>
-          </label>
+          ) : null}
+
+          {activeCapture === 'library' ? (
+            <>
+              <ProjectLibrary
+                projects={projects}
+                currentProjectId={currentProjectId}
+                onOpen={handleOpenProject}
+                onDelete={handleDeleteProject}
+                onClose={() => setActiveCapture('none')}
+                onRefresh={refreshProjects}
+                isLoading={projectsLoading}
+                disabled={isBusy}
+              />
+              {projectsError ? <p className="error-text">{projectsError}</p> : null}
+            </>
+          ) : null}
+
+          {activeCapture === 'none' ? (
+            <label
+              className={`dropzone ${dragActive ? 'dropzone-active' : ''} ${isBusy ? 'dropzone-busy' : ''}`}
+              onDragEnter={handleDragEnter}
+              onDragLeave={handleDragLeave}
+              onDragOver={handleDragOver}
+              onDrop={handleDrop}
+            >
+              <input
+                ref={inputRef}
+                type="file"
+                accept={ACCEPTED_AUDIO_TYPES}
+                onChange={handleInputChange}
+                disabled={isBusy}
+                hidden
+              />
+              <span className="dropzone-kicker">Drag & drop oppure click</span>
+              <strong>Carica un file audio</strong>
+              <p>
+                Supporto pensato per i formati più comuni. Il file resta locale e non viene
+                caricato su server esterni.
+              </p>
+            </label>
+          ) : null}
 
           <div className="status-strip">
             <div>
@@ -1508,9 +1718,22 @@ export default function App() {
                 {isBusy ? 'Elaborazione in corso...' : 'Taglia e scarica tutto'}
               </button>
 
+              <div className="save-row">
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={handleSaveProject}
+                  disabled={!audioFile || isBusy}
+                  title="Salva l'audio, i tagli e i segnalibri nel browser per riprenderli più tardi"
+                >
+                  {currentProjectId ? 'Aggiorna progetto salvato' : 'Salva progetto'}
+                </button>
+                {saveStatus ? <span className="save-status">{saveStatus}</span> : null}
+              </div>
+
               <p className="helper-text">
                 Il download genera uno ZIP senza comprimere di nuovo l’audio, per restare più
-                rapido possibile.
+                rapido possibile. I progetti salvati restano in questo browser, offline.
               </p>
             </aside>
           </div>
