@@ -989,6 +989,66 @@ export default function App() {
     await analyzeFile(file);
   }
 
+  async function handleExportForAiStudio() {
+    if (!audioFile || isBusy) {
+      return;
+    }
+    setErrorText('');
+    setIsBusy(true);
+    setStatusText('Preparo una copia ottimizzata per Google AI Studio...');
+    setPhaseProgress(0.15);
+
+    const outputName = `ai-studio-${Date.now()}.m4a`;
+    let ffmpeg = null;
+
+    try {
+      ffmpeg = await ensureEngineReady();
+      setPhaseProgress(0.4);
+
+      await ffmpeg.exec([
+        '-hide_banner',
+        '-nostats',
+        '-i',
+        audioFile.virtualInputName,
+        '-ac',
+        '1',
+        '-ar',
+        '16000',
+        '-c:a',
+        'aac',
+        '-b:a',
+        '32k',
+        '-movflags',
+        '+faststart',
+        outputName,
+      ]);
+      setPhaseProgress(0.85);
+
+      const data = await ffmpeg.readFile(outputName);
+      const blob = new Blob([data], { type: 'audio/mp4' });
+      const fileName = `${audioFile.baseName} - AI Studio.m4a`;
+      downloadBlob(blob, fileName);
+
+      setStatusText(
+        `Copia pronta (${formatBytes(blob.size)} · mono 16kHz AAC 32k). Caricala su AI Studio e chiedi la trascrizione.`,
+      );
+      setTechnicalLog(
+        `ai-studio export: mono 16kHz AAC 32k, ${formatBytes(blob.size)}.`,
+      );
+      setPhaseProgress(1);
+    } catch (error) {
+      console.error(error);
+      setErrorText(error.message || 'Export per AI Studio non riuscito.');
+      setStatusText('Export per AI Studio non completato.');
+      setPhaseProgress(0);
+    } finally {
+      if (ffmpeg) {
+        await safeDelete(ffmpeg, outputName);
+      }
+      setIsBusy(false);
+    }
+  }
+
   async function handleRestoreOriginal() {
     if (!originalAudioBackup || isBusy) {
       return;
@@ -1729,6 +1789,34 @@ export default function App() {
                   {currentProjectId ? 'Aggiorna progetto salvato' : 'Salva progetto'}
                 </button>
                 {saveStatus ? <span className="save-status">{saveStatus}</span> : null}
+              </div>
+
+              <div className="ai-studio-row">
+                <div>
+                  <p className="section-label">Trascrizione con Gemini</p>
+                  <p className="helper-text">
+                    Scarica una copia leggera (mono 16 kHz, AAC 32 kbps) pronta per essere
+                    caricata su Google AI Studio.
+                  </p>
+                </div>
+                <div className="ai-studio-actions">
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={handleExportForAiStudio}
+                    disabled={!audioFile || isBusy}
+                  >
+                    Esporta per AI Studio
+                  </button>
+                  <a
+                    className="ghost-link"
+                    href="https://aistudio.google.com/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Apri AI Studio ↗
+                  </a>
+                </div>
               </div>
 
               <p className="helper-text">
