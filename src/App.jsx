@@ -1,4 +1,4 @@
-import { startTransition, useEffect, useRef, useState } from 'react';
+import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile } from '@ffmpeg/util';
 import JSZip from 'jszip';
@@ -13,6 +13,13 @@ import {
   parseTimeInput,
   stripExtension,
 } from './lib/time.js';
+import { WaveformEditor } from './components/WaveformEditor.jsx';
+import { PlayerControls } from './components/PlayerControls.jsx';
+import { BookmarksPanel } from './components/BookmarksPanel.jsx';
+import {
+  KEYBOARD_HINTS,
+  useKeyboardShortcuts,
+} from './hooks/useKeyboardShortcuts.js';
 
 const ACCEPTED_AUDIO_TYPES = [
   'audio/*',
@@ -139,12 +146,12 @@ function formatFfmpegTime(seconds) {
 
 export default function App() {
   const ffmpegRef = useRef(null);
-  const audioRef = useRef(null);
   const inputRef = useRef(null);
   const objectUrlRef = useRef('');
   const activeInputRef = useRef('');
   const activeProbeRef = useRef('');
   const dragDepthRef = useRef(0);
+  const waveformRef = useRef(null);
 
   const [engineState, setEngineState] = useState('idle');
   const [statusText, setStatusText] = useState(INITIAL_MESSAGE);
@@ -159,6 +166,13 @@ export default function App() {
   const [currentTime, setCurrentTime] = useState(0);
   const [lastResult, setLastResult] = useState(null);
   const [audioFile, setAudioFile] = useState(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const [zoom, setZoom] = useState(60);
+  const [loopRegion, setLoopRegion] = useState(null);
+  const [loopDraft, setLoopDraft] = useState(null);
+  const [bookmarks, setBookmarks] = useState([]);
+  const [showShortcuts, setShowShortcuts] = useState(false);
 
   const plan = buildPlan({
     duration: audioFile?.duration ?? 0,
@@ -314,6 +328,12 @@ export default function App() {
         setEqualParts(2);
         setCustomCuts([]);
         setCurrentTime(0);
+        setIsPlaying(false);
+        setPlaybackRate(1);
+        setZoom(60);
+        setLoopRegion(null);
+        setLoopDraft(null);
+        setBookmarks([]);
       });
 
       setStatusText('File pronto. Scegli il tipo di taglio e scarica tutte le parti insieme.');
@@ -379,31 +399,216 @@ export default function App() {
     }
   }
 
-  function addCutAt(seconds) {
-    if (!audioFile?.duration) {
-      return;
-    }
+  const addCutAt = useCallback(
+    (seconds) => {
+      if (!audioFile?.duration) {
+        return;
+      }
 
-    const safeSeconds = clamp(seconds, 0.25, Math.max(0.25, audioFile.duration - 0.25));
-    setMode('custom');
-    setCustomCuts((previous) => [
-      ...previous,
-      {
-        id: createPointId(),
-        value: formatClock(safeSeconds),
-      },
-    ]);
-  }
+      const safeSeconds = clamp(seconds, 0.25, Math.max(0.25, audioFile.duration - 0.25));
+      setMode('custom');
+      setCustomCuts((previous) => {
+        const alreadyNear = previous.some(
+          (point) =>
+            typeof point.position === 'number' &&
+            Math.abs(point.position - safeSeconds) < 0.1,
+        );
+        if (alreadyNear) {
+          return previous;
+        }
+        return [
+          ...previous,
+          {
+            id: createPointId(),
+            value: formatClock(safeSeconds),
+            position: safeSeconds,
+          },
+        ];
+      });
+    },
+    [audioFile?.duration],
+  );
 
   function updateCutPoint(id, value) {
+    const parsed = parseTimeInput(value);
     setCustomCuts((previous) =>
-      previous.map((point) => (point.id === id ? { ...point, value } : point)),
+      previous.map((point) => {
+        if (point.id !== id) {
+          return point;
+        }
+        return {
+          ...point,
+          value,
+          position:
+            parsed !== null && Number.isFinite(parsed) ? parsed : point.position,
+        };
+      }),
     );
   }
+
+  const updateCutPointPosition = useCallback((id, position) => {
+    if (!Number.isFinite(position)) {
+      return;
+    }
+    setCustomCuts((previous) =>
+      previous.map((point) =>
+        point.id === id
+          ? { ...point, value: formatClock(position), position }
+          : point,
+      ),
+    );
+  }, []);
 
   function removeCutPoint(id) {
     setCustomCuts((previous) => previous.filter((point) => point.id !== id));
   }
+
+  const handleTogglePlay = useCallback(() => {
+    waveformRef.current?.togglePlay();
+  }, []);
+
+  const handleSkip = useCallback((delta) => {
+    waveformRef.current?.skip(delta);
+  }, []);
+
+  const RATE_STEPS = useMemo(() => [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3], []);
+
+  const handleRateChange = useCallback((rate) => {
+    if (typeof rate === 'number' && rate > 0) {
+      setPlaybackRate(rate);
+    }
+  }, []);
+
+  const handleSlowDown = useCallback(() => {
+    setPlaybackRate((current) => {
+      const index = RATE_STEPS.findIndex((rate) => Math.abs(rate - current) < 0.01);
+      if (index > 0) {
+        return RATE_STEPS[index - 1];
+      }
+      return RATE_STEPS[0];
+    });
+  }, [RATE_STEPS]);
+
+  const handleSpeedUp = useCallback(() => {
+    setPlaybackRate((current) => {
+      const index = RATE_STEPS.findIndex((rate) => Math.abs(rate - current) < 0.01);
+      if (index === -1) {
+        return 1;
+      }
+      if (index < RATE_STEPS.length - 1) {
+        return RATE_STEPS[index + 1];
+      }
+      return RATE_STEPS[RATE_STEPS.length - 1];
+    });
+  }, [RATE_STEPS]);
+
+  const handleZoomChange = useCallback((value) => {
+    setZoom(value);
+  }, []);
+
+  const getLivePosition = useCallback(() => {
+    return waveformRef.current?.getCurrentTime?.() ?? currentTime;
+  }, [currentTime]);
+
+  const handleSetLoopStart = useCallback(() => {
+    const position = getLivePosition();
+    setLoopRegion(null);
+    setLoopDraft(position);
+  }, [getLivePosition]);
+
+  const handleSetLoopEnd = useCallback(() => {
+    const position = getLivePosition();
+    if (loopDraft !== null && position > loopDraft + 0.2) {
+      setLoopRegion({ start: loopDraft, end: position });
+      setLoopDraft(null);
+      return;
+    }
+    if (loopRegion && position > loopRegion.start + 0.2) {
+      setLoopRegion({ start: loopRegion.start, end: position });
+    }
+  }, [getLivePosition, loopDraft, loopRegion]);
+
+  const handleClearLoop = useCallback(() => {
+    setLoopRegion(null);
+    setLoopDraft(null);
+  }, []);
+
+  const handleAddCutHere = useCallback(() => {
+    const position = getLivePosition();
+    addCutAt(position);
+  }, [addCutAt, getLivePosition]);
+
+  const handleAddBookmarkHere = useCallback(() => {
+    if (!audioFile?.duration) {
+      return;
+    }
+    const position = clamp(getLivePosition(), 0, audioFile.duration);
+    setBookmarks((previous) =>
+      [
+        ...previous,
+        { id: createPointId(), position, note: '' },
+      ].sort((left, right) => left.position - right.position),
+    );
+  }, [audioFile?.duration, getLivePosition]);
+
+  const handleBookmarkJump = useCallback(
+    (id) => {
+      const bookmark = bookmarks.find((item) => item.id === id);
+      if (bookmark) {
+        waveformRef.current?.seekTo(bookmark.position);
+      }
+    },
+    [bookmarks],
+  );
+
+  const handleBookmarkNoteChange = useCallback((id, note) => {
+    setBookmarks((previous) =>
+      previous.map((bookmark) =>
+        bookmark.id === id ? { ...bookmark, note } : bookmark,
+      ),
+    );
+  }, []);
+
+  const handleBookmarkRemove = useCallback((id) => {
+    setBookmarks((previous) => previous.filter((bookmark) => bookmark.id !== id));
+  }, []);
+
+  const handleWaveformReady = useCallback((duration) => {
+    setPhaseProgress(0);
+    if (Number.isFinite(duration) && duration > 0) {
+      setAudioFile((previous) =>
+        previous && Math.abs((previous.duration ?? 0) - duration) > 0.05
+          ? { ...previous, duration }
+          : previous,
+      );
+    }
+  }, []);
+
+  const handleWaveformTimeUpdate = useCallback((time) => {
+    setCurrentTime(time);
+  }, []);
+
+  const handleWaveformPlayStateChange = useCallback((playing) => {
+    setIsPlaying(playing);
+  }, []);
+
+  useKeyboardShortcuts(
+    {
+      togglePlay: handleTogglePlay,
+      skipBack5: () => handleSkip(-5),
+      skipForward5: () => handleSkip(5),
+      skipBack30: () => handleSkip(-30),
+      skipForward30: () => handleSkip(30),
+      slowDown: handleSlowDown,
+      speedUp: handleSpeedUp,
+      addCutHere: handleAddCutHere,
+      addBookmarkHere: handleAddBookmarkHere,
+      setLoopStart: handleSetLoopStart,
+      setLoopEnd: handleSetLoopEnd,
+      clearLoop: handleClearLoop,
+    },
+    { enabled: Boolean(audioFile) && !isBusy },
+  );
 
   async function processAndDownload() {
     if (!audioFile || plan.error || plan.segments.length < 2) {
@@ -737,22 +942,85 @@ export default function App() {
           </div>
 
           {audioFile ? (
-            <div className="loaded-file">
-              <div>
-                <p className="section-label">File caricato</p>
-                <h2>{audioFile.name}</h2>
-                <div className="meta-row">
-                  <span>{formatClock(audioFile.duration)}</span>
-                  <span>{formatBytes(audioFile.size)}</span>
-                  <span>{audioFile.formatLabel}</span>
+            <div className="studio">
+              <div className="studio-head">
+                <div>
+                  <p className="section-label">File caricato</p>
+                  <h2>{audioFile.name}</h2>
+                  <div className="meta-row">
+                    <span>{formatClock(audioFile.duration)}</span>
+                    <span>{formatBytes(audioFile.size)}</span>
+                    <span>{audioFile.formatLabel}</span>
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  className="ghost-button"
+                  onClick={() => setShowShortcuts((value) => !value)}
+                  title="Mostra scorciatoie da tastiera"
+                >
+                  {showShortcuts ? 'Chiudi scorciatoie' : 'Scorciatoie tastiera'}
+                </button>
               </div>
-              <audio
-                ref={audioRef}
-                controls
-                preload="metadata"
+
+              <WaveformEditor
+                ref={waveformRef}
                 src={audioFile.objectUrl}
-                onTimeUpdate={(event) => setCurrentTime(event.currentTarget.currentTime)}
+                cuts={customCuts}
+                bookmarks={bookmarks}
+                loopRegion={loopRegion}
+                playbackRate={playbackRate}
+                zoom={zoom}
+                onReady={handleWaveformReady}
+                onTimeUpdate={handleWaveformTimeUpdate}
+                onPlayStateChange={handleWaveformPlayStateChange}
+                onCutMove={updateCutPointPosition}
+              />
+
+              <PlayerControls
+                isPlaying={isPlaying}
+                currentTime={currentTime}
+                duration={audioFile.duration}
+                playbackRate={playbackRate}
+                zoom={zoom}
+                loopRegion={loopRegion}
+                loopDraft={loopDraft}
+                onTogglePlay={handleTogglePlay}
+                onSkip={handleSkip}
+                onRateChange={handleRateChange}
+                onZoomChange={handleZoomChange}
+                onSetLoopStart={handleSetLoopStart}
+                onSetLoopEnd={handleSetLoopEnd}
+                onClearLoop={handleClearLoop}
+                onAddCutHere={handleAddCutHere}
+                onAddBookmarkHere={handleAddBookmarkHere}
+                disabled={isBusy}
+              />
+
+              {showShortcuts ? (
+                <div className="shortcuts-panel">
+                  <p className="section-label">Scorciatoie da tastiera</p>
+                  <ul className="shortcuts-list">
+                    {KEYBOARD_HINTS.map((hint) => (
+                      <li key={hint.action}>
+                        <span className="shortcut-keys">
+                          {hint.keys.map((key) => (
+                            <kbd key={key}>{key}</kbd>
+                          ))}
+                        </span>
+                        <span className="shortcut-action">{hint.action}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ) : null}
+
+              <BookmarksPanel
+                bookmarks={bookmarks}
+                onJump={handleBookmarkJump}
+                onRemove={handleBookmarkRemove}
+                onNoteChange={handleBookmarkNoteChange}
+                disabled={isBusy}
               />
             </div>
           ) : null}
@@ -830,33 +1098,38 @@ export default function App() {
                       </p>
                     ) : null}
 
-                    {customCuts.map((point) => (
-                      <div className="cut-row" key={point.id}>
-                        <input
-                          type="text"
-                          value={point.value}
-                          onChange={(event) => updateCutPoint(point.id, event.target.value)}
-                          placeholder="00:30"
-                        />
-                        <input
-                          type="range"
-                          min="0"
-                          max={audioFile?.duration ?? 0}
-                          step="0.1"
-                          value={clamp(
-                            parseTimeInput(point.value) ?? currentTime,
-                            0,
-                            audioFile?.duration ?? 0,
-                          )}
-                          onChange={(event) =>
-                            updateCutPoint(point.id, formatClock(Number(event.target.value)))
-                          }
-                        />
-                        <button type="button" onClick={() => removeCutPoint(point.id)}>
-                          Rimuovi
-                        </button>
-                      </div>
-                    ))}
+                    {customCuts.map((point) => {
+                      const sliderValue = clamp(
+                        typeof point.position === 'number' && Number.isFinite(point.position)
+                          ? point.position
+                          : parseTimeInput(point.value) ?? 0,
+                        0,
+                        audioFile?.duration ?? 0,
+                      );
+                      return (
+                        <div className="cut-row" key={point.id}>
+                          <input
+                            type="text"
+                            value={point.value}
+                            onChange={(event) => updateCutPoint(point.id, event.target.value)}
+                            placeholder="00:30"
+                          />
+                          <input
+                            type="range"
+                            min="0"
+                            max={audioFile?.duration ?? 0}
+                            step="0.1"
+                            value={sliderValue}
+                            onChange={(event) =>
+                              updateCutPointPosition(point.id, Number(event.target.value))
+                            }
+                          />
+                          <button type="button" onClick={() => removeCutPoint(point.id)}>
+                            Rimuovi
+                          </button>
+                        </div>
+                      );
+                    })}
 
                     <button
                       type="button"
@@ -864,7 +1137,7 @@ export default function App() {
                       onClick={() =>
                         setCustomCuts((previous) => [
                           ...previous,
-                          { id: createPointId(), value: '' },
+                          { id: createPointId(), value: '', position: null },
                         ])
                       }
                     >

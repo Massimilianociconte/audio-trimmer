@@ -18,11 +18,22 @@ function createSegments(boundaries) {
 
 function sanitizeCutPoints(duration, rawCuts) {
   const parsedCuts = rawCuts
-    .map((item) => ({
-      ...item,
-      parsed: parseTimeInput(item.value),
-    }))
-    .filter((item) => item.value.trim().length > 0);
+    .map((item) => {
+      const numericPosition =
+        typeof item.position === 'number' && Number.isFinite(item.position)
+          ? item.position
+          : null;
+      return {
+        ...item,
+        parsed: numericPosition !== null ? numericPosition : parseTimeInput(item.value),
+      };
+    })
+    .filter((item) => {
+      if (typeof item.position === 'number' && Number.isFinite(item.position)) {
+        return true;
+      }
+      return typeof item.value === 'string' && item.value.trim().length > 0;
+    });
 
   const invalid = parsedCuts.find((item) => item.parsed === null);
   if (invalid) {
