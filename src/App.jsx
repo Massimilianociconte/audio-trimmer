@@ -16,10 +16,17 @@ import {
 import { WaveformEditor } from './components/WaveformEditor.jsx';
 import { PlayerControls } from './components/PlayerControls.jsx';
 import { BookmarksPanel } from './components/BookmarksPanel.jsx';
+import { AutomationPanel } from './components/AutomationPanel.jsx';
 import {
   KEYBOARD_HINTS,
   useKeyboardShortcuts,
 } from './hooks/useKeyboardShortcuts.js';
+import {
+  buildSilenceDetectFilter,
+  parseSilenceLog,
+  silencesToCutPoints,
+} from './lib/silence.js';
+import { buildCleanupFilter, getCleanupPreset } from './lib/cleanup.js';
 
 const ACCEPTED_AUDIO_TYPES = [
   'audio/*',
@@ -173,6 +180,12 @@ export default function App() {
   const [loopDraft, setLoopDraft] = useState(null);
   const [bookmarks, setBookmarks] = useState([]);
   const [showShortcuts, setShowShortcuts] = useState(false);
+  const [silenceThresholdDb, setSilenceThresholdDb] = useState(-30);
+  const [silenceMinDuration, setSilenceMinDuration] = useState(2);
+  const [silenceMinSegment, setSilenceMinSegment] = useState(8);
+  const [cleanupPreset, setCleanupPreset] = useState('none');
+  const [originalAudioBackup, setOriginalAudioBackup] = useState(null);
+  const [lastDetectionSummary, setLastDetectionSummary] = useState('');
 
   const plan = buildPlan({
     duration: audioFile?.duration ?? 0,
@@ -181,11 +194,19 @@ export default function App() {
     customCuts,
   });
 
+  const backupUrlRef = useRef(null);
+  backupUrlRef.current = originalAudioBackup?.objectUrl ?? null;
+
   useEffect(() => {
     return () => {
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
         objectUrlRef.current = '';
+      }
+
+      if (backupUrlRef.current && backupUrlRef.current !== objectUrlRef.current) {
+        URL.revokeObjectURL(backupUrlRef.current);
+        backupUrlRef.current = null;
       }
 
       if (ffmpegRef.current) {
@@ -334,6 +355,15 @@ export default function App() {
         setLoopRegion(null);
         setLoopDraft(null);
         setBookmarks([]);
+        setCleanupPreset('none');
+        setLastDetectionSummary('');
+      });
+
+      setOriginalAudioBackup((previousBackup) => {
+        if (previousBackup?.objectUrl) {
+          URL.revokeObjectURL(previousBackup.objectUrl);
+        }
+        return null;
       });
 
       setStatusText('File pronto. Scegli il tipo di taglio e scarica tutte le parti insieme.');
@@ -591,6 +621,274 @@ export default function App() {
   const handleWaveformPlayStateChange = useCallback((playing) => {
     setIsPlaying(playing);
   }, []);
+
+  async function runWithLogCapture(ffmpeg, args) {
+    const logs = [];
+    const capture = ({ message }) => {
+      if (typeof message === 'string') {
+        logs.push(message);
+      }
+    };
+    ffmpeg.on('log', capture);
+    try {
+      await ffmpeg.exec(args);
+      return logs.join('\n');
+    } finally {
+      ffmpeg.off('log', capture);
+    }
+  }
+
+  async function handleDetectSilences() {
+    if (!audioFile || isBusy) {
+      return;
+    }
+
+    setErrorText('');
+    setIsBusy(true);
+    setStatusText('Analisi dell’audio per trovare le pause lunghe...');
+    setPhaseProgress(0.15);
+
+    try {
+      const ffmpeg = await ensureEngineReady();
+      setPhaseProgress(0.4);
+
+      const filter = buildSilenceDetectFilter({
+        thresholdDb: silenceThresholdDb,
+        minSilenceSeconds: silenceMinDuration,
+      });
+
+      const logText = await runWithLogCapture(ffmpeg, [
+        '-hide_banner',
+        '-nostats',
+        '-i',
+        audioFile.virtualInputName,
+        '-af',
+        filter,
+        '-f',
+        'null',
+        '-',
+      ]);
+
+      const silences = parseSilenceLog(logText);
+      const cutPositions = silencesToCutPoints({
+        silences,
+        duration: audioFile.duration,
+        minSegmentLength: silenceMinSegment,
+      });
+
+      if (cutPositions.length === 0) {
+        setLastDetectionSummary(
+          `Nessun taglio utile con soglia ${silenceThresholdDb} dB e pausa ≥ ${silenceMinDuration}s. Prova ad abbassare la pausa o ad alzare la soglia.`,
+        );
+        setStatusText('Analisi completata: nessuna pausa adatta.');
+        setPhaseProgress(0);
+        return;
+      }
+
+      setMode('custom');
+      setCustomCuts(
+        cutPositions.map((position) => ({
+          id: createPointId(),
+          value: formatClock(position),
+          position,
+        })),
+      );
+
+      setLastDetectionSummary(
+        `${cutPositions.length} taglio${cutPositions.length === 1 ? '' : 'i'} auto da ${silences.length} pause rilevate.`,
+      );
+      setStatusText(
+        `Rilevati ${silences.length} silenzi; suggeriti ${cutPositions.length} punti di taglio.`,
+      );
+      setTechnicalLog(
+        `silencedetect: threshold=${silenceThresholdDb}dB, min=${silenceMinDuration}s → ${silences.length} gap.`,
+      );
+      setPhaseProgress(1);
+    } catch (error) {
+      console.error(error);
+      setErrorText(error.message || 'Non sono riuscito ad analizzare i silenzi.');
+      setStatusText('Analisi dei silenzi non completata.');
+      setPhaseProgress(0);
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function handleApplyCleanup() {
+    if (!audioFile || isBusy) {
+      return;
+    }
+    const preset = getCleanupPreset(cleanupPreset);
+    if (!preset || preset.filters.length === 0) {
+      return;
+    }
+
+    setErrorText('');
+    setIsBusy(true);
+    setStatusText(`Applico il preset "${preset.label}"...`);
+    setPhaseProgress(0.1);
+
+    const cleanedVirtualName = `cleaned-${Date.now()}.m4a`;
+    let ffmpeg = null;
+
+    try {
+      ffmpeg = await ensureEngineReady();
+      setPhaseProgress(0.3);
+
+      const filterChain = buildCleanupFilter(cleanupPreset);
+      await ffmpeg.exec([
+        '-hide_banner',
+        '-nostats',
+        '-i',
+        audioFile.virtualInputName,
+        '-af',
+        filterChain,
+        '-c:a',
+        'aac',
+        '-b:a',
+        '128k',
+        '-movflags',
+        '+faststart',
+        cleanedVirtualName,
+      ]);
+      setPhaseProgress(0.7);
+
+      const cleanedData = await ffmpeg.readFile(cleanedVirtualName);
+      const cleanedBlob = new Blob([cleanedData], { type: 'audio/mp4' });
+      const newObjectUrl = URL.createObjectURL(cleanedBlob);
+
+      const probedDuration = await readAudioDurationFromBrowser(newObjectUrl);
+      const newDuration =
+        typeof probedDuration === 'number' && Number.isFinite(probedDuration) && probedDuration > 0
+          ? probedDuration
+          : audioFile.duration;
+
+      setOriginalAudioBackup((previousBackup) => {
+        if (previousBackup) {
+          return previousBackup;
+        }
+        return {
+          objectUrl: audioFile.objectUrl,
+          virtualInputName: audioFile.virtualInputName,
+          extension: audioFile.extension,
+          duration: audioFile.duration,
+          formatLabel: audioFile.formatLabel,
+          mimeType: audioFile.mimeType,
+          size: audioFile.size,
+          baseName: audioFile.baseName,
+          name: audioFile.name,
+        };
+      });
+
+      if (!originalAudioBackup && objectUrlRef.current === audioFile.objectUrl) {
+        // Keep the old objectUrl alive (it is tracked inside the backup)
+      } else if (audioFile.objectUrl && audioFile.objectUrl !== originalAudioBackup?.objectUrl) {
+        URL.revokeObjectURL(audioFile.objectUrl);
+      }
+      objectUrlRef.current = newObjectUrl;
+
+      if (!originalAudioBackup) {
+        // Do not delete the original file from ffmpeg FS; keep it so we can restore.
+      } else if (audioFile.virtualInputName !== originalAudioBackup.virtualInputName) {
+        await safeDelete(ffmpeg, audioFile.virtualInputName);
+      }
+
+      setAudioFile((previous) =>
+        previous
+          ? {
+              ...previous,
+              objectUrl: newObjectUrl,
+              virtualInputName: cleanedVirtualName,
+              extension: 'm4a',
+              duration: newDuration,
+              formatLabel: `${preset.label} · AAC 128k`,
+              mimeType: 'audio/mp4',
+              size: cleanedBlob.size,
+            }
+          : previous,
+      );
+
+      activeInputRef.current = cleanedVirtualName;
+      setCustomCuts([]);
+      setBookmarks([]);
+      setLoopRegion(null);
+      setLoopDraft(null);
+      setCurrentTime(0);
+      setIsPlaying(false);
+      setLastDetectionSummary('');
+      setStatusText(`Pulizia applicata (${preset.label}). Il file è pronto per il taglio.`);
+      setTechnicalLog(`cleanup: ${preset.filters.join(' → ')}`);
+      setPhaseProgress(1);
+    } catch (error) {
+      console.error(error);
+      setErrorText(error.message || 'Pulizia dell’audio non completata.');
+      setStatusText('Pulizia non completata.');
+      setPhaseProgress(0);
+      if (ffmpeg) {
+        await safeDelete(ffmpeg, cleanedVirtualName);
+      }
+    } finally {
+      setIsBusy(false);
+    }
+  }
+
+  async function handleRestoreOriginal() {
+    if (!originalAudioBackup || isBusy) {
+      return;
+    }
+
+    setErrorText('');
+    setIsBusy(true);
+    setStatusText('Ripristino la versione originale del file...');
+
+    try {
+      const currentVirtual = audioFile?.virtualInputName;
+      if (audioFile?.objectUrl && audioFile.objectUrl !== originalAudioBackup.objectUrl) {
+        URL.revokeObjectURL(audioFile.objectUrl);
+      }
+      if (ffmpegRef.current && currentVirtual && currentVirtual !== originalAudioBackup.virtualInputName) {
+        await safeDelete(ffmpegRef.current, currentVirtual);
+      }
+
+      objectUrlRef.current = originalAudioBackup.objectUrl;
+      activeInputRef.current = originalAudioBackup.virtualInputName;
+
+      setAudioFile((previous) =>
+        previous
+          ? {
+              ...previous,
+              objectUrl: originalAudioBackup.objectUrl,
+              virtualInputName: originalAudioBackup.virtualInputName,
+              extension: originalAudioBackup.extension,
+              duration: originalAudioBackup.duration,
+              formatLabel: originalAudioBackup.formatLabel,
+              mimeType: originalAudioBackup.mimeType,
+              size: originalAudioBackup.size,
+              baseName: originalAudioBackup.baseName ?? previous.baseName,
+              name: originalAudioBackup.name ?? previous.name,
+            }
+          : previous,
+      );
+      setCustomCuts([]);
+      setBookmarks([]);
+      setLoopRegion(null);
+      setLoopDraft(null);
+      setCurrentTime(0);
+      setIsPlaying(false);
+      setCleanupPreset('none');
+      setLastDetectionSummary('');
+      setOriginalAudioBackup(null);
+      setStatusText('Versione originale ripristinata.');
+      setTechnicalLog('cleanup: ripristino originale completato.');
+      setPhaseProgress(0);
+    } catch (error) {
+      console.error(error);
+      setErrorText(error.message || 'Ripristino non riuscito.');
+      setStatusText('Ripristino non completato.');
+    } finally {
+      setIsBusy(false);
+    }
+  }
 
   useKeyboardShortcuts(
     {
@@ -1023,6 +1321,26 @@ export default function App() {
                 disabled={isBusy}
               />
             </div>
+          ) : null}
+
+          {audioFile ? (
+            <AutomationPanel
+              silenceThresholdDb={silenceThresholdDb}
+              silenceMinDuration={silenceMinDuration}
+              silenceMinSegment={silenceMinSegment}
+              onSilenceThresholdChange={setSilenceThresholdDb}
+              onSilenceDurationChange={setSilenceMinDuration}
+              onSilenceMinSegmentChange={setSilenceMinSegment}
+              onDetectSilences={handleDetectSilences}
+              cleanupPreset={cleanupPreset}
+              onCleanupPresetChange={setCleanupPreset}
+              onApplyCleanup={handleApplyCleanup}
+              onRestoreOriginal={handleRestoreOriginal}
+              hasOriginalBackup={Boolean(originalAudioBackup)}
+              hasCleanedAudio={Boolean(originalAudioBackup)}
+              disabled={isBusy}
+              lastDetectionSummary={lastDetectionSummary}
+            />
           ) : null}
 
           <div className="editor-grid">

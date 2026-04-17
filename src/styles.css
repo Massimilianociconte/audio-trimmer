@@ -696,6 +696,128 @@ kbd {
   color: var(--ink);
 }
 
+.automation {
+  display: grid;
+  gap: 16px;
+  padding: 24px;
+  border-radius: var(--radius-lg);
+  background:
+    linear-gradient(135deg, rgba(239, 108, 47, 0.06), rgba(15, 140, 98, 0.05)),
+    var(--surface);
+  border: 1px solid var(--line);
+}
+
+.automation-head h3 {
+  margin: 4px 0 0;
+  font-size: clamp(1.1rem, 2.4vw, 1.4rem);
+  letter-spacing: -0.02em;
+}
+
+.automation-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.automation-card {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line);
+}
+
+.automation-params {
+  display: grid;
+  gap: 8px;
+}
+
+.param-field {
+  display: grid;
+  gap: 4px;
+}
+
+.param-field > span {
+  font-size: 0.8rem;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.param-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.param-row input[type='range'] {
+  flex: 1;
+}
+
+.param-row strong {
+  min-width: 64px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+
+.preset-chooser {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.preset-chip {
+  padding: 8px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.8);
+  color: var(--muted);
+  font-size: 0.88rem;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    color 160ms ease;
+}
+
+.preset-chip:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.preset-chip-active {
+  background: rgba(239, 108, 47, 0.16);
+  border-color: rgba(239, 108, 47, 0.38);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.preset-chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.preset-description {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+
+.automation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.automation-actions .helper-text {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
 .editor-grid {
   grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
   align-items: start;
