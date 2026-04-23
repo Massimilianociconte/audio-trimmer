@@ -2,6 +2,19 @@ import { clamp, formatClock, parseTimeInput } from './time.js';
 
 const MIN_SLICE_DURATION = 0.25;
 
+export function normalizeExtension(extension) {
+  if (!extension) {
+    return '';
+  }
+
+  const trimmed = String(extension).trim().toLowerCase();
+  if (!trimmed) {
+    return '';
+  }
+
+  return trimmed.startsWith('.') ? trimmed : `.${trimmed}`;
+}
+
 function createSegments(boundaries) {
   return boundaries.slice(0, -1).map((start, index) => {
     const end = boundaries[index + 1];
@@ -19,17 +32,20 @@ function createSegments(boundaries) {
 function sanitizeCutPoints(duration, rawCuts) {
   const parsedCuts = rawCuts
     .map((item) => {
+      const hasTextValue =
+        typeof item.value === 'string' && item.value.trim().length > 0;
       const numericPosition =
         typeof item.position === 'number' && Number.isFinite(item.position)
           ? item.position
           : null;
+
       return {
         ...item,
-        parsed: numericPosition !== null ? numericPosition : parseTimeInput(item.value),
+        parsed: hasTextValue ? parseTimeInput(item.value) : numericPosition,
       };
     })
     .filter((item) => {
-      if (typeof item.position === 'number' && Number.isFinite(item.position)) {
+      if (item.parsed !== null) {
         return true;
       }
       return typeof item.value === 'string' && item.value.trim().length > 0;
@@ -45,19 +61,11 @@ function sanitizeCutPoints(duration, rawCuts) {
     .filter((value) => value > 0 && value < duration)
     .sort((left, right) => left - right);
 
-  const deduped = normalized.filter((value, index) => {
-    if (index === 0) {
-      return true;
-    }
-
-    return value - normalized[index - 1] >= MIN_SLICE_DURATION;
-  });
-
-  if (deduped.length === 0) {
+  if (normalized.length === 0) {
     return { error: 'Aggiungi almeno un punto di taglio valido.' };
   }
 
-  const boundaries = [0, ...deduped, duration];
+  const boundaries = [0, ...normalized, duration];
   const tooSmall = boundaries.some((value, index) => {
     if (index === 0) {
       return false;
@@ -70,7 +78,7 @@ function sanitizeCutPoints(duration, rawCuts) {
     return { error: 'Ogni parte deve durare almeno 0,25 secondi.' };
   }
 
-  return { cutPoints: deduped, segments: createSegments(boundaries) };
+  return { cutPoints: normalized, segments: createSegments(boundaries) };
 }
 
 function buildEqualSegments(duration, parts) {
@@ -80,6 +88,10 @@ function buildEqualSegments(duration, parts) {
 
   if (!Number.isInteger(parts) || parts < 2) {
     return { error: 'Servono almeno 2 parti.' };
+  }
+
+  if (duration / parts < MIN_SLICE_DURATION) {
+    return { error: 'Riduci il numero di parti: ogni parte deve durare almeno 0,25 secondi.' };
   }
 
   const step = duration / parts;
@@ -113,9 +125,9 @@ export function buildPlan({ duration, mode, equalParts, customCuts }) {
 }
 
 export function buildDownloadName(baseName, index, extension) {
-  return `${baseName} - parte ${index}${extension}`;
+  return `${baseName || 'audio'} - parte ${index}${normalizeExtension(extension)}`;
 }
 
 export function buildVirtualSegmentName(prefix, index, extension) {
-  return `${prefix}-${String(index).padStart(3, '0')}${extension}`;
+  return `${prefix}-${String(index).padStart(3, '0')}${normalizeExtension(extension)}`;
 }

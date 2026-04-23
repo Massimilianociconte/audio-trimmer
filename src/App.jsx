@@ -1,10 +1,13 @@
 import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile } from '@ffmpeg/util';
-import JSZip from 'jszip';
 import ffmpegCoreUrl from '@ffmpeg/core?url';
 import ffmpegWasmUrl from '@ffmpeg/core/wasm?url';
-import { buildDownloadName, buildPlan, buildVirtualSegmentName } from './lib/segments.js';
+import {
+  buildDownloadName,
+  buildPlan,
+  buildVirtualSegmentName,
+} from './lib/segments.js';
 import {
   clamp,
   formatBytes,
@@ -303,12 +306,18 @@ export default function App() {
 
       const ffmpeg = await ensureEngineReady();
 
-      if (activeInputRef.current) {
-        await safeDelete(ffmpeg, activeInputRef.current);
+      const staleVirtualNames = new Set(
+        [
+          activeInputRef.current,
+          activeProbeRef.current,
+          originalAudioBackup?.virtualInputName,
+        ].filter(Boolean),
+      );
+      for (const virtualName of staleVirtualNames) {
+        await safeDelete(ffmpeg, virtualName);
       }
-      if (activeProbeRef.current) {
-        await safeDelete(ffmpeg, activeProbeRef.current);
-      }
+      activeInputRef.current = '';
+      activeProbeRef.current = '';
 
       await ffmpeg.writeFile(virtualInputName, await fetchFile(file));
       activeInputRef.current = virtualInputName;
@@ -333,6 +342,8 @@ export default function App() {
         }
 
         const probeRaw = await ffmpeg.readFile(probeOutputName, 'utf8');
+        await safeDelete(ffmpeg, probeOutputName);
+        activeProbeRef.current = '';
         duration = Number(String(probeRaw).trim());
         technicalMessage = 'Durata recuperata con ffprobe.';
       }
@@ -486,7 +497,7 @@ export default function App() {
           ...point,
           value,
           position:
-            parsed !== null && Number.isFinite(parsed) ? parsed : point.position,
+            parsed !== null && Number.isFinite(parsed) ? parsed : null,
         };
       }),
     );
@@ -746,13 +757,14 @@ export default function App() {
 
     const cleanedVirtualName = `cleaned-${Date.now()}.m4a`;
     let ffmpeg = null;
+    let cleanedObjectUrl = '';
 
     try {
       ffmpeg = await ensureEngineReady();
       setPhaseProgress(0.3);
 
       const filterChain = buildCleanupFilter(cleanupPreset);
-      await ffmpeg.exec([
+      const cleanupExitCode = await ffmpeg.exec([
         '-hide_banner',
         '-nostats',
         '-i',
@@ -767,13 +779,21 @@ export default function App() {
         '+faststart',
         cleanedVirtualName,
       ]);
+      if (cleanupExitCode !== 0) {
+        throw new Error('Pulizia audio non riuscita: FFmpeg ha restituito un errore.');
+      }
       setPhaseProgress(0.7);
 
       const cleanedData = await ffmpeg.readFile(cleanedVirtualName);
       const cleanedBlob = new Blob([cleanedData], { type: 'audio/mp4' });
-      const newObjectUrl = URL.createObjectURL(cleanedBlob);
+      cleanedObjectUrl = URL.createObjectURL(cleanedBlob);
 
-      const probedDuration = await readAudioDurationFromBrowser(newObjectUrl);
+      let probedDuration = NaN;
+      try {
+        probedDuration = await readAudioDurationFromBrowser(cleanedObjectUrl);
+      } catch {
+        probedDuration = NaN;
+      }
       const newDuration =
         typeof probedDuration === 'number' && Number.isFinite(probedDuration) && probedDuration > 0
           ? probedDuration
@@ -801,7 +821,7 @@ export default function App() {
       } else if (audioFile.objectUrl && audioFile.objectUrl !== originalAudioBackup?.objectUrl) {
         URL.revokeObjectURL(audioFile.objectUrl);
       }
-      objectUrlRef.current = newObjectUrl;
+      objectUrlRef.current = cleanedObjectUrl;
 
       if (!originalAudioBackup) {
         // Do not delete the original file from ffmpeg FS; keep it so we can restore.
@@ -813,13 +833,14 @@ export default function App() {
         previous
           ? {
               ...previous,
-              objectUrl: newObjectUrl,
+              objectUrl: cleanedObjectUrl,
               virtualInputName: cleanedVirtualName,
-              extension: 'm4a',
+              extension: '.m4a',
               duration: newDuration,
               formatLabel: `${preset.label} · AAC 128k`,
               mimeType: 'audio/mp4',
               size: cleanedBlob.size,
+              name: `${previous.baseName || stripExtension(previous.name)}.m4a`,
             }
           : previous,
       );
@@ -840,6 +861,9 @@ export default function App() {
       setErrorText(error.message || 'Pulizia dell’audio non completata.');
       setStatusText('Pulizia non completata.');
       setPhaseProgress(0);
+      if (cleanedObjectUrl) {
+        URL.revokeObjectURL(cleanedObjectUrl);
+      }
       if (ffmpeg) {
         await safeDelete(ffmpeg, cleanedVirtualName);
       }
@@ -930,6 +954,9 @@ export default function App() {
       setActiveCapture('none');
       setCurrentProjectId(record.id);
       await analyzeFile(file);
+      if (record.mode === 'equal' || record.mode === 'custom') {
+        setMode(record.mode);
+      }
       if (Array.isArray(record.customCuts) && record.customCuts.length > 0) {
         setCustomCuts(
           record.customCuts.map((cut) => ({
@@ -941,9 +968,6 @@ export default function App() {
                 : null,
           })),
         );
-        if (record.mode) {
-          setMode(record.mode);
-        }
       }
       if (Array.isArray(record.bookmarks) && record.bookmarks.length > 0) {
         setBookmarks(
@@ -1005,7 +1029,7 @@ export default function App() {
       ffmpeg = await ensureEngineReady();
       setPhaseProgress(0.4);
 
-      await ffmpeg.exec([
+      const exportExitCode = await ffmpeg.exec([
         '-hide_banner',
         '-nostats',
         '-i',
@@ -1022,6 +1046,9 @@ export default function App() {
         '+faststart',
         outputName,
       ]);
+      if (exportExitCode !== 0) {
+        throw new Error('Export per AI Studio non riuscito: FFmpeg ha restituito un errore.');
+      }
       setPhaseProgress(0.85);
 
       const data = await ffmpeg.readFile(outputName);
@@ -1135,223 +1162,74 @@ export default function App() {
     setLastResult(null);
     setIsBusy(true);
     setPhaseProgress(0.05);
-    setStatusText('Sto tagliando il file e preparando lo ZIP...');
+    setStatusText('Sto creando file M4A leggeri e pronti da usare...');
 
     const runPrefix = `segment-${Date.now()}`;
     let ffmpeg = null;
     const createdVirtualNames = [];
-    let exportMode = 'multi-copy';
-    let outputExtension = audioFile.extension;
+    const outputExtension = '.m4a';
 
     try {
       ffmpeg = await ensureEngineReady();
-      const segmentTimes = plan.cutPoints.map((value) => value.toFixed(3)).join(',');
-      const outputPattern = `${runPrefix}-%03d${outputExtension}`;
-
-      async function cleanupExports() {
-        for (const virtualName of createdVirtualNames) {
-          await safeDelete(ffmpeg, virtualName);
-        }
-
-        createdVirtualNames.length = 0;
-      }
-
-      const batchExitCode = await ffmpeg.exec([
-        '-i',
-        audioFile.virtualInputName,
-        '-map',
-        '0',
-        '-c',
-        'copy',
-        '-f',
-        'segment',
-        '-segment_times',
-        segmentTimes,
-        '-reset_timestamps',
-        '1',
-        outputPattern,
-      ]);
-
-      if (batchExitCode === 0) {
-        for (let index = 0; index < plan.segments.length; index += 1) {
-          createdVirtualNames.push(buildVirtualSegmentName(runPrefix, index, outputExtension));
-        }
-      } else {
-        exportMode = 'single-copy';
-        setTechnicalLog(
-          'Il taglio multiplo in blocco non è supportato da questo contenitore. Passo al taglio diretto parte per parte.',
-        );
-        setStatusText('Questo formato richiede un taglio diretto parte per parte. Continuo automaticamente...');
-        setPhaseProgress(0.18);
-
-        for (let index = 0; index < plan.segments.length; index += 1) {
-          await safeDelete(ffmpeg, buildVirtualSegmentName(runPrefix, index, outputExtension));
-        }
-
-        for (let index = 0; index < plan.segments.length; index += 1) {
-          const segment = plan.segments[index];
-          const virtualName = buildVirtualSegmentName(runPrefix, index, outputExtension);
-          const segmentExitCode = await ffmpeg.exec([
-            '-ss',
-            formatFfmpegTime(segment.start),
-            '-t',
-            formatFfmpegTime(segment.duration),
-            '-i',
-            audioFile.virtualInputName,
-            '-map',
-            '0',
-            '-c',
-            'copy',
-            '-reset_timestamps',
-            '1',
-            '-avoid_negative_ts',
-            'make_zero',
-            virtualName,
-          ]);
-
-          if (segmentExitCode !== 0) {
-            await cleanupExports();
-            exportMode = 'lossy-aac';
-            outputExtension = '.m4a';
-            setTechnicalLog(
-              'La copia diretta non è riuscita. Passo a un export AAC in M4A per completare il taglio con file più leggeri.',
-            );
-            setStatusText('Questo file richiede una nuova codifica AAC in M4A. Continuo automaticamente...');
-            setPhaseProgress(0.32);
-
-            for (let fallbackIndex = 0; fallbackIndex < plan.segments.length; fallbackIndex += 1) {
-              const fallbackSegment = plan.segments[fallbackIndex];
-              const fallbackName = buildVirtualSegmentName(runPrefix, fallbackIndex, outputExtension);
-              const fallbackExitCode = await ffmpeg.exec([
-                '-ss',
-                formatFfmpegTime(fallbackSegment.start),
-                '-t',
-                formatFfmpegTime(fallbackSegment.duration),
-                '-i',
-                audioFile.virtualInputName,
-                '-map',
-                '0:a:0',
-                '-c:a',
-                'aac',
-                '-b:a',
-                '160k',
-                fallbackName,
-              ]);
-
-              if (fallbackExitCode !== 0) {
-                await cleanupExports();
-                exportMode = 'lossless-flac';
-                outputExtension = '.flac';
-                setTechnicalLog(
-                  'Il fallback AAC non è riuscito. Passo a un export FLAC lossless come ultima opzione.',
-                );
-                setStatusText('Il file richiede un export FLAC lossless come ultima opzione...');
-                setPhaseProgress(0.45);
-
-                for (
-                  let losslessIndex = 0;
-                  losslessIndex < plan.segments.length;
-                  losslessIndex += 1
-                ) {
-                  const losslessSegment = plan.segments[losslessIndex];
-                  const losslessName = buildVirtualSegmentName(
-                    runPrefix,
-                    losslessIndex,
-                    outputExtension,
-                  );
-                  const losslessExitCode = await ffmpeg.exec([
-                    '-ss',
-                    formatFfmpegTime(losslessSegment.start),
-                    '-t',
-                    formatFfmpegTime(losslessSegment.duration),
-                    '-i',
-                    audioFile.virtualInputName,
-                    '-map',
-                    '0:a:0',
-                    '-c:a',
-                    'flac',
-                    losslessName,
-                  ]);
-
-                  if (losslessExitCode !== 0) {
-                    throw new Error(
-                      'Non sono riuscito a tagliare questo file nel browser neanche con il fallback finale.',
-                    );
-                  }
-
-                  createdVirtualNames.push(losslessName);
-                  setStatusText(
-                    `Preparo parte ${losslessIndex + 1} di ${plan.segments.length} in FLAC lossless...`,
-                  );
-                  setPhaseProgress(0.45 + ((losslessIndex + 1) / plan.segments.length) * 0.25);
-                }
-
-                break;
-              }
-
-              createdVirtualNames.push(fallbackName);
-              setStatusText(
-                `Preparo parte ${fallbackIndex + 1} di ${plan.segments.length} in AAC M4A...`,
-              );
-              setPhaseProgress(0.32 + ((fallbackIndex + 1) / plan.segments.length) * 0.38);
-            }
-
-            break;
-          }
-
-          createdVirtualNames.push(virtualName);
-          setStatusText(
-            `Preparo parte ${index + 1} di ${plan.segments.length} senza ricodifica...`,
-          );
-          setPhaseProgress(0.18 + ((index + 1) / plan.segments.length) * 0.52);
-        }
-      }
-
-      setStatusText('Creo l’archivio ZIP finale con tutte le parti rinominate...');
-      setPhaseProgress(0.78);
-
-      const zip = new JSZip();
       const exportedParts = [];
 
       for (let index = 0; index < plan.segments.length; index += 1) {
-        const virtualName = createdVirtualNames[index];
+        const segment = plan.segments[index];
+        const virtualName = buildVirtualSegmentName(runPrefix, index, outputExtension);
+        setStatusText(
+          `Creo e scarico parte ${index + 1} di ${plan.segments.length} in M4A ottimizzato...`,
+        );
+        setPhaseProgress(0.08 + (index / plan.segments.length) * 0.82);
+
+        const segmentExitCode = await ffmpeg.exec([
+          '-hide_banner',
+          '-nostats',
+          '-ss',
+          formatFfmpegTime(segment.start),
+          '-t',
+          formatFfmpegTime(segment.duration),
+          '-i',
+          audioFile.virtualInputName,
+          '-map',
+          '0:a:0',
+          '-vn',
+          '-sn',
+          '-c:a',
+          'aac',
+          '-b:a',
+          '128k',
+          '-movflags',
+          '+faststart',
+          virtualName,
+        ]);
+
+        if (segmentExitCode !== 0) {
+          throw new Error(
+            `Non sono riuscito a esportare la parte ${index + 1} in M4A.`,
+          );
+        }
+
+        createdVirtualNames.push(virtualName);
+
         const outputData = await ffmpeg.readFile(virtualName);
         const downloadName = buildDownloadName(audioFile.baseName, index + 1, outputExtension);
+        const blob = new Blob([outputData], { type: 'audio/mp4' });
 
-        zip.file(downloadName, outputData, { binary: true });
+        downloadBlob(blob, downloadName);
         exportedParts.push({
           name: downloadName,
-          size: outputData.byteLength,
-          duration: plan.segments[index].duration,
+          size: blob.size,
+          duration: segment.duration,
         });
       }
 
-      const archiveName = `${audioFile.baseName} - parti.zip`;
-      const zipBlob = await zip.generateAsync(
-        {
-          type: 'blob',
-          compression: 'STORE',
-        },
-        ({ percent }) => {
-          setPhaseProgress(0.78 + percent / 100 * 0.22);
-        },
-      );
-
-      downloadBlob(zipBlob, archiveName);
-
       setLastResult({
-        archiveName,
+        archiveName: `${exportedParts.length} file M4A scaricati`,
         parts: exportedParts,
       });
-      setStatusText('Fatto. Ho scaricato tutte le parti in un solo ZIP, già rinominate.');
+      setStatusText('Fatto. Ho scaricato ogni parte come file M4A già rinominato.');
       setTechnicalLog(
-        exportMode === 'multi-copy'
-          ? `Esportazione completata in copia diretta: ${exportedParts.length} file pronti.`
-          : exportMode === 'single-copy'
-            ? `Esportazione completata con fallback parte per parte: ${exportedParts.length} file pronti.`
-            : exportMode === 'lossy-aac'
-              ? `Esportazione completata con fallback AAC M4A: ${exportedParts.length} file pronti.`
-              : `Esportazione completata con fallback FLAC lossless: ${exportedParts.length} file pronti.`,
+        `Esportazione completata in AAC M4A 128k: ${exportedParts.length} file pronti.`,
       );
       setPhaseProgress(1);
     } catch (error) {
@@ -1374,7 +1252,7 @@ export default function App() {
   const helperChips = [
     'Locale nel browser',
     'Un solo upload',
-    'Copia diretta senza ricodifica',
+    'Download diretto in M4A',
   ];
 
   return (
@@ -1775,7 +1653,7 @@ export default function App() {
                 onClick={processAndDownload}
                 disabled={!canExport}
               >
-                {isBusy ? 'Elaborazione in corso...' : 'Taglia e scarica tutto'}
+                {isBusy ? 'Elaborazione in corso...' : 'Taglia e scarica M4A'}
               </button>
 
               <div className="save-row">
@@ -1820,8 +1698,8 @@ export default function App() {
               </div>
 
               <p className="helper-text">
-                Il download genera uno ZIP senza comprimere di nuovo l’audio, per restare più
-                rapido possibile. I progetti salvati restano in questo browser, offline.
+                Il download crea file M4A separati e leggeri, già rinominati e pronti da usare.
+                I progetti salvati restano in questo browser, offline.
               </p>
             </aside>
           </div>
@@ -1830,19 +1708,19 @@ export default function App() {
         <section className="details">
           <div className="detail">
             <p className="section-label">Perché è più veloce</p>
-            <strong>Un solo file in ingresso, tutte le parti in uscita.</strong>
+            <strong>Un solo file in ingresso, parti scaricate direttamente.</strong>
             <p>
               Il sito analizza il file una volta sola, applica tutti i punti di taglio in un
-              unico passaggio e prepara subito l’archivio finale.
+              flusso guidato e scarica ogni segmento senza passare da archivi da estrarre.
             </p>
           </div>
 
           <div className="detail">
             <p className="section-label">Qualità</p>
-            <strong>Nessuna ricodifica quando il formato lo consente.</strong>
+            <strong>M4A ottimizzato per peso e qualità.</strong>
             <p>
-              La strategia predefinita usa copia diretta dei flussi audio per evitare perdite
-              di qualità e tempi morti di esportazione.
+              La strategia predefinita usa AAC in M4A a 128 kbps: file più piccoli, compatibili
+              e con qualità adatta a lezioni, memo e parlato.
             </p>
           </div>
 
@@ -1851,7 +1729,7 @@ export default function App() {
             <strong>{technicalLog || 'In attesa del prossimo passaggio.'}</strong>
             <p>
               {lastResult
-                ? `Ultimo ZIP creato: ${lastResult.archiveName}`
+                ? `Ultimo export: ${lastResult.archiveName}`
                 : 'Qui comparirà l’ultimo messaggio utile del motore di elaborazione.'}
             </p>
           </div>

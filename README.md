@@ -6,9 +6,9 @@ Web app statica per tagliare file audio direttamente nel browser, senza ri-uploa
 
 - carica un file audio una sola volta
 - divide in parti uguali oppure in segmenti personalizzati
-- esporta tutte le parti in un solo ZIP
+- esporta ogni parte come file M4A separato, senza ZIP da estrarre
 - mantiene il workflow locale nel browser
-- usa copia diretta dei flussi quando il formato lo permette, evitando ricodifiche inutili
+- ottimizza i segmenti in AAC/M4A per avere file leggeri e compatibili
 
 ## Sviluppo locale
 
