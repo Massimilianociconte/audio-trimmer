@@ -1,4 +1,23 @@
-import { CLEANUP_ORDER, CLEANUP_PRESETS } from '../lib/cleanup.js';
+import {
+  CLEANUP_ORDER,
+  CLEANUP_PRESETS,
+  estimateCleanupSeconds,
+} from '../lib/cleanup.js';
+
+function formatEstimate(seconds) {
+  if (!seconds || seconds <= 0) {
+    return '';
+  }
+  if (seconds < 60) {
+    return `~${Math.max(1, Math.round(seconds))}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remaining = Math.round(seconds % 60);
+  if (remaining === 0) {
+    return `~${minutes} min`;
+  }
+  return `~${minutes}:${String(remaining).padStart(2, '0')} min`;
+}
 
 export function AutomationPanel({
   silenceThresholdDb,
@@ -16,9 +35,12 @@ export function AutomationPanel({
   hasCleanedAudio,
   disabled,
   lastDetectionSummary,
+  audioDurationSeconds,
 }) {
   const activePreset = CLEANUP_PRESETS[cleanupPreset] ?? CLEANUP_PRESETS.none;
   const canApplyCleanup = cleanupPreset !== 'none' && !disabled;
+  const estimateSeconds = estimateCleanupSeconds(cleanupPreset, audioDurationSeconds);
+  const estimateLabel = formatEstimate(estimateSeconds);
 
   return (
     <section className="automation">
@@ -135,6 +157,16 @@ export function AutomationPanel({
           </div>
 
           <p className="preset-description">{activePreset.description}</p>
+
+          {estimateLabel ? (
+            <p className="preset-estimate">
+              Elaborazione stimata: <strong>{estimateLabel}</strong>
+              <span className="preset-estimate-note">
+                {' '}
+                · dipende dalla potenza del computer
+              </span>
+            </p>
+          ) : null}
 
           <div className="automation-actions">
             <button

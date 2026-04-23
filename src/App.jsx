@@ -31,7 +31,11 @@ import {
   parseSilenceLog,
   silencesToCutPoints,
 } from './lib/silence.js';
-import { buildCleanupFilter, getCleanupPreset } from './lib/cleanup.js';
+import {
+  buildCleanupFilter,
+  estimateCleanupSeconds,
+  getCleanupPreset,
+} from './lib/cleanup.js';
 import {
   deleteProject as deleteStoredProject,
   listProjects,
@@ -236,7 +240,7 @@ export default function App() {
     };
   }, []);
 
-  async function ensureEngineReady() {
+  async function ensureEngineReady({ silent = false } = {}) {
     let ffmpeg = ffmpegRef.current;
 
     if (!ffmpeg) {
@@ -255,8 +259,10 @@ export default function App() {
 
     if (!ffmpeg.loaded) {
       setEngineState('loading');
-      setStatusText('Carico il motore locale di taglio. Succede solo la prima volta.');
-      setPhaseProgress(0.08);
+      if (!silent) {
+        setStatusText('Carico il motore locale di taglio. Succede solo la prima volta.');
+        setPhaseProgress(0.08);
+      }
 
       await ffmpeg.load({
         coreURL: ffmpegCoreUrl,
@@ -264,12 +270,45 @@ export default function App() {
       });
 
       setEngineState('ready');
-      setStatusText('Motore pronto. Ora puoi analizzare e tagliare il file.');
-      setPhaseProgress(0);
+      if (!silent) {
+        setStatusText('Motore pronto. Ora puoi analizzare e tagliare il file.');
+        setPhaseProgress(0);
+      }
     }
 
     return ffmpeg;
   }
+
+  useEffect(() => {
+    let cancelled = false;
+    const preload = () => {
+      if (cancelled) {
+        return;
+      }
+      ensureEngineReady({ silent: true }).catch(() => {
+        // Ignora: il primo click dell'utente rifarà partire il caricamento con il messaggio normale.
+      });
+    };
+
+    let idleHandle = null;
+    let timeoutHandle = null;
+    if (typeof window.requestIdleCallback === 'function') {
+      idleHandle = window.requestIdleCallback(preload, { timeout: 2500 });
+    } else {
+      timeoutHandle = window.setTimeout(preload, 400);
+    }
+
+    return () => {
+      cancelled = true;
+      if (idleHandle !== null && typeof window.cancelIdleCallback === 'function') {
+        window.cancelIdleCallback(idleHandle);
+      }
+      if (timeoutHandle !== null) {
+        window.clearTimeout(timeoutHandle);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function analyzeFile(file) {
     if (!file) {
@@ -752,16 +791,47 @@ export default function App() {
 
     setErrorText('');
     setIsBusy(true);
-    setStatusText(`Applico il preset "${preset.label}"...`);
-    setPhaseProgress(0.1);
+
+    const audioDuration = audioFile.duration || 60;
+    const estimatedSeconds = estimateCleanupSeconds(cleanupPreset, audioDuration) || 20;
+    const describeTime = (seconds) => {
+      if (!seconds || seconds <= 0) {
+        return '';
+      }
+      if (seconds < 60) {
+        return `~${Math.max(1, Math.round(seconds))}s`;
+      }
+      const minutes = Math.floor(seconds / 60);
+      const remaining = Math.round(seconds % 60);
+      return remaining === 0
+        ? `~${minutes} min`
+        : `~${minutes}:${String(remaining).padStart(2, '0')} min`;
+    };
+    const initialEstimateLabel = describeTime(estimatedSeconds);
+
+    setStatusText(
+      `Applico "${preset.label}" su ${formatClock(audioDuration)} di audio — stima ${initialEstimateLabel}.`,
+    );
+    setPhaseProgress(0.05);
 
     const cleanedVirtualName = `cleaned-${Date.now()}.m4a`;
     let ffmpeg = null;
     let cleanedObjectUrl = '';
+    const startTime = performance.now();
+    const tickerHandle = window.setInterval(() => {
+      const elapsedSeconds = (performance.now() - startTime) / 1000;
+      const fractional = Math.min(0.9, elapsedSeconds / Math.max(estimatedSeconds, 1));
+      setPhaseProgress((current) => Math.max(current, fractional));
+      const remaining = Math.max(0, estimatedSeconds - elapsedSeconds);
+      const remainingLabel = describeTime(remaining) || 'pochi secondi';
+      setStatusText(
+        `Applico "${preset.label}" — ${remainingLabel} rimanenti (${Math.round(elapsedSeconds)}s trascorsi).`,
+      );
+    }, 700);
 
     try {
       ffmpeg = await ensureEngineReady();
-      setPhaseProgress(0.3);
+      setPhaseProgress((current) => Math.max(current, 0.1));
 
       const filterChain = buildCleanupFilter(cleanupPreset);
       const cleanupExitCode = await ffmpeg.exec([
@@ -782,7 +852,7 @@ export default function App() {
       if (cleanupExitCode !== 0) {
         throw new Error('Pulizia audio non riuscita: FFmpeg ha restituito un errore.');
       }
-      setPhaseProgress(0.7);
+      setPhaseProgress((current) => Math.max(current, 0.92));
 
       const cleanedData = await ffmpeg.readFile(cleanedVirtualName);
       const cleanedBlob = new Blob([cleanedData], { type: 'audio/mp4' });
@@ -868,6 +938,7 @@ export default function App() {
         await safeDelete(ffmpeg, cleanedVirtualName);
       }
     } finally {
+      window.clearInterval(tickerHandle);
       setIsBusy(false);
     }
   }
@@ -1488,6 +1559,7 @@ export default function App() {
               hasCleanedAudio={Boolean(originalAudioBackup)}
               disabled={isBusy}
               lastDetectionSummary={lastDetectionSummary}
+              audioDurationSeconds={audioFile?.duration ?? 0}
             />
           ) : null}
 
