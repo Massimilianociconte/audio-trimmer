@@ -1,4 +1,4 @@
-import { startTransition, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile } from '@ffmpeg/util';
 import ffmpegCoreUrl from '@ffmpeg/core?url';
@@ -168,6 +168,7 @@ function formatFfmpegTime(seconds) {
 
 export default function App() {
   const ffmpegRef = useRef(null);
+  const ffmpegLoadPromiseRef = useRef(null);
   const inputRef = useRef(null);
   const objectUrlRef = useRef('');
   const activeInputRef = useRef('');
@@ -252,7 +253,8 @@ export default function App() {
         }
       });
       ffmpeg.on('progress', ({ progress }) => {
-        setPhaseProgress((current) => Math.max(current, progress));
+        const safeProgress = Number.isFinite(progress) ? clamp(progress, 0, 1) : 0;
+        setPhaseProgress((current) => Math.max(current, safeProgress));
       });
       ffmpegRef.current = ffmpeg;
     }
@@ -264,10 +266,23 @@ export default function App() {
         setPhaseProgress(0.08);
       }
 
-      await ffmpeg.load({
-        coreURL: ffmpegCoreUrl,
-        wasmURL: ffmpegWasmUrl,
-      });
+      if (!ffmpegLoadPromiseRef.current) {
+        ffmpegLoadPromiseRef.current = ffmpeg
+          .load({
+            coreURL: ffmpegCoreUrl,
+            wasmURL: ffmpegWasmUrl,
+          })
+          .finally(() => {
+            ffmpegLoadPromiseRef.current = null;
+          });
+      }
+
+      try {
+        await ffmpegLoadPromiseRef.current;
+      } catch (error) {
+        setEngineState('idle');
+        throw error;
+      }
 
       setEngineState('ready');
       if (!silent) {
@@ -397,31 +412,29 @@ export default function App() {
       objectUrlRef.current = objectUrl;
       keepObjectUrl = true;
 
-      startTransition(() => {
-        setAudioFile({
-          baseName,
-          duration,
-          extension: outputExtension,
-          formatLabel,
-          mimeType: getAudioMime(file, outputExtension),
-          name: file.name,
-          objectUrl,
-          size: file.size,
-          virtualInputName,
-        });
-        setMode('equal');
-        setEqualParts(2);
-        setCustomCuts([]);
-        setCurrentTime(0);
-        setIsPlaying(false);
-        setPlaybackRate(1);
-        setZoom(60);
-        setLoopRegion(null);
-        setLoopDraft(null);
-        setBookmarks([]);
-        setCleanupPreset('none');
-        setLastDetectionSummary('');
+      setAudioFile({
+        baseName,
+        duration,
+        extension: outputExtension,
+        formatLabel,
+        mimeType: getAudioMime(file, outputExtension),
+        name: file.name,
+        objectUrl,
+        size: file.size,
+        virtualInputName,
       });
+      setMode('equal');
+      setEqualParts(2);
+      setCustomCuts([]);
+      setCurrentTime(0);
+      setIsPlaying(false);
+      setPlaybackRate(1);
+      setZoom(60);
+      setLoopRegion(null);
+      setLoopDraft(null);
+      setBookmarks([]);
+      setCleanupPreset('none');
+      setLastDetectionSummary('');
 
       setOriginalAudioBackup((previousBackup) => {
         if (previousBackup?.objectUrl) {
@@ -433,11 +446,13 @@ export default function App() {
       setStatusText('File pronto. Scegli il tipo di taglio e scarica tutte le parti insieme.');
       setPhaseProgress(0);
       setTechnicalLog(technicalMessage);
+      return true;
     } catch (error) {
       console.error(error);
       setErrorText(error.message || 'Non sono riuscito ad analizzare il file.');
       setStatusText('Qualcosa è andato storto durante l’analisi del file.');
       setPhaseProgress(0);
+      return false;
     } finally {
       if (objectUrl && !keepObjectUrl) {
         URL.revokeObjectURL(objectUrl);
@@ -1023,8 +1038,12 @@ export default function App() {
         type: record.audioMimeType || record.audioBlob.type,
       });
       setActiveCapture('none');
+      const loaded = await analyzeFile(file);
+      if (!loaded) {
+        setCurrentProjectId(null);
+        return;
+      }
       setCurrentProjectId(record.id);
-      await analyzeFile(file);
       if (record.mode === 'equal' || record.mode === 'custom') {
         setMode(record.mode);
       }
@@ -1454,7 +1473,7 @@ export default function App() {
           <div className="progress-track" aria-hidden="true">
             <span
               className={`progress-bar ${isBusy ? 'progress-bar-busy' : ''}`}
-              style={{ transform: `scaleX(${phaseProgress || 0.02})` }}
+              style={{ transform: `scaleX(${clamp(phaseProgress || 0.02, 0, 1)})` }}
             />
           </div>
 
@@ -1492,6 +1511,7 @@ export default function App() {
                 onTimeUpdate={handleWaveformTimeUpdate}
                 onPlayStateChange={handleWaveformPlayStateChange}
                 onCutMove={updateCutPointPosition}
+                onBookmarkJump={handleBookmarkJump}
               />
 
               <PlayerControls

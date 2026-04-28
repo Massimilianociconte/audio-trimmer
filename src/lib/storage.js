@@ -9,6 +9,14 @@ function promisifyRequest(request) {
   });
 }
 
+function waitForTransaction(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onabort = () => reject(tx.error ?? new Error('Transazione IndexedDB annullata.'));
+    tx.onerror = () => reject(tx.error ?? new Error('Transazione IndexedDB non riuscita.'));
+  });
+}
+
 function openDatabase() {
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') {
@@ -72,6 +80,7 @@ export async function saveProject(project) {
     const tx = db.transaction(STORE_PROJECTS, 'readwrite');
     const store = tx.objectStore(STORE_PROJECTS);
     await promisifyRequest(store.put(record));
+    await waitForTransaction(tx);
     return record;
   } finally {
     db.close();
@@ -96,6 +105,7 @@ export async function deleteProject(id) {
     const tx = db.transaction(STORE_PROJECTS, 'readwrite');
     const store = tx.objectStore(STORE_PROJECTS);
     await promisifyRequest(store.delete(id));
+    await waitForTransaction(tx);
   } finally {
     db.close();
   }

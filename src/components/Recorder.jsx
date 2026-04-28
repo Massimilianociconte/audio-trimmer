@@ -4,16 +4,14 @@ import { formatClock } from '../lib/time.js';
 
 export function Recorder({ onRecorded, disabled, onClose }) {
   const recorder = useRecorder();
+  const cancelRecording = recorder.cancel;
   const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     return () => {
-      if (recorder.isRecording) {
-        recorder.cancel();
-      }
+      cancelRecording();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [cancelRecording]);
 
   async function handleStopAndSave() {
     setSubmitting(true);
