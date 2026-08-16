@@ -1840,6 +1840,20 @@ export default function App() {
             </div>
           </section>
         ) : null}
+
+        <footer className="site-footer">
+          <p>
+            Realizzato da{' '}
+            <a
+              href="https://www.webnovis.com"
+              target="_blank"
+              rel="noopener noreferrer nofollow"
+              className="webnovis-link"
+            >
+              WebNovis
+            </a>
+          </p>
+        </footer>
       </main>
     </div>
   );
