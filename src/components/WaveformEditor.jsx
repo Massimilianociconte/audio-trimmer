@@ -406,8 +406,56 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     };
   }, [loopRegion, src]);
 
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) {
+      return undefined;
+    }
+    const handleDoubleClick = (event) => {
+      const ws = wsRef.current;
+      const onAdd = callbacksRef.current.onAddCutAt;
+      if (!ws || typeof onAdd !== 'function') {
+        return;
+      }
+      let duration = 0;
+      try {
+        duration = ws.getDuration() || 0;
+      } catch {
+        return;
+      }
+      if (!(duration > 0)) {
+        return;
+      }
+      // Con lo zoom WaveSurfer scrolla: il rapporto va calcolato sullo scrollWidth
+      // interno, non sulla larghezza visibile del container (bug taglio fuori punto).
+      try {
+        const wrapper = ws.getWrapper?.();
+        const scrollLeft = ws.getScroll?.() ?? wrapper?.scrollLeft ?? 0;
+        const rect = (wrapper ?? container).getBoundingClientRect();
+        const totalWidth = wrapper?.scrollWidth ?? rect.width;
+        if (!(totalWidth > 0)) {
+          return;
+        }
+        const ratio = (event.clientX - rect.left + scrollLeft) / totalWidth;
+        const clamped = Math.min(1, Math.max(0, ratio));
+        onAdd(clamped * duration);
+      } catch {
+        const rect = container.getBoundingClientRect();
+        if (!(rect.width > 0)) {
+          return;
+        }
+        const ratio = (event.clientX - rect.left) / rect.width;
+        onAdd(Math.min(1, Math.max(0, ratio)) * duration);
+      }
+    };
+    container.addEventListener('dblclick', handleDoubleClick);
+    return () => {
+      container.removeEventListener('dblclick', handleDoubleClick);
+    };
+  }, [src]);
+
   return (
-    <div className="waveform-wrapper">
+    <div className="waveform-wrapper" title="Doppio click per aggiungere un taglio">
       <div ref={containerRef} className="waveform-container" />
     </div>
   );

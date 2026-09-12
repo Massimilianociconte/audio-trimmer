@@ -2,16 +2,22 @@ import { useEffect, useState } from 'react';
 import { useRecorder } from '../hooks/useRecorder.js';
 import { formatClock } from '../lib/time.js';
 
-export function Recorder({ onRecorded, disabled, onClose }) {
+export function Recorder({ onRecorded, disabled, onClose, onRecordingChange }) {
   const recorder = useRecorder();
   const cancelRecording = recorder.cancel;
   const [submitting, setSubmitting] = useState(false);
+  const isRecording = recorder.isRecording;
+
+  useEffect(() => {
+    onRecordingChange?.(isRecording);
+  }, [isRecording, onRecordingChange]);
 
   useEffect(() => {
     return () => {
+      onRecordingChange?.(false);
       cancelRecording();
     };
-  }, [cancelRecording]);
+  }, [cancelRecording, onRecordingChange]);
 
   async function handleStopAndSave() {
     setSubmitting(true);

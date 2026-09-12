@@ -1,13 +1,30 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile } from '@ffmpeg/util';
-import ffmpegCoreUrl from '@ffmpeg/core?url';
-import ffmpegWasmUrl from '@ffmpeg/core/wasm?url';
 import {
-  buildDownloadName,
   buildPlan,
   buildVirtualSegmentName,
 } from './lib/segments.js';
+import {
+  buildExportArgs,
+  buildSegmentFileName,
+  canFastCopy,
+  estimateExportBytes,
+  getExportFormat,
+  sanitizeFileName,
+} from './lib/export.js';
+import {
+  RETAIN_BLOBS_BYTES,
+  adviseExportStrategy,
+  clearCheckpoint,
+  createZipBlobWriter,
+  createZipStreamWriter,
+  getExportCapabilities,
+  readCheckpoint,
+  writeBlobToFileHandle,
+  writeCheckpoint,
+  yieldToUI,
+} from './lib/streamExport.js';
+import { useWakeLock } from './hooks/useWakeLock.js';
 import {
   clamp,
   formatBytes,
@@ -17,11 +34,13 @@ import {
   stripExtension,
 } from './lib/time.js';
 import { WaveformEditor } from './components/WaveformEditor.jsx';
-import { PlayerControls } from './components/PlayerControls.jsx';
+import { PlayerControls, RATE_PRESETS } from './components/PlayerControls.jsx';
 import { BookmarksPanel } from './components/BookmarksPanel.jsx';
 import { AutomationPanel } from './components/AutomationPanel.jsx';
+import { ExportPanel } from './components/ExportPanel.jsx';
 import { Recorder } from './components/Recorder.jsx';
 import { ProjectLibrary } from './components/ProjectLibrary.jsx';
+import { useFfmpegEngine, safeDelete } from './hooks/useFfmpegEngine.js';
 import {
   KEYBOARD_HINTS,
   useKeyboardShortcuts,
@@ -60,6 +79,30 @@ const ACCEPTED_AUDIO_TYPES = [
 ].join(',');
 
 const INITIAL_MESSAGE = 'Carica un file audio e preparerò tutte le parti in un unico passaggio.';
+
+function loadSetting(key, fallback) {
+  try {
+    const raw = window.localStorage?.getItem(key);
+    if (raw === null || raw === undefined) {
+      return fallback;
+    }
+    if (typeof fallback === 'boolean') {
+      return raw === '1' || raw === 'true';
+    }
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+function saveSetting(key, value) {
+  try {
+    const stored = typeof value === 'boolean' ? (value ? '1' : '0') : JSON.stringify(value);
+    window.localStorage?.setItem(key, stored);
+  } catch {
+    // storage pieno o non disponibile: impostazioni solo per la sessione
+  }
+}
 
 function createPointId() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -140,16 +183,6 @@ function readAudioDurationFromBrowser(objectUrl) {
   });
 }
 
-async function safeDelete(ffmpeg, path) {
-  try {
-    await ffmpeg.deleteFile(path);
-  } catch {
-    return false;
-  }
-
-  return true;
-}
-
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -162,30 +195,61 @@ function downloadBlob(blob, filename) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1200);
 }
 
-function formatFfmpegTime(seconds) {
-  return Math.max(0, seconds).toFixed(3);
-}
-
 export default function App() {
-  const ffmpegRef = useRef(null);
-  const ffmpegLoadPromiseRef = useRef(null);
   const inputRef = useRef(null);
   const objectUrlRef = useRef('');
   const activeInputRef = useRef('');
   const activeProbeRef = useRef('');
   const dragDepthRef = useRef(0);
   const waveformRef = useRef(null);
+  const exportAbortRef = useRef(false);
+  const previewTimeoutRef = useRef(null);
+  const lastResultUrlsRef = useRef([]);
+  const analysisIdRef = useRef(0);
+  const isBusyRef = useRef(false);
+  const isRecorderBusyRef = useRef(false);
+  const sourceFileRef = useRef(null);
 
-  const [engineState, setEngineState] = useState('idle');
+  const {
+    ffmpegRef,
+    engineState,
+    setEngineState,
+    phaseProgress,
+    setPhaseProgress,
+    technicalLog,
+    setTechnicalLog,
+    ensureReady: ensureEngineReadyBase,
+    runWithLogCapture,
+    resetAfterAbort,
+  } = useFfmpegEngine();
+
+  async function ensureEngineReady(options) {
+    const silent = options?.silent ?? false;
+    if (!silent) {
+      setStatusText('Carico il motore locale di taglio. Succede solo la prima volta.');
+      setPhaseProgress(0.08);
+    }
+    try {
+      const ffmpeg = await ensureEngineReadyBase(options);
+      if (!silent) {
+        setStatusText('Motore pronto. Ora puoi analizzare e tagliare il file.');
+        setPhaseProgress(0);
+      }
+      return ffmpeg;
+    } catch (error) {
+      setEngineState('idle');
+      throw error;
+    }
+  }
+
   const [statusText, setStatusText] = useState(INITIAL_MESSAGE);
-  const [phaseProgress, setPhaseProgress] = useState(0);
-  const [technicalLog, setTechnicalLog] = useState('');
   const [dragActive, setDragActive] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
   const [errorText, setErrorText] = useState('');
   const [mode, setMode] = useState('equal');
   const [equalParts, setEqualParts] = useState(2);
   const [customCuts, setCustomCuts] = useState([]);
+  const [cutsHistory, setCutsHistory] = useState([]);
   const [currentTime, setCurrentTime] = useState(0);
   const [lastResult, setLastResult] = useState(null);
   const [audioFile, setAudioFile] = useState(null);
@@ -208,6 +272,25 @@ export default function App() {
   const [projectsError, setProjectsError] = useState('');
   const [currentProjectId, setCurrentProjectId] = useState(null);
   const [saveStatus, setSaveStatus] = useState('');
+  const [isRecorderBusy, setIsRecorderBusy] = useState(false);
+  const [exportFormat, setExportFormat] = useState(() => loadSetting('ac-export-format', 'm4a'));
+  const [exportBitrate, setExportBitrate] = useState(() => Number(loadSetting('ac-export-bitrate', 128)) || 128);
+  const [fastCopy, setFastCopy] = useState(() => loadSetting('ac-fast-copy', false));
+  const [fadeSeconds, setFadeSeconds] = useState(() => Number(loadSetting('ac-fade', 0)) || 0);
+  const [exportDest, setExportDest] = useState(() => loadSetting('ac-export-dest', 'auto'));
+  const [skipExisting, setSkipExisting] = useState(true);
+  const [advisorNote, setAdvisorNote] = useState('');
+  const [resumeNotice, setResumeNotice] = useState('');
+  const [baseNameOverride, setBaseNameOverride] = useState('');
+  const [segmentNames, setSegmentNames] = useState({});
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportProgress, setExportProgress] = useState(0);
+  const [currentSegmentIndex, setCurrentSegmentIndex] = useState(0);
+  const [previewIndex, setPreviewIndex] = useState(null);
+  const [failedExportIndex, setFailedExportIndex] = useState(null);
+  const [chaptersStatus, setChaptersStatus] = useState('');
+  const [timestampDraft, setTimestampDraft] = useState('');
+  const [projectJsonStatus, setProjectJsonStatus] = useState('');
 
   const plan = buildPlan({
     duration: audioFile?.duration ?? 0,
@@ -218,6 +301,19 @@ export default function App() {
 
   const backupUrlRef = useRef(null);
   backupUrlRef.current = originalAudioBackup?.objectUrl ?? null;
+
+  const effectiveBaseName = baseNameOverride.trim() || audioFile?.baseName || 'audio';
+
+  const waveformCuts = useMemo(() => {
+    if (mode === 'custom') {
+      return customCuts;
+    }
+    return (plan.cutPoints ?? []).map((position, index) => ({
+      id: `equal-${index}`,
+      value: formatClock(position),
+      position,
+    }));
+  }, [mode, customCuts, plan.cutPoints]);
 
   useEffect(() => {
     return () => {
@@ -231,9 +327,17 @@ export default function App() {
         backupUrlRef.current = null;
       }
 
-      if (ffmpegRef.current) {
-        ffmpegRef.current.terminate();
-        ffmpegRef.current = null;
+      for (const url of lastResultUrlsRef.current) {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {
+          // ignore
+        }
+      }
+      lastResultUrlsRef.current = [];
+
+      if (previewTimeoutRef.current) {
+        window.clearTimeout(previewTimeoutRef.current);
       }
 
       activeInputRef.current = '';
@@ -241,100 +345,33 @@ export default function App() {
     };
   }, []);
 
-  async function ensureEngineReady({ silent = false } = {}) {
-    let ffmpeg = ffmpegRef.current;
-
-    if (!ffmpeg) {
-      ffmpeg = new FFmpeg();
-      ffmpeg.on('log', ({ message }) => {
-        const compactMessage = message.trim();
-        if (compactMessage) {
-          setTechnicalLog(compactMessage);
-        }
-      });
-      ffmpeg.on('progress', ({ progress }) => {
-        const safeProgress = Number.isFinite(progress) ? clamp(progress, 0, 1) : 0;
-        setPhaseProgress((current) => Math.max(current, safeProgress));
-      });
-      ffmpegRef.current = ffmpeg;
-    }
-
-    if (!ffmpeg.loaded) {
-      setEngineState('loading');
-      if (!silent) {
-        setStatusText('Carico il motore locale di taglio. Succede solo la prima volta.');
-        setPhaseProgress(0.08);
-      }
-
-      if (!ffmpegLoadPromiseRef.current) {
-        ffmpegLoadPromiseRef.current = ffmpeg
-          .load({
-            coreURL: ffmpegCoreUrl,
-            wasmURL: ffmpegWasmUrl,
-          })
-          .finally(() => {
-            ffmpegLoadPromiseRef.current = null;
-          });
-      }
-
-      try {
-        await ffmpegLoadPromiseRef.current;
-      } catch (error) {
-        setEngineState('idle');
-        throw error;
-      }
-
-      setEngineState('ready');
-      if (!silent) {
-        setStatusText('Motore pronto. Ora puoi analizzare e tagliare il file.');
-        setPhaseProgress(0);
-      }
-    }
-
-    return ffmpeg;
-  }
-
-  useEffect(() => {
-    let cancelled = false;
-    const preload = () => {
-      if (cancelled) {
-        return;
-      }
-      ensureEngineReady({ silent: true }).catch(() => {
-        // Ignora: il primo click dell'utente rifarà partire il caricamento con il messaggio normale.
-      });
-    };
-
-    let idleHandle = null;
-    let timeoutHandle = null;
-    if (typeof window.requestIdleCallback === 'function') {
-      idleHandle = window.requestIdleCallback(preload, { timeout: 2500 });
-    } else {
-      timeoutHandle = window.setTimeout(preload, 400);
-    }
-
-    return () => {
-      cancelled = true;
-      if (idleHandle !== null && typeof window.cancelIdleCallback === 'function') {
-        window.cancelIdleCallback(idleHandle);
-      }
-      if (timeoutHandle !== null) {
-        window.clearTimeout(timeoutHandle);
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
   async function analyzeFile(file) {
     if (!file) {
-      return;
+      return false;
     }
+    if (isBusyRef.current) {
+      setErrorText('Attendi il completamento dell’operazione in corso prima di caricare un altro file.');
+      return false;
+    }
+    if (isRecorderBusyRef.current) {
+      setErrorText('Ferma la registrazione prima di caricare un altro file.');
+      return false;
+    }
+    if (file.size === 0) {
+      setErrorText('Il file è vuoto (0 byte). Scegli un file audio valido.');
+      return false;
+    }
+
+    const analysisId = analysisIdRef.current + 1;
+    analysisIdRef.current = analysisId;
+    const isStale = () => analysisIdRef.current !== analysisId;
 
     let objectUrl = '';
     let keepObjectUrl = false;
 
     setErrorText('');
     setLastResult(null);
+    isBusyRef.current = true;
     setIsBusy(true);
     setStatusText('Analizzo il file e recupero la durata esatta...');
     setPhaseProgress(0.12);
@@ -343,22 +380,38 @@ export default function App() {
       const extension = getExtension(file.name);
       const outputExtension = extension || '.audio';
       const baseName = stripExtension(file.name);
-      const virtualInputName = `source-${Date.now()}${outputExtension}`;
-      const probeOutputName = `probe-${Date.now()}.json`;
+      const virtualInputName = `source-${Date.now()}-${analysisId}${outputExtension}`;
+      const probeOutputName = `probe-${Date.now()}-${analysisId}.json`;
       let duration = NaN;
       let technicalMessage = 'File pronto.';
       let formatLabel = getFormatLabel(file, outputExtension);
+
+      if (file.size > 350 * 1024 * 1024) {
+        technicalMessage = 'File molto grande: l’analisi potrebbe richiedere tempo e memoria.';
+        setStatusText('File molto grande (>350 MB): analisi in corso, potrebbe volerci un po’...');
+      }
 
       objectUrl = URL.createObjectURL(file);
 
       try {
         duration = await readAudioDurationFromBrowser(objectUrl);
+        if (isStale()) {
+          URL.revokeObjectURL(objectUrl);
+          return false;
+        }
         technicalMessage = 'Durata recuperata direttamente dal browser.';
       } catch {
+        if (isStale()) {
+          URL.revokeObjectURL(objectUrl);
+          return false;
+        }
         technicalMessage = 'Il browser non legge la durata, provo con ffprobe.';
       }
 
       const ffmpeg = await ensureEngineReady();
+      if (isStale()) {
+        return false;
+      }
 
       const staleVirtualNames = new Set(
         [
@@ -374,6 +427,10 @@ export default function App() {
       activeProbeRef.current = '';
 
       await ffmpeg.writeFile(virtualInputName, await fetchFile(file));
+      if (isStale()) {
+        await safeDelete(ffmpeg, virtualInputName);
+        return false;
+      }
       activeInputRef.current = virtualInputName;
 
       if (!Number.isFinite(duration) || duration <= 0) {
@@ -402,8 +459,39 @@ export default function App() {
         technicalMessage = 'Durata recuperata con ffprobe.';
       }
 
+      if (isStale()) {
+        return false;
+      }
+
       if (!Number.isFinite(duration) || duration <= 0) {
         throw new Error('Durata non valida. Prova con un file audio differente.');
+      }
+
+      // Verifica che esista davvero una traccia audio (evita video/mascherati accettati per durata).
+      try {
+        const streamProbeName = `streams-${Date.now()}-${analysisId}.txt`;
+        activeProbeRef.current = streamProbeName;
+        const streamExit = await ffmpeg.ffprobe([
+          '-v', 'error',
+          '-show_entries', 'stream=codec_type',
+          '-of', 'csv=p=0',
+          virtualInputName,
+          '-o', streamProbeName,
+        ]);
+        const streamRaw = streamExit === 0 ? await ffmpeg.readFile(streamProbeName, 'utf8') : '';
+        await safeDelete(ffmpeg, streamProbeName);
+        activeProbeRef.current = '';
+        if (isStale()) {
+          return false;
+        }
+        if (!String(streamRaw).toLowerCase().includes('audio')) {
+          throw new Error('Nessuna traccia audio trovata in questo file. Scegli un file audio valido.');
+        }
+      } catch (probeError) {
+        if (probeError?.message?.includes('Nessuna traccia audio')) {
+          throw probeError;
+        }
+        // Probe stream non disponibile: prosegui (l'export segnalerà l'errore reale).
       }
 
       if (objectUrlRef.current) {
@@ -423,9 +511,12 @@ export default function App() {
         size: file.size,
         virtualInputName,
       });
+      // Riferimento al File originale: evita una copia in RAM al salvataggio progetto.
+      sourceFileRef.current = file instanceof File ? file : null;
       setMode('equal');
       setEqualParts(2);
       setCustomCuts([]);
+      setCutsHistory([]);
       setCurrentTime(0);
       setIsPlaying(false);
       setPlaybackRate(1);
@@ -435,6 +526,23 @@ export default function App() {
       setBookmarks([]);
       setCleanupPreset('none');
       setLastDetectionSummary('');
+      setBaseNameOverride('');
+      setSegmentNames({});
+      setPreviewIndex(null);
+      setExportFormat('m4a');
+      setExportBitrate(128);
+      setFastCopy(false);
+      setFadeSeconds(0);
+      setIsExporting(false);
+      setExportProgress(0);
+      for (const url of lastResultUrlsRef.current) {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {
+          // ignore
+        }
+      }
+      lastResultUrlsRef.current = [];
 
       setOriginalAudioBackup((previousBackup) => {
         if (previousBackup?.objectUrl) {
@@ -446,9 +554,13 @@ export default function App() {
       setStatusText('File pronto. Scegli il tipo di taglio e scarica tutte le parti insieme.');
       setPhaseProgress(0);
       setTechnicalLog(technicalMessage);
+      clearPreview();
       return true;
     } catch (error) {
       console.error(error);
+      if (analysisIdRef.current !== analysisId) {
+        return false;
+      }
       setErrorText(error.message || 'Non sono riuscito ad analizzare il file.');
       setStatusText('Qualcosa è andato storto durante l’analisi del file.');
       setPhaseProgress(0);
@@ -458,14 +570,30 @@ export default function App() {
         URL.revokeObjectURL(objectUrl);
       }
 
-      setIsBusy(false);
+      if (analysisIdRef.current === analysisId) {
+        isBusyRef.current = false;
+        setIsBusy(false);
+      }
     }
+  }
+
+  function clearPreview() {
+    if (previewTimeoutRef.current) {
+      window.clearTimeout(previewTimeoutRef.current);
+      previewTimeoutRef.current = null;
+    }
+    setPreviewIndex(null);
+  }
+
+  function handleRecordingChange(recording) {
+    isRecorderBusyRef.current = recording;
+    setIsRecorderBusy(recording);
   }
 
   async function handleInputChange(event) {
     const file = event.target.files?.[0];
     event.target.value = '';
-    if (file && !isBusy) {
+    if (file && !isBusyRef.current) {
       setCurrentProjectId(null);
       await analyzeFile(file);
     }
@@ -494,12 +622,16 @@ export default function App() {
     }
   }
 
+  useEffect(() => {
+    isBusyRef.current = isBusy;
+  }, [isBusy]);
+
   async function handleDrop(event) {
     event.preventDefault();
     dragDepthRef.current = 0;
     setDragActive(false);
 
-    if (isBusy) {
+    if (isBusyRef.current || isRecorderBusyRef.current) {
       return;
     }
 
@@ -510,6 +642,10 @@ export default function App() {
     }
   }
 
+  const pushCutsHistory = useCallback((cuts) => {
+    setCutsHistory((previous) => [...previous.slice(-19), cuts]);
+  }, []);
+
   const addCutAt = useCallback(
     (seconds) => {
       if (!audioFile?.duration) {
@@ -517,28 +653,95 @@ export default function App() {
       }
 
       const safeSeconds = clamp(seconds, 0.25, Math.max(0.25, audioFile.duration - 0.25));
+      const alreadyNear = customCuts.some(
+        (point) =>
+          typeof point.position === 'number' &&
+          Math.abs(point.position - safeSeconds) < 0.1,
+      );
+      if (alreadyNear) {
+        return;
+      }
+      pushCutsHistory(customCuts);
       setMode('custom');
-      setCustomCuts((previous) => {
-        const alreadyNear = previous.some(
-          (point) =>
-            typeof point.position === 'number' &&
-            Math.abs(point.position - safeSeconds) < 0.1,
-        );
-        if (alreadyNear) {
-          return previous;
-        }
-        return [
-          ...previous,
+      setCustomCuts(
+        [
+          ...customCuts,
           {
             id: createPointId(),
             value: formatClock(safeSeconds),
             position: safeSeconds,
           },
-        ];
-      });
+        ].sort((a, b) => (a.position ?? 0) - (b.position ?? 0)),
+      );
     },
-    [audioFile?.duration],
+    [audioFile?.duration, customCuts, pushCutsHistory],
   );
+
+  const handleUndoCuts = useCallback(() => {
+    if (cutsHistory.length === 0) {
+      return;
+    }
+    const restored = cutsHistory[cutsHistory.length - 1];
+    setCutsHistory(cutsHistory.slice(0, -1));
+    setCustomCuts(restored);
+  }, [cutsHistory]);
+
+  const handleSortAndCleanCuts = useCallback(() => {
+    if (customCuts.length < 2) {
+      return;
+    }
+    pushCutsHistory(customCuts);
+    const sorted = [...customCuts].sort((a, b) => {
+      const left = typeof a.position === 'number' ? a.position : parseTimeInput(a.value) ?? Infinity;
+      const right = typeof b.position === 'number' ? b.position : parseTimeInput(b.value) ?? Infinity;
+      return left - right;
+    });
+    const deduped = [];
+    for (const point of sorted) {
+      const pos = typeof point.position === 'number' ? point.position : parseTimeInput(point.value);
+      const last = deduped[deduped.length - 1];
+      const lastPos = last ? (typeof last.position === 'number' ? last.position : parseTimeInput(last.value)) : null;
+      if (lastPos !== null && pos !== null && Math.abs(pos - lastPos) < 0.1) {
+        continue;
+      }
+      deduped.push(point);
+    }
+    setCustomCuts(deduped);
+  }, [customCuts, pushCutsHistory]);
+
+  const handleWaveformCutMove = useCallback((id, position) => {
+    if (!Number.isFinite(position)) {
+      return;
+    }
+    const duration = audioFile?.duration ?? 0;
+    const safePosition = duration > 0.5
+      ? clamp(position, 0.25, duration - 0.25)
+      : clamp(position, 0, Math.max(0, duration));
+    if (String(id).startsWith('equal-')) {
+      // Trascinare un taglio in modalità "parti uguali" converte in custom.
+      const index = Number(String(id).split('-')[1]);
+      const points = (plan.cutPoints ?? []).map((pos, i) => ({
+        id: i === index ? createPointId() : createPointId(),
+        value: formatClock(i === index ? safePosition : pos),
+        position: i === index ? safePosition : pos,
+      }));
+      pushCutsHistory(customCuts);
+      setMode('custom');
+      setCustomCuts(points);
+      return;
+    }
+    setCustomCuts((previous) =>
+      previous.map((point) =>
+        point.id === id
+          ? { ...point, value: formatClock(safePosition), position: safePosition }
+          : point,
+      ),
+    );
+  }, [plan.cutPoints, customCuts, audioFile?.duration, pushCutsHistory]);
+
+  const handleWaveformAddCut = useCallback((seconds) => {
+    addCutAt(seconds);
+  }, [addCutAt]);
 
   function updateCutPoint(id, value) {
     const parsed = parseTimeInput(value);
@@ -561,6 +764,10 @@ export default function App() {
     if (!Number.isFinite(position)) {
       return;
     }
+    if (String(id).startsWith('equal-')) {
+      handleWaveformCutMove(id, position);
+      return;
+    }
     setCustomCuts((previous) =>
       previous.map((point) =>
         point.id === id
@@ -568,10 +775,11 @@ export default function App() {
           : point,
       ),
     );
-  }, []);
+  }, [handleWaveformCutMove]);
 
   function removeCutPoint(id) {
-    setCustomCuts((previous) => previous.filter((point) => point.id !== id));
+    pushCutsHistory(customCuts);
+    setCustomCuts(customCuts.filter((point) => point.id !== id));
   }
 
   const handleTogglePlay = useCallback(() => {
@@ -582,7 +790,7 @@ export default function App() {
     waveformRef.current?.skip(delta);
   }, []);
 
-  const RATE_STEPS = useMemo(() => [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3], []);
+  const RATE_STEPS = RATE_PRESETS;
 
   const handleRateChange = useCallback((rate) => {
     if (typeof rate === 'number' && rate > 0) {
@@ -703,21 +911,94 @@ export default function App() {
     setIsPlaying(playing);
   }, []);
 
-  async function runWithLogCapture(ffmpeg, args) {
-    const logs = [];
-    const capture = ({ message }) => {
-      if (typeof message === 'string') {
-        logs.push(message);
-      }
-    };
-    ffmpeg.on('log', capture);
-    try {
-      await ffmpeg.exec(args);
-      return logs.join('\n');
-    } finally {
-      ffmpeg.off('log', capture);
+  const exportBitrateRef = useRef(exportBitrate);
+  exportBitrateRef.current = exportBitrate;
+
+  const handlePreviewSegment = useCallback((segmentIndex) => {
+    const segment = plan.segments.find((item) => item.index === segmentIndex);
+    if (!segment) {
+      return;
     }
-  }
+    if (previewTimeoutRef.current) {
+      window.clearTimeout(previewTimeoutRef.current);
+      previewTimeoutRef.current = null;
+    }
+    if (previewIndex === segmentIndex) {
+      waveformRef.current?.pause?.();
+      setPreviewIndex(null);
+      return;
+    }
+    waveformRef.current?.seekTo(segment.start + 0.01);
+    waveformRef.current?.play?.();
+    setPreviewIndex(segmentIndex);
+    const waitMs = Math.min(15 * 60 * 1000, Math.max(500, segment.duration * 1000));
+    previewTimeoutRef.current = window.setTimeout(() => {
+      waveformRef.current?.pause?.();
+      setPreviewIndex(null);
+      previewTimeoutRef.current = null;
+    }, waitMs);
+  }, [plan.segments, previewIndex]);
+
+  const handleExportFormatChange = useCallback((formatId) => {
+    const format = getExportFormat(formatId);
+    setExportFormat(format.id);
+    if (format.bitrates.length > 0 && !format.bitrates.includes(exportBitrateRef.current)) {
+      setExportBitrate(format.defaultBitrate);
+    }
+    if (!format.supportsFastCopy) {
+      setFastCopy(false);
+    }
+  }, []);
+
+  // Auto-disinserisce il fast-copy quando sorgente/formato non sono compatibili.
+  useEffect(() => {
+    if (fastCopy && !canFastCopy({ formatId: exportFormat, sourceExtension: audioFile?.extension })) {
+      setFastCopy(false);
+    }
+  }, [fastCopy, exportFormat, audioFile?.extension]);
+
+  // Persiste le preferenze di export (default invariati se storage assente).
+  useEffect(() => {
+    saveSetting('ac-export-format', exportFormat);
+  }, [exportFormat]);
+  useEffect(() => {
+    saveSetting('ac-export-bitrate', exportBitrate);
+  }, [exportBitrate]);
+  useEffect(() => {
+    saveSetting('ac-fast-copy', fastCopy);
+  }, [fastCopy]);
+  useEffect(() => {
+    saveSetting('ac-fade', fadeSeconds);
+  }, [fadeSeconds]);
+  useEffect(() => {
+    saveSetting('ac-export-dest', exportDest);
+  }, [exportDest]);
+
+  // Avviso di ripresa se un export precedente è stato interrotto.
+  useEffect(() => {
+    const checkpoint = readCheckpoint();
+    if (checkpoint && checkpoint.total >= 2) {
+      const done = checkpoint.doneCount ?? checkpoint.doneNames?.length ?? 0;
+      setResumeNotice(
+        `Ultimo export interrotto: ${done}/${checkpoint.total} parti "${checkpoint.baseName ?? ''}". ` +
+        'Ricarica lo stesso file e riesporta: in modalità cartella i file già presenti vengono saltati.',
+      );
+    }
+  }, []);
+
+  // Wake lock + avviso uscita durante elaborazioni lunghe (progetti pesanti in background).
+  const wakeHeld = useWakeLock(isExporting);
+  useEffect(() => {
+    if (!isExporting) {
+      return undefined;
+    }
+    const handler = (event) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [isExporting]);
 
   async function handleDetectSilences() {
     if (!audioFile || isBusy) {
@@ -738,7 +1019,7 @@ export default function App() {
         minSilenceSeconds: silenceMinDuration,
       });
 
-      const logText = await runWithLogCapture(ffmpeg, [
+      const logText = await runWithLogCapture([
         '-hide_banner',
         '-nostats',
         '-i',
@@ -767,6 +1048,7 @@ export default function App() {
       }
 
       setMode('custom');
+      setCutsHistory((previous) => [...previous.slice(-19), customCuts]);
       setCustomCuts(
         cutPositions.map((position) => ({
           id: createPointId(),
@@ -979,13 +1261,35 @@ export default function App() {
   }, [activeCapture, refreshProjects]);
 
   async function handleSaveProject() {
-    if (!audioFile || isBusy) {
+    if (!audioFile || isBusyRef.current) {
       return;
     }
     setSaveStatus('Salvo il progetto…');
     try {
-      const response = await fetch(audioFile.objectUrl);
-      const audioBlob = await response.blob();
+      // Riutilizza il File originale quando corrisponde all'audio corrente
+      // (niente fetch→blob duplicato in RAM); fallback a fetch per audio pulito/registrato.
+      const sameAsSource = sourceFileRef.current
+        && audioFile.name === sourceFileRef.current.name
+        && audioFile.size === sourceFileRef.current.size;
+      const audioBlob = sameAsSource
+        ? sourceFileRef.current
+        : await (await fetch(audioFile.objectUrl)).blob();
+      try {
+        const estimate = await navigator.storage?.estimate?.();
+        if (estimate?.quota && estimate?.usage !== undefined) {
+          const free = estimate.quota - estimate.usage;
+          if (audioBlob.size > free) {
+            throw new Error(
+              `Spazio insufficiente nel browser (mancano ~${Math.ceil((audioBlob.size - free) / 1024 / 1024)} MB). Elimina vecchi progetti e riprova.`,
+            );
+          }
+        }
+      } catch (estimateError) {
+        if (estimateError?.message?.includes('Spazio insufficiente')) {
+          throw estimateError;
+        }
+        // estimate opzionale: ignora
+      }
       const now = Date.now();
       const record = await saveStoredProject({
         id: currentProjectId ?? undefined,
@@ -1011,6 +1315,7 @@ export default function App() {
           position: bookmark.position,
           note: bookmark.note ?? '',
         })),
+        segmentNames,
         createdAt: currentProjectId ? undefined : now,
       });
       setCurrentProjectId(record.id);
@@ -1019,7 +1324,12 @@ export default function App() {
     } catch (error) {
       console.error(error);
       setSaveStatus('');
-      setErrorText(error.message || 'Salvataggio progetto non riuscito.');
+      const isQuota = error?.name === 'QuotaExceededError' || /quota|spazio/i.test(error?.message ?? '');
+      setErrorText(
+        isQuota
+          ? 'Spazio esaurito in IndexedDB. Elimina vecchi progetti dalla libreria e riprova.'
+          : error.message || 'Salvataggio progetto non riuscito.',
+      );
     }
   }
 
@@ -1071,9 +1381,57 @@ export default function App() {
       if (typeof record.equalParts === 'number' && record.equalParts > 0) {
         setEqualParts(record.equalParts);
       }
+      if (record.segmentNames && typeof record.segmentNames === 'object') {
+        setSegmentNames(record.segmentNames);
+      }
     } catch (error) {
       console.error(error);
       setProjectsError(error.message || 'Non sono riuscito ad aprire il progetto.');
+    }
+  }
+
+  async function handleRenameProject(projectId, currentName) {
+    if (!projectId) {
+      return;
+    }
+    const next = window.prompt('Rinomina progetto:', currentName || '');
+    if (next === null) {
+      return;
+    }
+    const name = next.trim();
+    if (!name) {
+      return;
+    }
+    try {
+      const record = await loadStoredProject(projectId);
+      if (!record) {
+        setProjectsError('Progetto non trovato.');
+        return;
+      }
+      await saveStoredProject({ ...record, name });
+      await refreshProjects();
+    } catch (error) {
+      console.error(error);
+      setProjectsError(error.message || 'Rinomina non riuscita.');
+    }
+  }
+
+  async function handleDuplicateProject(projectId) {
+    if (!projectId) {
+      return;
+    }
+    try {
+      const record = await loadStoredProject(projectId);
+      if (!record) {
+        setProjectsError('Progetto non trovato.');
+        return;
+      }
+      const { id: _dropped, ...rest } = record;
+      await saveStoredProject({ ...rest, id: undefined, name: `${record.name || 'Progetto'} (copia)`, createdAt: Date.now() });
+      await refreshProjects();
+    } catch (error) {
+      console.error(error);
+      setProjectsError(error.message || 'Duplicazione non riuscita.');
     }
   }
 
@@ -1098,6 +1456,11 @@ export default function App() {
   }
 
   async function handleRecordedFile(file) {
+    if (isBusyRef.current) {
+      setErrorText('Attendi il completamento dell’operazione in corso.');
+      return;
+    }
+    handleRecordingChange(false);
     setActiveCapture('none');
     setCurrentProjectId(null);
     await analyzeFile(file);
@@ -1238,9 +1601,307 @@ export default function App() {
       setLoopStart: handleSetLoopStart,
       setLoopEnd: handleSetLoopEnd,
       clearLoop: handleClearLoop,
+      undoCuts: handleUndoCuts,
     },
     { enabled: Boolean(audioFile) && !isBusy },
   );
+
+  function downloadUrl(url, filename) {
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }
+
+  function handleCancelExport() {
+    exportAbortRef.current = true;
+    setStatusText('Annullamento export in corso…');
+    // Interrompe un exec FFmpeg in corso; il motore verrà ricreato al prossimo uso.
+    resetAfterAbort();
+  }
+
+  function handleDownloadSingle(part) {
+    if (part?.url && part?.name) {
+      downloadUrl(part.url, part.name);
+    }
+  }
+
+  function handleDownloadZipAgain() {
+    if (lastResult?.zipUrl && lastResult?.zipName) {
+      downloadUrl(lastResult.zipUrl, lastResult.zipName);
+    }
+  }
+
+  function handleSegmentNameChange(index, value) {
+    setSegmentNames((previous) => ({ ...previous, [index]: value }));
+  }
+
+  function formatChapterClock(totalSeconds) {
+    if (!Number.isFinite(totalSeconds) || totalSeconds < 0) {
+      return '00:00';
+    }
+    const total = Math.floor(totalSeconds);
+    const hours = Math.floor(total / 3600);
+    const minutes = Math.floor((total % 3600) / 60);
+    const seconds = total % 60;
+    if (hours > 0) {
+      return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  async function handleCopyChapters() {
+    if (plan.segments.length === 0) {
+      return;
+    }
+    const lines = plan.segments.map((segment) => {
+      const title = (segmentNames[segment.index] ?? '').trim() || `Parte ${segment.index}`;
+      return `${formatChapterClock(segment.start)} ${title}`;
+    });
+    const text = lines.join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      setChaptersStatus(`Scaletta copiata (${lines.length} capitoli).`);
+    } catch {
+      try {
+        const area = document.createElement('textarea');
+        area.value = text;
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand('copy');
+        area.remove();
+        setChaptersStatus(`Scaletta copiata (${lines.length} capitoli).`);
+      } catch {
+        setChaptersStatus('Copia non riuscita: seleziona e copia manualmente.');
+      }
+    }
+    window.setTimeout(() => setChaptersStatus(''), 3500);
+  }
+
+  function handleImportTimestamps() {
+    const raw = timestampDraft.trim();
+    if (!raw || !audioFile?.duration) {
+      return;
+    }
+    const duration = audioFile.duration;
+    const found = [];
+    const zeroLabels = [];
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        continue;
+      }
+      const match = trimmed.match(/^(\d{1,3}(?::\d{1,2}){1,2}(?:[.,]\d+)?|\d+(?:[.,]\d+)?)\s*[-–—:.)\]]?\s*(.*)$/);
+      if (!match) {
+        continue;
+      }
+      const seconds = parseTimeInput(match[1]);
+      const label = (match[2] ?? '').trim().slice(0, 60);
+      if (seconds === null || !Number.isFinite(seconds) || seconds < 0 || seconds >= duration - 0.24) {
+        continue;
+      }
+      if (seconds <= 0.24) {
+        // "00:00 Titolo" non è un taglio: è il nome della prima parte.
+        if (label) {
+          zeroLabels.push(label);
+        }
+        continue;
+      }
+      found.push({ position: seconds, label });
+    }
+    if (found.length === 0 && zeroLabels.length === 0) {
+      setChaptersStatus('Nessun timestamp valido trovato (es. 00:00 Intro, 12:30 Tema).');
+      window.setTimeout(() => setChaptersStatus(''), 3500);
+      return;
+    }
+    found.sort((a, b) => a.position - b.position);
+    const deduped = found.filter((item, index) =>
+      index === 0 || Math.abs(item.position - found[index - 1].position) >= 0.25,
+    );
+    if (deduped.length > 0) {
+      pushCutsHistory(customCuts);
+    }
+    setMode('custom');
+    if (deduped.length > 0) {
+      setCustomCuts(deduped.map((item) => ({
+        id: createPointId(),
+        value: formatClock(item.position),
+        position: item.position,
+      })));
+    }
+    // L'etichetta di un timestamp descrive il segmento che INIZIA lì:
+    // boundaries[k] è l'inizio del segmento k+1 (segmenti numerati da 1).
+    setSegmentNames((previous) => {
+      const next = { ...previous };
+      if (zeroLabels.length > 0) {
+        next[1] = zeroLabels[0];
+      }
+      const boundaries = [0, ...deduped.map((item) => item.position), duration];
+      deduped.forEach((item) => {
+        if (!item.label) {
+          return;
+        }
+        const boundaryIndex = boundaries.findIndex((boundary) => Math.abs(boundary - item.position) < 0.001);
+        if (boundaryIndex > 0) {
+          next[boundaryIndex + 1] = item.label;
+        }
+      });
+      return next;
+    });
+    setTimestampDraft('');
+    setChaptersStatus(
+      deduped.length > 0
+        ? `Importati ${deduped.length} tagli dalla scaletta.`
+        : 'Nome prima parte impostato da 00:00.',
+    );
+    window.setTimeout(() => setChaptersStatus(''), 3500);
+  }
+
+  function handleCreateCutsFromBookmarks() {
+    if (bookmarks.length === 0 || !audioFile?.duration) {
+      return;
+    }
+    const duration = audioFile.duration;
+    const positions = [...new Set(
+      bookmarks
+        .map((bookmark) => bookmark.position)
+        .filter((position) => Number.isFinite(position) && position > 0.24 && position < duration - 0.24),
+    )].sort((a, b) => a - b);
+    if (positions.length === 0) {
+      return;
+    }
+    pushCutsHistory(customCuts);
+    setMode('custom');
+    setCustomCuts(positions.map((position) => ({
+      id: createPointId(),
+      value: formatClock(position),
+      position,
+    })));
+  }
+
+  function handleExportProjectJson() {
+    if (!audioFile) {
+      return;
+    }
+    const payload = {
+      app: 'audio-cutter',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      audioName: audioFile.name,
+      baseName: effectiveBaseName,
+      mode,
+      equalParts,
+      customCuts: customCuts.map((cut) => ({ value: cut.value, position: cut.position })),
+      bookmarks: bookmarks.map((bookmark) => ({ position: bookmark.position, note: bookmark.note ?? '' })),
+      segmentNames,
+      exportFormat,
+      exportBitrate,
+      fadeSeconds,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    downloadBlob(blob, `${sanitizeFileName(effectiveBaseName)} - progetto.json`);
+    setProjectJsonStatus('Progetto esportato in JSON.');
+    window.setTimeout(() => setProjectJsonStatus(''), 3000);
+  }
+
+  async function handleImportProjectJson(event) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) {
+      return;
+    }
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      if (!data || typeof data !== 'object') {
+        throw new Error('JSON non valido.');
+      }
+      if (Array.isArray(data.customCuts)) {
+        pushCutsHistory(customCuts);
+        setMode(data.mode === 'equal' ? 'equal' : 'custom');
+        setCustomCuts(data.customCuts
+          .filter((cut) => cut && (typeof cut.value === 'string' || typeof cut.position === 'number'))
+          .map((cut) => {
+            const position = typeof cut.position === 'number' ? cut.position : parseTimeInput(cut.value ?? '');
+            return {
+              id: createPointId(),
+              value: typeof cut.value === 'string' ? cut.value : formatClock(position ?? 0),
+              position: Number.isFinite(position) ? position : null,
+            };
+          }));
+      }
+      if (typeof data.equalParts === 'number' && data.equalParts >= 2) {
+        setEqualParts(Math.min(48, Math.floor(data.equalParts)));
+      }
+      if (Array.isArray(data.bookmarks)) {
+        setBookmarks(data.bookmarks
+          .filter((bookmark) => bookmark && Number.isFinite(bookmark.position))
+          .map((bookmark) => ({ id: createPointId(), position: bookmark.position, note: String(bookmark.note ?? '') }))
+          .sort((a, b) => a.position - b.position));
+      }
+      if (data.segmentNames && typeof data.segmentNames === 'object') {
+        setSegmentNames(data.segmentNames);
+      }
+      if (typeof data.exportFormat === 'string') {
+        setExportFormat(getExportFormat(data.exportFormat).id);
+      }
+      if (typeof data.exportBitrate === 'number') {
+        setExportBitrate(data.exportBitrate);
+      }
+      if (typeof data.fadeSeconds === 'number') {
+        setFadeSeconds(Math.min(2, Math.max(0, data.fadeSeconds)));
+      }
+      setProjectJsonStatus('Progetto JSON importato (applica allo stesso audio).');
+    } catch (error) {
+      console.error(error);
+      setProjectJsonStatus('Import non riuscito: file JSON non valido.');
+    }
+    window.setTimeout(() => setProjectJsonStatus(''), 3500);
+  }
+
+  async function processLoopExport() {
+    if (!audioFile || !loopRegion || loopRegion.end <= loopRegion.start + 0.24 || isBusy) {
+      setErrorText('Imposta prima un loop A-B di almeno 0,25 secondi.');
+      return;
+    }
+    const format = getExportFormat(exportFormat);
+    setErrorText('');
+    setIsBusy(true);
+    setStatusText(`Esporto la selezione ${formatClock(loopRegion.start)} → ${formatClock(loopRegion.end)}...`);
+    const virtualName = `loop-${Date.now()}${format.extension}`;
+    let ffmpeg = null;
+    try {
+      ffmpeg = await ensureEngineReady();
+      const args = buildExportArgs({
+        segment: { start: loopRegion.start, duration: loopRegion.end - loopRegion.start },
+        inputName: audioFile.virtualInputName,
+        outputName: virtualName,
+        formatId: format.id,
+        bitrateKbps: exportBitrate,
+        fastCopy: fastCopy && canFastCopy({ formatId: format.id, sourceExtension: audioFile?.extension }),
+        fadeSeconds: 0,
+      });
+      const exitCode = await ffmpeg.exec(args);
+      if (exitCode !== 0) {
+        throw new Error('Export selezione non riuscito.');
+      }
+      const data = await ffmpeg.readFile(virtualName);
+      const blob = new Blob([data], { type: format.mime });
+      downloadBlob(blob, `${sanitizeFileName(effectiveBaseName)} - selezione${format.extension}`);
+      setStatusText('Selezione esportata.');
+    } catch (error) {
+      console.error(error);
+      setErrorText(error.message || 'Export selezione non riuscito.');
+    } finally {
+      if (ffmpeg) {
+        await safeDelete(ffmpeg, virtualName);
+      }
+      setIsBusy(false);
+    }
+  }
 
   async function processAndDownload() {
     if (!audioFile || plan.error || plan.segments.length < 2) {
@@ -1248,93 +1909,349 @@ export default function App() {
       return;
     }
 
+    const format = getExportFormat(exportFormat);
+    const outputExtension = format.extension;
+    // Fast-copy solo se il container lo permette DAVVERO (evita MP3 in .m4a corrotti).
+    const effectiveFastCopy = fastCopy && canFastCopy({ formatId: format.id, sourceExtension: audioFile?.extension });
+    if (fastCopy && !effectiveFastCopy) {
+      setTechnicalLog(`fast-copy richiesto ma non compatibile (${audioFile?.extension} → ${format.id}): uso re-encode.`);
+    }
+
     setErrorText('');
+    for (const url of lastResultUrlsRef.current) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        // ignore
+      }
+    }
+    lastResultUrlsRef.current = [];
     setLastResult(null);
+    setFailedExportIndex(null);
+    setResumeNotice('');
+    clearPreview();
+
+    // Snapshot del job: i controlli restano usabili mentre il job gira in background.
+    const jobSegments = plan.segments.map((segment) => ({ ...segment }));
+    const jobBaseName = effectiveBaseName;
+    const jobFormatId = format.id;
+    const jobBitrate = exportBitrate;
+    const jobFade = effectiveFastCopy ? 0 : fadeSeconds;
+    const jobNames = jobSegments.map((segment) => buildSegmentFileName(
+      jobBaseName,
+      segment.index,
+      outputExtension,
+      segmentNames[segment.index] ?? '',
+    ));
+    const totalEstimate = jobSegments.reduce(
+      (sum, segment) => sum + estimateExportBytes({
+        durationSeconds: segment.duration,
+        bitrateKbps: jobBitrate,
+        formatId: jobFormatId,
+      }),
+      0,
+    );
+
+    const capabilities = getExportCapabilities();
+    const advice = adviseExportStrategy({
+      fileSizeBytes: audioFile.size ?? 0,
+      totalEstimateBytes: totalEstimate,
+      segmentCount: jobSegments.length,
+      capabilities,
+      preference: exportDest,
+    });
+    const destMode = advice.mode;
+    setAdvisorNote([...advice.reasons, ...advice.warnings].join(' '));
+    // Trattiene i Blob per il re-download solo sotto soglia: sopra, solo metadati.
+    const retainBlobs = totalEstimate <= RETAIN_BLOBS_BYTES;
+
+    // Gli handle disco vanno chiesti NEL gesto utente, prima del lavoro pesante.
+    let dirHandle = null;
+    let zipFileHandle = null;
+    if (destMode === 'folder') {
+      if (typeof window.showDirectoryPicker !== 'function') {
+        setErrorText('Scrittura su cartella non supportata da questo browser. Scegli un’altra destinazione.');
+        return;
+      }
+      try {
+        dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      } catch (pickerError) {
+        if (pickerError?.name === 'AbortError') {
+          setStatusText('Scelta cartella annullata.');
+          return;
+        }
+        throw pickerError;
+      }
+    } else if (destMode === 'zip-stream') {
+      if (typeof window.showSaveFilePicker !== 'function') {
+        setErrorText('Salvataggio diretto non supportato da questo browser. Scegli un’altra destinazione.');
+        return;
+      }
+      try {
+        zipFileHandle = await window.showSaveFilePicker({
+          suggestedName: `${sanitizeFileName(jobBaseName)} - ${jobSegments.length} parti.zip`,
+          types: [{ description: 'Archivio ZIP', accept: { 'application/zip': ['.zip'] } }],
+        });
+      } catch (pickerError) {
+        if (pickerError?.name === 'AbortError') {
+          setStatusText('Salvataggio annullato.');
+          return;
+        }
+        throw pickerError;
+      }
+    }
+
     setIsBusy(true);
+    setIsExporting(true);
+    setExportProgress(0);
+    setCurrentSegmentIndex(0);
+    exportAbortRef.current = false;
     setPhaseProgress(0.05);
-    setStatusText('Sto creando file M4A leggeri e pronti da usare...');
+    setStatusText(
+      `Sto creando ${jobSegments.length} parti in ${format.label} (${destMode === 'folder' ? 'cartella' : destMode === 'zip-stream' ? 'ZIP su disco' : destMode === 'zip-classic' ? 'ZIP' : 'singoli'})... ` +
+      'Puoi cambiare scheda: tieni questa aperta, il job continua in background.',
+    );
+    const previousTitle = document.title;
 
     const runPrefix = `segment-${Date.now()}`;
     let ffmpeg = null;
     const createdVirtualNames = [];
-    const outputExtension = '.m4a';
+    let zipWriter = null;
+    let zipWritable = null;
 
     try {
       ffmpeg = await ensureEngineReady();
+      if (destMode === 'zip-stream') {
+        zipWritable = await zipFileHandle.createWritable();
+        zipWriter = await createZipStreamWriter(zipWritable);
+      } else if (destMode === 'zip-classic') {
+        zipWriter = await createZipBlobWriter();
+      }
       const exportedParts = [];
+      writeCheckpoint({
+        baseName: jobBaseName,
+        formatId: jobFormatId,
+        outputExtension,
+        total: jobSegments.length,
+        destMode,
+        doneCount: 0,
+        doneNames: [],
+      });
 
-      for (let index = 0; index < plan.segments.length; index += 1) {
-        const segment = plan.segments[index];
+      for (let index = 0; index < jobSegments.length; index += 1) {
+        if (exportAbortRef.current) {
+          throw new Error('Export annullato.');
+        }
+        const segment = jobSegments[index];
+        const downloadName = jobNames[index];
         const virtualName = buildVirtualSegmentName(runPrefix, index, outputExtension);
+        setCurrentSegmentIndex(index);
+        setExportProgress(index / jobSegments.length);
         setStatusText(
-          `Creo e scarico parte ${index + 1} di ${plan.segments.length} in M4A ottimizzato...`,
+          `Creo parte ${index + 1} di ${jobSegments.length} in ${format.label} (${destMode})...`,
         );
-        setPhaseProgress(0.08 + (index / plan.segments.length) * 0.82);
+        setPhaseProgress(0.08 + (index / jobSegments.length) * 0.82);
+        document.title = `(${index + 1}/${jobSegments.length}) Export audio…`;
 
-        const segmentExitCode = await ffmpeg.exec([
-          '-hide_banner',
-          '-nostats',
-          '-ss',
-          formatFfmpegTime(segment.start),
-          '-t',
-          formatFfmpegTime(segment.duration),
-          '-i',
-          audioFile.virtualInputName,
-          '-map',
-          '0:a:0',
-          '-vn',
-          '-sn',
-          '-c:a',
-          'aac',
-          '-b:a',
-          '128k',
-          '-movflags',
-          '+faststart',
-          virtualName,
-        ]);
+        // Modalità cartella + ripresa: salta i file già presenti e validi.
+        if (destMode === 'folder' && skipExisting) {
+          try {
+            const existingHandle = await dirHandle.getFileHandle(downloadName);
+            const existingFile = await existingHandle.getFile();
+            if (existingFile.size > 0) {
+              exportedParts.push({
+                name: downloadName,
+                size: existingFile.size,
+                duration: segment.duration,
+                skipped: true,
+              });
+              await yieldToUI();
+              continue;
+            }
+          } catch {
+            // file assente: si esporta normalmente
+          }
+        }
+
+        const args = buildExportArgs({
+          segment,
+          inputName: audioFile.virtualInputName,
+          outputName: virtualName,
+          formatId: format.id,
+          bitrateKbps: jobBitrate,
+          fastCopy: effectiveFastCopy,
+          fadeSeconds: jobFade,
+        });
+
+        const segmentExitCode = await ffmpeg.exec(args);
+
+        if (exportAbortRef.current) {
+          throw new Error('Export annullato.');
+        }
 
         if (segmentExitCode !== 0) {
-          throw new Error(
-            `Non sono riuscito a esportare la parte ${index + 1} in M4A.`,
+          const failed = new Error(
+            `Non sono riuscito a esportare la parte ${index + 1} in ${format.label}.`,
           );
+          failed.failedIndex = index;
+          throw failed;
         }
 
         createdVirtualNames.push(virtualName);
 
-        const outputData = await ffmpeg.readFile(virtualName);
-        const downloadName = buildDownloadName(audioFile.baseName, index + 1, outputExtension);
-        const blob = new Blob([outputData], { type: 'audio/mp4' });
+        let outputData = await ffmpeg.readFile(virtualName);
 
-        downloadBlob(blob, downloadName);
-        exportedParts.push({
-          name: downloadName,
-          size: blob.size,
-          duration: segment.duration,
+        if (destMode === 'folder') {
+          const fileHandle = await dirHandle.getFileHandle(downloadName, { create: true });
+          await writeBlobToFileHandle(fileHandle, new Blob([outputData], { type: format.mime }));
+          exportedParts.push({
+            name: downloadName,
+            size: outputData.length,
+            duration: segment.duration,
+          });
+        } else if (destMode === 'zip-stream' || destMode === 'zip-classic') {
+          await zipWriter.add(downloadName, outputData);
+          exportedParts.push({
+            name: downloadName,
+            size: outputData.length,
+            duration: segment.duration,
+          });
+        } else {
+          const blob = new Blob([outputData], { type: format.mime });
+          let url = null;
+          if (retainBlobs) {
+            url = URL.createObjectURL(blob);
+            lastResultUrlsRef.current.push(url);
+          }
+          exportedParts.push({
+            name: downloadName,
+            size: blob.size,
+            duration: segment.duration,
+            ...(url ? { url, blob } : {}),
+          });
+          downloadBlob(blob, downloadName);
+        }
+
+        // Libera SUBITO il segmento: mai più di uno in RAM.
+        await safeDelete(ffmpeg, virtualName);
+        outputData = null;
+        await yieldToUI();
+        writeCheckpoint({
+          baseName: jobBaseName,
+          formatId: jobFormatId,
+          outputExtension,
+          total: jobSegments.length,
+          destMode,
+          doneCount: exportedParts.length,
+          doneNames: exportedParts.map((part) => part.name).slice(-200),
         });
       }
 
+      let zipUrl = null;
+      let zipName = '';
+      if (destMode === 'zip-stream') {
+        setStatusText('Finalizzo il file ZIP su disco...');
+        await zipWriter.close();
+        zipWriter = null;
+        zipName = `${sanitizeFileName(jobBaseName)} - ${exportedParts.length} parti.zip`;
+      } else if (destMode === 'zip-classic') {
+        setStatusText('Creo lo ZIP...');
+        const zipBlob = await zipWriter.close();
+        zipWriter = null;
+        zipName = `${sanitizeFileName(jobBaseName)} - ${exportedParts.length} parti.zip`;
+        const url = URL.createObjectURL(zipBlob);
+        lastResultUrlsRef.current.push(url);
+        zipUrl = url;
+        downloadBlob(zipBlob, zipName);
+      }
+
+      clearCheckpoint();
       setLastResult({
-        archiveName: `${exportedParts.length} file M4A scaricati`,
+        archiveName: destMode === 'folder'
+          ? `Cartella: ${exportedParts.length} parti scritte su disco`
+          : destMode === 'zip-stream'
+            ? `ZIP su disco: ${exportedParts.length} parti`
+            : destMode === 'zip-classic'
+              ? `ZIP pronto: ${exportedParts.length} parti in ${format.label}`
+              : `${exportedParts.length} file ${format.label} scaricati`,
         parts: exportedParts,
+        zipUrl,
+        zipName,
+        destMode,
+        retainBlobs,
       });
-      setStatusText('Fatto. Ho scaricato ogni parte come file M4A già rinominato.');
+      setStatusText(
+        destMode === 'folder'
+          ? `Fatto. ${exportedParts.length} parti scritte nella cartella scelta, senza riempire la memoria.`
+          : destMode === 'zip-stream'
+            ? `Fatto. ZIP scritto direttamente su disco con ${exportedParts.length} parti.`
+            : destMode === 'zip-classic'
+              ? `Fatto. ZIP scaricato con ${exportedParts.length} parti.${retainBlobs ? ' I singoli restano riscaricabili sotto.' : ''}`
+              : `Fatto. Ho scaricato ogni parte come file ${format.label} già rinominato.${retainBlobs ? '' : ' (Re-download disattivato per risparmiare memoria.)'}`,
+      );
       setTechnicalLog(
-        `Esportazione completata in AAC M4A 128k: ${exportedParts.length} file pronti.`,
+        `Export ${format.id} ${format.bitrates.length ? `${jobBitrate}k` : 'lossless'}${effectiveFastCopy ? ' fast-copy' : ''}${jobFade ? ` fade ${jobFade}s` : ''} via ${destMode}: ${exportedParts.length} file.`,
       );
       setPhaseProgress(1);
+      setExportProgress(1);
     } catch (error) {
       console.error(error);
-      setErrorText(error.message || 'Non sono riuscito a esportare le parti.');
-      setStatusText('Esportazione non completata.');
-      setPhaseProgress(0);
+      const cancelled = exportAbortRef.current || error?.message === 'Export annullato.';
+      if (cancelled) {
+        setErrorText('');
+        setFailedExportIndex(null);
+        for (const url of lastResultUrlsRef.current) {
+          try {
+            URL.revokeObjectURL(url);
+          } catch {
+            // ignore
+          }
+        }
+        lastResultUrlsRef.current = [];
+        setStatusText('Export annullato. Puoi rilanciarlo quando vuoi.');
+        setPhaseProgress(0);
+      } else {
+        if (Number.isInteger(error?.failedIndex)) {
+          setFailedExportIndex(error.failedIndex);
+        }
+        // Le parti parziali non sono esposte (lastResult resta null): revoca subito
+        // gli URL orfani per non tenere in RAM blob inutilizzabili.
+        for (const url of lastResultUrlsRef.current) {
+          try {
+            URL.revokeObjectURL(url);
+          } catch {
+            // ignore
+          }
+        }
+        lastResultUrlsRef.current = [];
+        setErrorText(error.message || 'Non sono riuscito a esportare le parti.');
+        setStatusText('Esportazione non completata.');
+        setPhaseProgress(0);
+      }
     } finally {
+      // Su errore/annullo lo stream ZIP va chiuso o interrotto, altrimenti
+      // il file parziale resta bloccato su disco.
+      if (zipWriter) {
+        try {
+          if (exportAbortRef.current || destMode === 'zip-stream') {
+            await zipWriter.abort?.();
+          }
+          await zipWriter.close()?.catch?.(() => {});
+        } catch {
+          // ignore: il file parziale resta eliminabile dall'utente
+        }
+        zipWriter = null;
+      }
       if (ffmpeg) {
         for (const virtualName of createdVirtualNames) {
           await safeDelete(ffmpeg, virtualName);
         }
       }
 
+      document.title = previousTitle;
+      exportAbortRef.current = false;
       setIsBusy(false);
+      setIsExporting(false);
     }
   }
 
@@ -1342,7 +2259,7 @@ export default function App() {
   const helperChips = [
     'Locale nel browser',
     'Un solo upload',
-    'Download diretto in M4A',
+    `Export ${getExportFormat(exportFormat).label}`,
   ];
 
   return (
@@ -1390,24 +2307,45 @@ export default function App() {
             <button
               type="button"
               className={activeCapture === 'none' ? 'capture-tab capture-tab-active' : 'capture-tab'}
-              onClick={() => setActiveCapture('none')}
+              onClick={() => {
+                if (isRecorderBusy && !window.confirm('Registrazione in corso: abbandonarla e cambiare scheda?')) {
+                  return;
+                }
+                setActiveCapture('none');
+              }}
               disabled={isBusy}
+              title={isRecorderBusy ? 'Ferma la registrazione prima di cambiare scheda' : undefined}
             >
               Carica file
             </button>
             <button
               type="button"
               className={activeCapture === 'recorder' ? 'capture-tab capture-tab-active' : 'capture-tab'}
-              onClick={() => setActiveCapture(activeCapture === 'recorder' ? 'none' : 'recorder')}
+              onClick={() => {
+                if (activeCapture === 'recorder') {
+                  if (isRecorderBusy && !window.confirm('Registrazione in corso: abbandonarla e chiudere?')) {
+                    return;
+                  }
+                  setActiveCapture('none');
+                  return;
+                }
+                setActiveCapture('recorder');
+              }}
               disabled={isBusy}
             >
-              Registra
+              Registra{isRecorderBusy ? ' ●' : ''}
             </button>
             <button
               type="button"
               className={activeCapture === 'library' ? 'capture-tab capture-tab-active' : 'capture-tab'}
-              onClick={() => setActiveCapture(activeCapture === 'library' ? 'none' : 'library')}
+              onClick={() => {
+                if (isRecorderBusy && !window.confirm('Registrazione in corso: abbandonarla e aprire i progetti?')) {
+                  return;
+                }
+                setActiveCapture(activeCapture === 'library' ? 'none' : 'library');
+              }}
               disabled={isBusy}
+              title={isRecorderBusy ? 'Ferma la registrazione prima di cambiare scheda' : undefined}
             >
               Progetti salvati
             </button>
@@ -1417,17 +2355,25 @@ export default function App() {
             <Recorder
               onRecorded={handleRecordedFile}
               disabled={isBusy}
-              onClose={() => setActiveCapture('none')}
+              onClose={() => {
+                if (isRecorderBusy && !window.confirm('Registrazione in corso: abbandonarla e chiudere?')) {
+                  return;
+                }
+                setActiveCapture('none');
+              }}
+              onRecordingChange={handleRecordingChange}
             />
           ) : null}
 
           {activeCapture === 'library' ? (
             <>
-              <ProjectLibrary
+                <ProjectLibrary
                 projects={projects}
                 currentProjectId={currentProjectId}
                 onOpen={handleOpenProject}
                 onDelete={handleDeleteProject}
+                onRename={handleRenameProject}
+                onDuplicate={handleDuplicateProject}
                 onClose={() => setActiveCapture('none')}
                 onRefresh={refreshProjects}
                 isLoading={projectsLoading}
@@ -1502,7 +2448,7 @@ export default function App() {
               <WaveformEditor
                 ref={waveformRef}
                 src={audioFile.objectUrl}
-                cuts={customCuts}
+                cuts={waveformCuts}
                 bookmarks={bookmarks}
                 loopRegion={loopRegion}
                 playbackRate={playbackRate}
@@ -1510,7 +2456,8 @@ export default function App() {
                 onReady={handleWaveformReady}
                 onTimeUpdate={handleWaveformTimeUpdate}
                 onPlayStateChange={handleWaveformPlayStateChange}
-                onCutMove={updateCutPointPosition}
+                onCutMove={handleWaveformCutMove}
+                onAddCutAt={handleWaveformAddCut}
                 onBookmarkJump={handleBookmarkJump}
               />
 
@@ -1641,11 +2588,59 @@ export default function App() {
                     >
                       Inserisci un taglio a metà
                     </button>
+                    <button
+                      type="button"
+                      onClick={handleUndoCuts}
+                      disabled={cutsHistory.length === 0 || isBusy}
+                      title="Annulla ultima modifica ai tagli (Ctrl+Z)"
+                    >
+                      Annulla modifica
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleSortAndCleanCuts}
+                      disabled={customCuts.length < 2 || isBusy}
+                      title="Ordina per tempo e rimuovi duplicati vicini"
+                    >
+                      Ordina e pulisci
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleCreateCutsFromBookmarks}
+                      disabled={bookmarks.length === 0 || isBusy}
+                      title="Crea un taglio in corrispondenza di ogni segnalibro"
+                    >
+                      Tagli dai segnalibri
+                    </button>
+                  </div>
+
+                  <div className="timestamp-import">
+                    <label className="field">
+                      <span>Incolla scaletta (uno per riga: 00:00 Intro)</span>
+                      <textarea
+                        className="text-input timestamp-area"
+                        value={timestampDraft}
+                        onChange={(event) => setTimestampDraft(event.target.value)}
+                        placeholder={'00:00 Introduzione\n12:30 Tema principale\n31:00 Domande'}
+                        disabled={isBusy}
+                        rows={3}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      className="ghost-button"
+                      onClick={handleImportTimestamps}
+                      disabled={!timestampDraft.trim() || isBusy}
+                    >
+                      Crea tagli + nomi dalla scaletta
+                    </button>
+                    {chaptersStatus ? <p className="save-status">{chaptersStatus}</p> : null}
                   </div>
 
                   <p className="helper-text">
                     Puoi scrivere i punti in secondi oppure in formato <code>mm:ss</code>{' '}
-                    o <code>hh:mm:ss</code>.
+                    o <code>hh:mm:ss</code>. Doppio click sulla waveform per aggiungere un taglio.
+                    Trascina le linee arancioni per spostarli.
                   </p>
 
                   <div className="cut-list">
@@ -1706,48 +2701,53 @@ export default function App() {
               )}
             </div>
 
-            <aside className="summary-column">
-              <div className="summary-head">
-                <p className="section-label">Anteprima esportazione</p>
-                <strong>
-                  {plan.segments.length > 0 ? `${plan.segments.length} file pronti` : 'In attesa'}
-                </strong>
-              </div>
+            <div className="summary-stack">
+            <ExportPanel
+              plan={plan}
+              audioFile={audioFile}
+              exportFormat={exportFormat}
+              onExportFormatChange={handleExportFormatChange}
+              exportBitrate={exportBitrate}
+              onExportBitrateChange={setExportBitrate}
+              fastCopy={fastCopy}
+              onFastCopyChange={setFastCopy}
+              fadeSeconds={fadeSeconds}
+              onFadeChange={setFadeSeconds}
+              exportDest={exportDest}
+              onExportDestChange={setExportDest}
+              skipExisting={skipExisting}
+              onSkipExistingChange={setSkipExisting}
+              advisorNote={advisorNote}
+              wakeHeld={wakeHeld}
+              baseName={baseNameOverride}
+              onBaseNameChange={setBaseNameOverride}
+              segmentNames={segmentNames}
+              onSegmentNameChange={handleSegmentNameChange}
+              onPreviewSegment={handlePreviewSegment}
+              previewIndex={previewIndex}
+              canExport={canExport}
+              isBusy={isBusy}
+              isExporting={isExporting}
+              exportProgress={exportProgress}
+              currentSegmentIndex={currentSegmentIndex}
+              failedExportIndex={failedExportIndex}
+              onExport={processAndDownload}
+              onCancelExport={handleCancelExport}
+              lastResult={lastResult}
+              onDownloadSingle={handleDownloadSingle}
+              onDownloadZipAgain={handleDownloadZipAgain}
+              loopRegion={loopRegion}
+              onExportLoop={processLoopExport}
+              onCopyChapters={handleCopyChapters}
+              chaptersStatus={chaptersStatus}
+              resumeNotice={resumeNotice}
+              disabled={isBusy}
+            />
 
-              {plan.error ? <p className="error-text">{plan.error}</p> : null}
-              {errorText ? <p className="error-text">{errorText}</p> : null}
+            {plan.error ? <p className="error-text">{plan.error}</p> : null}
+            {errorText ? <p className="error-text">{errorText}</p> : null}
 
-              {plan.segments.length > 0 ? (
-                <div className="segment-stack">
-                  {plan.segments.map((segment) => (
-                    <div className="segment-row" key={segment.index}>
-                      <div>
-                        <strong>
-                          {buildDownloadName(
-                            audioFile?.baseName ?? 'audio',
-                            segment.index,
-                            audioFile?.extension ?? '',
-                          )}
-                        </strong>
-                        <p>{segment.rangeLabel}</p>
-                      </div>
-                      <span>{formatClock(segment.duration)}</span>
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="empty-text">Le parti appariranno qui appena il piano è valido.</p>
-              )}
-
-              <button
-                type="button"
-                className="primary-button"
-                onClick={processAndDownload}
-                disabled={!canExport}
-              >
-                {isBusy ? 'Elaborazione in corso...' : 'Taglia e scarica M4A'}
-              </button>
-
+            <div className="summary-column summary-sub">
               <div className="save-row">
                 <button
                   type="button"
@@ -1759,6 +2759,37 @@ export default function App() {
                   {currentProjectId ? 'Aggiorna progetto salvato' : 'Salva progetto'}
                 </button>
                 {saveStatus ? <span className="save-status">{saveStatus}</span> : null}
+              </div>
+
+              <div className="ai-studio-row">
+                <div>
+                  <p className="section-label">Progetto come file</p>
+                  <p className="helper-text">
+                    Esporta tagli, segnalibri e nomi in JSON leggero (senza audio) da condividere
+                    o riaprire su un altro PC insieme allo stesso file audio.
+                  </p>
+                </div>
+                <div className="ai-studio-actions">
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={handleExportProjectJson}
+                    disabled={!audioFile || isBusy}
+                  >
+                    Esporta JSON
+                  </button>
+                  <label className="ghost-button ghost-file">
+                    Importa JSON
+                    <input
+                      type="file"
+                      accept="application/json,.json"
+                      onChange={handleImportProjectJson}
+                      disabled={!audioFile || isBusy}
+                      hidden
+                    />
+                  </label>
+                </div>
+                {projectJsonStatus ? <p className="save-status">{projectJsonStatus}</p> : null}
               </div>
 
               <div className="ai-studio-row">
@@ -1790,29 +2821,31 @@ export default function App() {
               </div>
 
               <p className="helper-text">
-                Il download crea file M4A separati e leggeri, già rinominati e pronti da usare.
+                Il download crea un unico ZIP più i singoli già rinominati.
                 I progetti salvati restano in questo browser, offline.
               </p>
-            </aside>
+            </div>
+            </div>
           </div>
         </section>
 
         <section className="details">
           <div className="detail">
             <p className="section-label">Perché è più veloce</p>
-            <strong>Un solo file in ingresso, parti scaricate direttamente.</strong>
+            <strong>Un solo file in ingresso, ZIP unico in uscita.</strong>
             <p>
               Il sito analizza il file una volta sola, applica tutti i punti di taglio in un
-              flusso guidato e scarica ogni segmento senza passare da archivi da estrarre.
+              flusso guidato e scarica un unico ZIP con tutte le parti già rinominate.
+              Niente più popup multipli bloccati dal browser.
             </p>
           </div>
 
           <div className="detail">
             <p className="section-label">Qualità</p>
-            <strong>M4A ottimizzato per peso e qualità.</strong>
+            <strong>M4A, MP3, OGG o WAV a tua scelta.</strong>
             <p>
-              La strategia predefinita usa AAC in M4A a 128 kbps: file più piccoli, compatibili
-              e con qualità adatta a lezioni, memo e parlato.
+              Predefinito AAC in M4A a 128 kbps per lezioni e parlato. Taglio veloce senza
+              ricodifica quando possibile, fade in/out opzionale per giunte pulite.
             </p>
           </div>
 
@@ -1835,6 +2868,18 @@ export default function App() {
               {lastResult.parts.map((part) => (
                 <span key={part.name}>
                   {part.name} · {formatBytes(part.size)} · {formatClock(part.duration)}
+                  {part.url ? (
+                    <>
+                      {' · '}
+                      <button
+                        type="button"
+                        className="mini-button"
+                        onClick={() => handleDownloadSingle(part)}
+                      >
+                        Riscarica
+                      </button>
+                    </>
+                  ) : null}
                 </span>
               ))}
             </div>

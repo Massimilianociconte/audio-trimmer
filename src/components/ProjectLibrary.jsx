@@ -35,6 +35,8 @@ export function ProjectLibrary({
   currentProjectId,
   onOpen,
   onDelete,
+  onRename,
+  onDuplicate,
   onClose,
   onRefresh,
   isLoading,
@@ -92,6 +94,27 @@ export function ProjectLibrary({
                     <span>{formatRelativeTime(project.updatedAt)}</span>
                   </span>
                 </button>
+                <div className="project-actions">
+                <button
+                  type="button"
+                  className="project-icon-button"
+                  onClick={() => onRename?.(project.id, project.name)}
+                  disabled={disabled}
+                  title="Rinomina progetto"
+                  aria-label="Rinomina progetto"
+                >
+                  ✎
+                </button>
+                <button
+                  type="button"
+                  className="project-icon-button"
+                  onClick={() => onDuplicate?.(project.id)}
+                  disabled={disabled}
+                  title="Duplica progetto"
+                  aria-label="Duplica progetto"
+                >
+                  ⧉
+                </button>
                 <button
                   type="button"
                   className="project-delete"
@@ -102,6 +125,7 @@ export function ProjectLibrary({
                 >
                   ×
                 </button>
+                </div>
               </li>
             );
           })}

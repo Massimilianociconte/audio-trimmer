@@ -21,15 +21,28 @@ export function useKeyboardShortcuts(handlers, { enabled = true } = {}) {
     }
 
     function onKeyDown(event) {
+      const map = handlersRef.current ?? {};
+      const key = event.key;
+
+      // Undo tagli: Ctrl/Cmd+Z, ma MAI dentro input/textarea/select/contenteditable
+      // (lì deve vincere l'undo nativo del campo).
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && typeof key === 'string' && key.toLowerCase() === 'z') {
+        if (isEditableTarget(event.target)) {
+          return;
+        }
+        if (!event.shiftKey && map.undoCuts) {
+          event.preventDefault();
+          map.undoCuts();
+          return;
+        }
+      }
+
       if (event.metaKey || event.ctrlKey || event.altKey) {
         return;
       }
       if (isEditableTarget(event.target)) {
         return;
       }
-
-      const map = handlersRef.current ?? {};
-      const key = event.key;
 
       if (key === ' ' || event.code === 'Space') {
         if (map.togglePlay) {
@@ -143,4 +156,5 @@ export const KEYBOARD_HINTS = [
   { keys: ['B'], action: 'Aggiungi segnalibro' },
   { keys: ['A', 'Z'], action: 'Loop A / B' },
   { keys: ['X'], action: 'Esci dal loop' },
+  { keys: ['Ctrl', 'Z'], action: 'Annulla modifica tagli' },
 ];
