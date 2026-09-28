@@ -8,11 +8,28 @@ const MIME_CANDIDATES = [
   'audio/mpeg',
 ];
 
+function isIOSDevice() {
+  try {
+    const ua = String(globalThis.navigator?.userAgent ?? '');
+    if (/iPad|iPhone|iPod/.test(ua)) {
+      return true;
+    }
+    const platform = String(globalThis.navigator?.platform ?? '');
+    return /^Mac/.test(platform) && Number(globalThis.navigator?.maxTouchPoints ?? 0) > 1;
+  } catch {
+    return false;
+  }
+}
+
 function pickSupportedMimeType() {
   if (typeof MediaRecorder === 'undefined') {
     return '';
   }
-  for (const candidate of MIME_CANDIDATES) {
+  // Su iOS webm/opus non esistono: prova prima mp4 così il blob resta riproducibile.
+  const candidates = isIOSDevice()
+    ? ['audio/mp4', 'audio/mpeg', 'audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus']
+    : MIME_CANDIDATES;
+  for (const candidate of candidates) {
     try {
       if (MediaRecorder.isTypeSupported(candidate)) {
         return candidate;
@@ -169,6 +186,12 @@ export function useRecorder() {
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
         if (AudioContextClass) {
           const audioContext = new AudioContextClass();
+          // Su iOS resta suspended senza resume esplicito dopo il gesto utente.
+          try {
+            await audioContext.resume?.()?.catch?.(() => {});
+          } catch {
+            // ignore
+          }
           const source = audioContext.createMediaStreamSource(stream);
           const analyser = audioContext.createAnalyser();
           analyser.fftSize = 512;

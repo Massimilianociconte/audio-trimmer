@@ -20,6 +20,7 @@ export function PlayerControls({
   onAddCutHere,
   onAddBookmarkHere,
   disabled,
+  nativeMode,
 }) {
   const isLooping = Boolean(loopRegion);
   const waitingForEnd = loopDraft != null && !isLooping;
@@ -97,21 +98,23 @@ export function PlayerControls({
           </div>
         </div>
 
-        <div className="player-cluster">
-          <label className="cluster-label" htmlFor="zoom-slider">
-            Zoom
-          </label>
-          <input
-            id="zoom-slider"
-            type="range"
-            min="1"
-            max="400"
-            step="1"
-            value={zoom}
-            onChange={(event) => onZoomChange(Number(event.target.value))}
-            disabled={disabled}
-          />
-        </div>
+        {nativeMode ? null : (
+          <div className="player-cluster">
+            <label className="cluster-label" htmlFor="zoom-slider">
+              Zoom
+            </label>
+            <input
+              id="zoom-slider"
+              type="range"
+              min="1"
+              max="400"
+              step="1"
+              value={zoom}
+              onChange={(event) => onZoomChange(Number(event.target.value))}
+              disabled={disabled}
+            />
+          </div>
+        )}
       </div>
 
       <div className="player-row player-row-tertiary">

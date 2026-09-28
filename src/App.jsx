@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { fetchFile } from '@ffmpeg/util';
 import {
   buildPlan,
   buildVirtualSegmentName,
@@ -34,6 +33,8 @@ import {
   stripExtension,
 } from './lib/time.js';
 import { WaveformEditor } from './components/WaveformEditor.jsx';
+import { NativeAudioPreview } from './components/NativeAudioPreview.jsx';
+import { LoadingBar } from './components/ProgressBars.jsx';
 import { PlayerControls, RATE_PRESETS } from './components/PlayerControls.jsx';
 import { BookmarksPanel } from './components/BookmarksPanel.jsx';
 import { AutomationPanel } from './components/AutomationPanel.jsx';
@@ -67,6 +68,20 @@ import {
   hasAudioStreamText,
   parseFfmpegInputLog,
 } from './lib/probe.js';
+import {
+  isMobileDevice,
+  mobileLoadLimitBytes,
+  resolveExportModeForDevice,
+  shouldUseNativePreview,
+} from './lib/device.js';
+import { readFileBytesWithProgress } from './lib/fileInput.js';
+import {
+  clamp01,
+  combineExportProgress,
+  combineLoadProgress,
+  etaMsRemaining,
+  throughputBytesPerSec,
+} from './lib/progress.js';
 
 const ACCEPTED_AUDIO_TYPES = [
   'audio/*',
@@ -150,8 +165,27 @@ function getFormatLabel(file, extension) {
   return 'audio';
 }
 
-function readAudioDurationFromBrowser(objectUrl) {
+function readAudioDurationFromBrowser(objectUrl, mimeType = '') {
   return new Promise((resolve, reject) => {
+    // Skip immediato se il browser dichiara di non saper riprodurre il tipo:
+    // evita 15s di timeout muto su Safari/iOS (opus/webm, wma, amr...).
+    if (mimeType) {
+      try {
+        const probe = document.createElement('audio');
+        const support = probe.canPlayType(mimeType);
+        if (support === '') {
+          reject(new Error('Formato non riproducibile dal browser, uso il motore locale'));
+          return;
+        }
+      } catch (earlyError) {
+        if (earlyError?.message?.includes('non riproducibile')) {
+          reject(earlyError);
+          return;
+        }
+        // canPlayType non disponibile: prosegui col tentativo normale
+      }
+    }
+
     const audio = document.createElement('audio');
     let settled = false;
 
@@ -236,13 +270,14 @@ export default function App() {
 
   async function ensureEngineReady(options) {
     const silent = options?.silent ?? false;
-    if (!silent) {
+    const hasRealProgress = typeof options?.onEngineProgress === 'function';
+    if (!silent && !hasRealProgress) {
       setStatusText('Carico il motore locale di taglio. Succede solo la prima volta.');
       setPhaseProgress(0.08);
     }
     try {
       const ffmpeg = await ensureEngineReadyBase(options);
-      if (!silent) {
+      if (!silent && !hasRealProgress) {
         setStatusText('Motore pronto. Ora puoi analizzare e tagliare il file.');
         setPhaseProgress(0);
       }
@@ -296,12 +331,16 @@ export default function App() {
   const [segmentNames, setSegmentNames] = useState({});
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState(0);
+  const [exportDetail, setExportDetail] = useState(null);
   const [currentSegmentIndex, setCurrentSegmentIndex] = useState(0);
   const [previewIndex, setPreviewIndex] = useState(null);
   const [failedExportIndex, setFailedExportIndex] = useState(null);
   const [chaptersStatus, setChaptersStatus] = useState('');
   const [timestampDraft, setTimestampDraft] = useState('');
   const [projectJsonStatus, setProjectJsonStatus] = useState('');
+  const [loadJob, setLoadJob] = useState(null);
+  const [waveformError, setWaveformError] = useState('');
+  const loadAbortRef = useRef(null);
 
   const plan = buildPlan({
     duration: audioFile?.duration ?? 0,
@@ -314,6 +353,31 @@ export default function App() {
   backupUrlRef.current = originalAudioBackup?.objectUrl ?? null;
 
   const effectiveBaseName = baseNameOverride.trim() || audioFile?.baseName || 'audio';
+
+  // Su mobile con file molto pesanti la decodifica integrale per la waveform
+  // (GB di PCM) uccide la tab: si usa l'anteprima nativa leggera.
+  const useNativePreview = useMemo(
+    () => shouldUseNativePreview({
+      sizeBytes: audioFile?.size ?? 0,
+      durationSeconds: audioFile?.duration ?? 0,
+    }),
+    [audioFile?.size, audioFile?.duration],
+  );
+
+  function handleCancelAnalysis() {
+    analysisIdRef.current += 1;
+    try {
+      loadAbortRef.current?.abort();
+    } catch {
+      // ignore
+    }
+    loadAbortRef.current = null;
+    isBusyRef.current = false;
+    setIsBusy(false);
+    setLoadJob(null);
+    setStatusText('Caricamento annullato. Scegli di nuovo il file quando vuoi.');
+    setPhaseProgress(0);
+  }
 
   const waveformCuts = useMemo(() => {
     if (mode === 'custom') {
@@ -372,20 +436,45 @@ export default function App() {
       setErrorText('Il file è vuoto (0 byte). Scegli un file audio valido.');
       return false;
     }
+    // Guardia anti-crash mobile PRIMA di copiare in RAM/wasm: su iPad/Android
+    // la tripla copia (Blob + heap JS + MEMFS) + decode uccide la tab.
+    const loadLimit = mobileLoadLimitBytes();
+    if (Number.isFinite(loadLimit) && file.size > loadLimit) {
+      const limitMb = Math.round(loadLimit / 1024 / 1024);
+      const sizeMb = Math.max(1, Math.round(file.size / 1024 / 1024));
+      setErrorText(
+        `File troppo grande per questo dispositivo (~${sizeMb} MB, limite ~${limitMb} MB): ` +
+        'su telefono/tablet il browser esaurisce la memoria. Usa un file più corto, ' +
+        'comprimilo in MP3/M4A, oppure apri il sito da un computer.',
+      );
+      setStatusText('File rifiutato per proteggere la memoria del dispositivo.');
+      return false;
+    }
 
     const analysisId = analysisIdRef.current + 1;
     analysisIdRef.current = analysisId;
     const isStale = () => analysisIdRef.current !== analysisId;
+    const abortController = new AbortController();
+    loadAbortRef.current = abortController;
 
     let objectUrl = '';
     let keepObjectUrl = false;
 
     setErrorText('');
     setLastResult(null);
+    setWaveformError('');
     isBusyRef.current = true;
     setIsBusy(true);
     setStatusText('Analizzo il file e recupero la durata esatta...');
     setPhaseProgress(0.12);
+    setLoadJob({
+      active: true,
+      stage: 'reading',
+      frac: 0,
+      bytesRead: 0,
+      totalBytes: file.size,
+      fileName: file.name,
+    });
 
     try {
       const extension = getExtension(file.name);
@@ -406,7 +495,7 @@ export default function App() {
 
       let browserDurationOk = false;
       try {
-        duration = await readAudioDurationFromBrowser(objectUrl);
+        duration = await readAudioDurationFromBrowser(objectUrl, getAudioMime(file, outputExtension));
         if (isStale()) {
           URL.revokeObjectURL(objectUrl);
           return false;
@@ -421,7 +510,28 @@ export default function App() {
         technicalMessage = 'Il browser non legge la durata, provo con ffprobe.';
       }
 
-      const ffmpeg = await ensureEngineReady();
+      if (isMobileDevice() && !browserDurationOk && !isStale()) {
+        setStatusText('Formato poco supportato su questo dispositivo: uso il motore locale (richiede il download una tantum)…');
+      }
+
+      setLoadJob((previous) => previous?.active
+        ? { ...previous, stage: 'engine', frac: null, bytesRead: 0, totalBytes: 0 }
+        : previous);
+      const ffmpeg = await ensureEngineReady({
+        onEngineProgress: (loaded, total) => {
+          if (isStale()) {
+            return;
+          }
+          setLoadJob((previous) => {
+            if (!previous?.active) {
+              return previous;
+            }
+            const frac = total > 0 ? loaded / total : null;
+            return { ...previous, stage: 'engine', frac, bytesRead: loaded, totalBytes: total };
+          });
+        },
+        signal: abortController.signal,
+      });
       if (isStale()) {
         return false;
       }
@@ -439,12 +549,39 @@ export default function App() {
       activeInputRef.current = '';
       activeProbeRef.current = '';
 
-      await ffmpeg.writeFile(virtualInputName, await fetchFile(file));
+      // Lettura con progresso reale (una sola copia, trasferibile al worker).
+      setLoadJob((previous) => previous?.active
+        ? { ...previous, stage: 'reading', frac: 0, bytesRead: 0, totalBytes: file.size }
+        : previous);
+      let fileBytes = null;
+      try {
+        fileBytes = await readFileBytesWithProgress(file, {
+          signal: abortController.signal,
+          onProgress: (loaded, total) => {
+            if (isStale()) {
+              return;
+            }
+            setLoadJob((previous) => previous?.active
+              ? { ...previous, stage: 'reading', frac: total > 0 ? loaded / total : null, bytesRead: loaded, totalBytes: total }
+              : previous);
+          },
+        });
+      } catch (readError) {
+        if (readError?.name === 'AbortError' || abortController.signal.aborted || isStale()) {
+          return false;
+        }
+        throw new Error('Non sono riuscito a leggere il file dal dispositivo. Riprova.');
+      }
+      await ffmpeg.writeFile(virtualInputName, fileBytes);
+      fileBytes = null;
       if (isStale()) {
         await safeDelete(ffmpeg, virtualInputName);
         return false;
       }
       activeInputRef.current = virtualInputName;
+      setLoadJob((previous) => previous?.active
+        ? { ...previous, stage: 'analysis', frac: null }
+        : previous);
 
       if (!Number.isFinite(duration) || duration <= 0) {
         activeProbeRef.current = probeOutputName;
@@ -632,6 +769,16 @@ export default function App() {
       setStatusText('File pronto. Scegli il tipo di taglio e scarica tutte le parti insieme.');
       setPhaseProgress(0);
       setTechnicalLog(technicalMessage);
+      // La waveform (o l'anteprima nativa) completa la barra di caricamento.
+      setLoadJob({
+        active: true,
+        stage: 'waveform',
+        frac: 0.1,
+        bytesRead: 0,
+        totalBytes: 0,
+        fileName: file.name,
+      });
+      loadAbortRef.current = null;
       clearPreview();
       return true;
     } catch (error) {
@@ -642,12 +789,16 @@ export default function App() {
       setErrorText(error.message || 'Non sono riuscito ad analizzare il file.');
       setStatusText('Qualcosa è andato storto durante l’analisi del file.');
       setPhaseProgress(0);
+      setLoadJob(null);
       return false;
     } finally {
       if (objectUrl && !keepObjectUrl) {
         URL.revokeObjectURL(objectUrl);
       }
 
+      if (loadAbortRef.current === abortController) {
+        loadAbortRef.current = null;
+      }
       if (analysisIdRef.current === analysisId) {
         isBusyRef.current = false;
         setIsBusy(false);
@@ -972,6 +1123,7 @@ export default function App() {
 
   const handleWaveformReady = useCallback((duration) => {
     setPhaseProgress(0);
+    setLoadJob(null);
     if (Number.isFinite(duration) && duration > 0) {
       setAudioFile((previous) =>
         previous && Math.abs((previous.duration ?? 0) - duration) > 0.05
@@ -979,6 +1131,23 @@ export default function App() {
           : previous,
       );
     }
+  }, []);
+
+  const handleWaveformProgress = useCallback((frac) => {
+    setLoadJob((previous) => {
+      if (!previous?.active || previous.stage !== 'waveform') {
+        return previous;
+      }
+      return { ...previous, frac: 0.1 + clamp01(frac) * 0.9 };
+    });
+  }, []);
+
+  const handleWaveformError = useCallback((message) => {
+    setLoadJob(null);
+    setWaveformError(
+      'Anteprima grafica non disponibile per questo file su questo browser, ma taglio ed export restano attivi. ' +
+      `Dettaglio: ${message || 'decodifica non riuscita'}`,
+    );
   }, []);
 
   const handleWaveformTimeUpdate = useCallback((time) => {
@@ -2038,8 +2207,10 @@ export default function App() {
       capabilities,
       preference: exportDest,
     });
-    const destMode = advice.mode;
-    setAdvisorNote([...advice.reasons, ...advice.warnings].join(' '));
+    // Su iPhone/iPad i download multipli sono bloccati (1 per gesto): un unico ZIP.
+    const deviceMode = resolveExportModeForDevice(advice.mode);
+    const destMode = deviceMode.mode;
+    setAdvisorNote([...advice.reasons, ...advice.warnings, ...(deviceMode.note ? [deviceMode.note] : [])].join(' '));
     // Trattiene i Blob per il re-download solo sotto soglia: sopra, solo metadati.
     const retainBlobs = totalEstimate <= RETAIN_BLOBS_BYTES;
 
@@ -2082,9 +2253,20 @@ export default function App() {
     setIsBusy(true);
     setIsExporting(true);
     setExportProgress(0);
+    setExportDetail({
+      active: true,
+      segIndex: 0,
+      segCount: jobSegments.length,
+      frac: 0,
+      bytesDone: 0,
+      bytesTotal: totalEstimate,
+      throughputBps: 0,
+      etaMs: null,
+    });
     setCurrentSegmentIndex(0);
     exportAbortRef.current = false;
     setPhaseProgress(0.05);
+    const exportStartedAt = performance.now();
     setStatusText(
       `Sto creando ${jobSegments.length} parti in ${format.label} (${destMode === 'folder' ? 'cartella' : destMode === 'zip-stream' ? 'ZIP su disco' : destMode === 'zip-classic' ? 'ZIP' : 'singoli'})... ` +
       'Puoi cambiare scheda: tieni questa aperta, il job continua in background.',
@@ -2123,13 +2305,39 @@ export default function App() {
         const segment = jobSegments[index];
         const downloadName = jobNames[index];
         const virtualName = buildVirtualSegmentName(runPrefix, index, outputExtension);
+        const segEstimate = estimateExportBytes({
+          durationSeconds: segment.duration,
+          bitrateKbps: jobBitrate,
+          formatId: jobFormatId,
+        });
+        const reportExport = (bytesDone, segFrac) => {
+          const frac = combineExportProgress({
+            bytesDone,
+            segFrac,
+            segEstimate,
+            bytesTotal: totalEstimate,
+          });
+          const elapsedMs = performance.now() - exportStartedAt;
+          const throughput = throughputBytesPerSec(bytesDone, elapsedMs);
+          setExportDetail((previous) => previous?.active
+            ? {
+              ...previous,
+              segIndex: index,
+              frac,
+              bytesDone,
+              throughputBps: throughput,
+              etaMs: etaMsRemaining({ bytesDone, bytesTotal: totalEstimate, throughputBps: throughput }),
+            }
+            : previous);
+          setExportProgress(frac);
+          document.title = `(${index + 1}/${jobSegments.length} · ${Math.round(frac * 100)}%) Export audio…`;
+        };
         setCurrentSegmentIndex(index);
         setExportProgress(index / jobSegments.length);
         setStatusText(
           `Creo parte ${index + 1} di ${jobSegments.length} in ${format.label} (${destMode})...`,
         );
         setPhaseProgress(0.08 + (index / jobSegments.length) * 0.82);
-        document.title = `(${index + 1}/${jobSegments.length}) Export audio…`;
 
         // Modalità cartella + ripresa: salta i file già presenti e validi.
         if (destMode === 'folder' && skipExisting) {
@@ -2143,6 +2351,8 @@ export default function App() {
                 duration: segment.duration,
                 skipped: true,
               });
+              const doneBytes = exportedParts.reduce((sum, part) => sum + (part.size || 0), 0);
+              reportExport(doneBytes, 1);
               await yieldToUI();
               continue;
             }
@@ -2161,7 +2371,21 @@ export default function App() {
           fadeSeconds: jobFade,
         });
 
-        const segmentExitCode = await ffmpeg.exec(args);
+        // Avanzamento intra-segmento reale dagli eventi progress di ffmpeg.
+        let segFrac = 0;
+        const doneBytesBase = exportedParts.reduce((sum, part) => sum + (part.size || 0), 0);
+        const onSegmentProgress = ({ progress }) => {
+          const safe = clamp01(progress);
+          segFrac = safe;
+          reportExport(doneBytesBase, safe);
+        };
+        ffmpeg.on('progress', onSegmentProgress);
+        let segmentExitCode = 1;
+        try {
+          segmentExitCode = await ffmpeg.exec(args);
+        } finally {
+          ffmpeg.off('progress', onSegmentProgress);
+        }
 
         if (exportAbortRef.current) {
           throw new Error('Export annullato.');
@@ -2213,6 +2437,7 @@ export default function App() {
         // Libera SUBITO il segmento: mai più di uno in RAM.
         await safeDelete(ffmpeg, virtualName);
         outputData = null;
+        reportExport(exportedParts.reduce((sum, part) => sum + (part.size || 0), 0), 1);
         await yieldToUI();
         writeCheckpoint({
           baseName: jobBaseName,
@@ -2328,6 +2553,7 @@ export default function App() {
 
       document.title = previousTitle;
       exportAbortRef.current = false;
+      setExportDetail(null);
       setIsBusy(false);
       setIsExporting(false);
     }
@@ -2501,6 +2727,18 @@ export default function App() {
             />
           </div>
 
+          {loadJob?.active ? (
+            <LoadingBar
+              job={loadJob.frac === null || loadJob.frac === undefined
+                ? loadJob
+                : {
+                  ...loadJob,
+                  frac: combineLoadProgress({ stage: loadJob.stage, stageFrac: loadJob.frac }),
+                }}
+              onCancel={handleCancelAnalysis}
+            />
+          ) : null}
+
           {audioFile ? (
             <div className="studio">
               <div className="studio-head">
@@ -2523,21 +2761,35 @@ export default function App() {
                 </button>
               </div>
 
-              <WaveformEditor
-                ref={waveformRef}
-                src={audioFile.objectUrl}
-                cuts={waveformCuts}
-                bookmarks={bookmarks}
-                loopRegion={loopRegion}
-                playbackRate={playbackRate}
-                zoom={zoom}
-                onReady={handleWaveformReady}
-                onTimeUpdate={handleWaveformTimeUpdate}
-                onPlayStateChange={handleWaveformPlayStateChange}
-                onCutMove={handleWaveformCutMove}
-                onAddCutAt={handleWaveformAddCut}
-                onBookmarkJump={handleBookmarkJump}
-              />
+              {useNativePreview ? (
+                <NativeAudioPreview
+                  ref={waveformRef}
+                  src={audioFile.objectUrl}
+                  playbackRate={playbackRate}
+                  onReady={handleWaveformReady}
+                  onTimeUpdate={handleWaveformTimeUpdate}
+                  onPlayStateChange={handleWaveformPlayStateChange}
+                />
+              ) : (
+                <WaveformEditor
+                  ref={waveformRef}
+                  src={audioFile.objectUrl}
+                  cuts={waveformCuts}
+                  bookmarks={bookmarks}
+                  loopRegion={loopRegion}
+                  playbackRate={playbackRate}
+                  zoom={zoom}
+                  onReady={handleWaveformReady}
+                  onTimeUpdate={handleWaveformTimeUpdate}
+                  onPlayStateChange={handleWaveformPlayStateChange}
+                  onCutMove={handleWaveformCutMove}
+                  onAddCutAt={handleWaveformAddCut}
+                  onBookmarkJump={handleBookmarkJump}
+                  onLoadingProgress={handleWaveformProgress}
+                  onWaveformError={handleWaveformError}
+                />
+              )}
+              {waveformError ? <p className="error-text">{waveformError}</p> : null}
 
               <PlayerControls
                 isPlaying={isPlaying}
@@ -2557,6 +2809,7 @@ export default function App() {
                 onAddCutHere={handleAddCutHere}
                 onAddBookmarkHere={handleAddBookmarkHere}
                 disabled={isBusy}
+                nativeMode={useNativePreview}
               />
 
               {showShortcuts ? (
@@ -2807,6 +3060,7 @@ export default function App() {
               isBusy={isBusy}
               isExporting={isExporting}
               exportProgress={exportProgress}
+              exportDetail={exportDetail}
               currentSegmentIndex={currentSegmentIndex}
               failedExportIndex={failedExportIndex}
               onExport={processAndDownload}

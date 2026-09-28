@@ -25,6 +25,8 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     onAddCutAt,
     onBookmarkJump,
     onWaveformClick,
+    onLoadingProgress,
+    onWaveformError,
   },
   ref,
 ) {
@@ -48,6 +50,8 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     onAddCutAt,
     onBookmarkJump,
     onWaveformClick,
+    onLoadingProgress,
+    onWaveformError,
   };
   latestRateRef.current = playbackRate;
   latestZoomRef.current = zoom;
@@ -169,8 +173,26 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     const handlePause = () => callbacksRef.current.onPlayStateChange?.(false);
     const handleFinish = () => callbacksRef.current.onPlayStateChange?.(false);
     const handleTime = (time) => callbacksRef.current.onTimeUpdate?.(time);
+    const handleLoading = (percent) => {
+      const numeric = Number(percent);
+      if (!Number.isFinite(numeric)) {
+        return;
+      }
+      // wavesurfer v7 emette 0..100 sul fetch + 'decode' prima di 'ready'
+      const frac = numeric > 1 ? numeric / 100 : numeric;
+      callbacksRef.current.onLoadingProgress?.(Math.min(1, Math.max(0, frac)));
+    };
+    const handleDecode = () => callbacksRef.current.onLoadingProgress?.(0.95);
+    const handleDecodeError = (error) => {
+      callbacksRef.current.onWaveformError?.(
+        error?.message || String(error) || 'Decodifica anteprima non riuscita',
+      );
+    };
 
     instance.on('ready', handleReady);
+    instance.on('loading', handleLoading);
+    instance.on('decode', handleDecode);
+    instance.on('error', handleDecodeError);
     instance.on('play', handlePlay);
     instance.on('pause', handlePause);
     instance.on('finish', handleFinish);
@@ -207,6 +229,9 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     return () => {
       isReadyRef.current = false;
       instance.un('ready', handleReady);
+      instance.un('loading', handleLoading);
+      instance.un('decode', handleDecode);
+      instance.un('error', handleDecodeError);
       instance.un('play', handlePlay);
       instance.un('pause', handlePause);
       instance.un('finish', handleFinish);

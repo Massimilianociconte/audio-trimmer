@@ -1,6 +1,7 @@
 import { EXPORT_FORMAT_ORDER, EXPORT_FORMATS, canFastCopy, estimateExportBytes } from '../lib/export.js';
 import { EXPORT_DESTINATION_ORDER, EXPORT_DESTINATIONS, getExportCapabilities } from '../lib/streamExport.js';
 import { formatBytes, formatClock } from '../lib/time.js';
+import { ExportProgressBar } from './ProgressBars.jsx';
 
 export function ExportPanel({
   plan,
@@ -29,6 +30,7 @@ export function ExportPanel({
   isBusy,
   isExporting,
   exportProgress,
+  exportDetail,
   currentSegmentIndex,
   failedExportIndex,
   onExport,
@@ -239,19 +241,7 @@ export function ExportPanel({
 
       {isExporting ? (
         <div className="export-progress">
-          <div className="progress-track" aria-hidden="true">
-            <span
-              className="progress-bar progress-bar-busy"
-              style={{ transform: `scaleX(${exportProgress})` }}
-            />
-          </div>
-          <p className="helper-text">
-            Parte {Math.min(currentSegmentIndex + 1, plan.segments.length)} di {plan.segments.length}…
-            Puoi cambiare scheda: tieni questa aperta{wakeHeld ? ' (schermo attivo)' : ''}, il job continua in background.
-          </p>
-          <button type="button" className="ghost-button ghost-danger" onClick={onCancelExport}>
-            Annulla export
-          </button>
+          <ExportProgressBar detail={exportDetail} wakeHeld={wakeHeld} onCancel={onCancelExport} />
         </div>
       ) : (
         <>

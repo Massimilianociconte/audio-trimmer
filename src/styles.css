@@ -1713,3 +1713,148 @@ select.text-input {
   gap: 12px;
 }
 
+/* Barre di caricamento/scaricamento reali */
+.loadbar,
+.exportbar {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  margin-top: 12px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid var(--line-strong);
+}
+
+.loadbar-steps {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.loadbar-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+  color: var(--muted);
+  min-width: 0;
+}
+
+.loadbar-dot {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.68rem;
+  font-weight: 700;
+  background: rgba(34, 23, 13, 0.08);
+  color: var(--muted);
+}
+
+.loadbar-step-active {
+  color: var(--ink);
+}
+
+.loadbar-step-active .loadbar-dot {
+  background: var(--accent);
+  color: #fff;
+  animation: pulse 1.6s ease infinite;
+}
+
+.loadbar-step-done {
+  color: var(--success);
+}
+
+.loadbar-step-done .loadbar-dot {
+  background: rgba(15, 140, 98, 0.16);
+  color: var(--success);
+}
+
+.loadbar-step-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.loadbar-track {
+  width: 100%;
+  height: 14px;
+  border-radius: 999px;
+  background: rgba(34, 23, 13, 0.08);
+  overflow: hidden;
+}
+
+.loadbar-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  transform-origin: left center;
+  background: linear-gradient(90deg, #ffb26e, #ef6c2f, #cf4a0f);
+  border-radius: inherit;
+  transition: transform 200ms ease;
+}
+
+.loadbar-fill-busy {
+  width: 40%;
+  animation: loadbar-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes loadbar-slide {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
+.loadbar-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: center;
+  font-size: 0.88rem;
+  color: var(--muted);
+}
+
+.loadbar-meta strong {
+  color: var(--ink);
+}
+
+.native-preview {
+  display: grid;
+  gap: 10px;
+}
+
+.native-note {
+  margin: 0;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  background: rgba(239, 108, 47, 0.08);
+  border: 1px dashed var(--line-strong);
+}
+
+.native-audio {
+  width: 100%;
+}
+
+@media (max-width: 720px) {
+  .loadbar-step-label {
+    display: none;
+  }
+
+  .loadbar-steps {
+    grid-template-columns: repeat(4, auto);
+    justify-content: start;
+    gap: 10px;
+  }
+
+  .loadbar,
+  .exportbar {
+    padding: 12px;
+  }
+}
+
