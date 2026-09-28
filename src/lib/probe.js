@@ -126,3 +126,33 @@ export function decideAudioAcceptance({
     error: 'Impossibile verificare la traccia audio di questo file. Prova con un MP3 o WAV standard.',
   };
 }
+
+/**
+ * Parsa l'output JSON di
+ * `ffprobe -show_entries format=duration:stream=codec_type -of json`.
+ * NB: ffprobe di ffmpeg.wasm 0.12 restituisce SEMPRE -1 anche quando riesce:
+ * l'esito si giudica dal contenuto, mai dal codice di uscita.
+ * Ritorna { ok, durationSeconds, hasAudio, hasVideo } (ok = JSON valido con stream).
+ */
+export function parseProbeJson(raw) {
+  const empty = { ok: false, durationSeconds: NaN, hasAudio: false, hasVideo: false };
+  const text = decodeProbeText(raw).trim();
+  if (!text) {
+    return empty;
+  }
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    return empty;
+  }
+  const streams = Array.isArray(data?.streams) ? data.streams : [];
+  const types = streams.map((stream) => String(stream?.codec_type ?? '').toLowerCase());
+  const duration = Number(data?.format?.duration);
+  return {
+    ok: streams.length > 0,
+    durationSeconds: Number.isFinite(duration) && duration > 0 ? duration : NaN,
+    hasAudio: types.includes('audio'),
+    hasVideo: types.includes('video'),
+  };
+}

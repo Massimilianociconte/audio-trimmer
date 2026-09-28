@@ -203,6 +203,8 @@ export function useRecorder() {
           analyserRef.current = analyser;
 
           const buffer = new Uint8Array(analyser.frequencyBinCount);
+          let lastLevelAt = 0;
+          let lastLevel = -1;
           const sample = () => {
             const analyserInstance = analyserRef.current;
             if (!analyserInstance) {
@@ -216,7 +218,14 @@ export function useRecorder() {
                 peak = normalized;
               }
             }
-            setLevel(peak);
+            // ~15 aggiornamenti/s bastano al vu-meter: 60 setState/s
+            // pesano sui telefoni proprio mentre registrano.
+            const now = performance.now();
+            if (now - lastLevelAt >= 66 && Math.abs(peak - lastLevel) >= 0.01) {
+              lastLevelAt = now;
+              lastLevel = peak;
+              setLevel(peak);
+            }
             levelFrameRef.current = window.requestAnimationFrame(sample);
           };
           levelFrameRef.current = window.requestAnimationFrame(sample);

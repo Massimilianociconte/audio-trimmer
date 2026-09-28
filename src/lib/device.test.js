@@ -8,7 +8,9 @@ import {
   shouldPreloadEngine,
   mobileLoadLimitBytes,
   shouldUseNativePreview,
+  shouldWarmEngineInBackground,
   resolveExportModeForDevice,
+  waveformSampleRate,
 } from './device.js';
 
 const desktop = {
@@ -92,5 +94,50 @@ describe('device', () => {
     });
     assert.deepEqual(resolveExportModeForDevice('singles', desktop).mode, 'singles');
     assert.deepEqual(resolveExportModeForDevice('zip-classic', iPad).mode, 'zip-classic');
+  });
+
+  it('warm-up motore in background tranne risparmio dati / 2G', () => {
+    assert.equal(shouldWarmEngineInBackground(desktop), true);
+    assert.equal(shouldWarmEngineInBackground(android), true);
+    assert.equal(shouldWarmEngineInBackground({ navigator: { connection: { saveData: true } } }), false);
+    assert.equal(shouldWarmEngineInBackground({ navigator: { connection: { effectiveType: '2g' } } }), false);
+    assert.equal(shouldWarmEngineInBackground({}), true);
+  });
+
+  it('PC deboli usano l’anteprima leggera prima dei PC potenti', () => {
+    const lowEnd = {
+      navigator: { userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', deviceMemory: 4, hardwareConcurrency: 4 },
+      matchMedia: () => ({ matches: false }),
+    };
+    // 1h stereo ≈ 230MB di PCM a 8kHz: ok sul PC potente, troppo sul PC debole
+    assert.equal(shouldUseNativePreview({ sizeBytes: 60 * 1024 * 1024, durationSeconds: 3600 }, desktop), false);
+    assert.equal(shouldUseNativePreview({ sizeBytes: 60 * 1024 * 1024, durationSeconds: 3600 }, lowEnd), true);
+    assert.equal(shouldUseNativePreview({ sizeBytes: 10 * 1024 * 1024, durationSeconds: 600 }, lowEnd), false);
+  });
+
+  it('decodifica la forma d’onda a 3 kHz sui dispositivi deboli che lo supportano', () => {
+    class OfflineOk {
+      constructor(channels, length, rate) {
+        if (rate < 3000) {
+          throw new Error('NotSupportedError');
+        }
+      }
+    }
+    class OfflineMin8k {
+      constructor(channels, length, rate) {
+        if (rate < 8000) {
+          throw new Error('NotSupportedError');
+        }
+      }
+    }
+    assert.equal(waveformSampleRate({ ...android, OfflineAudioContext: OfflineOk }), 3000);
+    assert.equal(waveformSampleRate({ ...android, OfflineAudioContext: OfflineMin8k }), 8000);
+    assert.equal(waveformSampleRate({ ...desktop, OfflineAudioContext: OfflineOk }), 8000);
+    assert.equal(waveformSampleRate(android), 8000);
+    assert.equal(estimateWaveformBytes(3600, 3000), 3600 * 3000 * 2 * 4);
+    // 60 min stereo: anteprima nativa a 8 kHz, forma d'onda a 3 kHz
+    const phone = { ...android, OfflineAudioContext: OfflineOk };
+    assert.equal(shouldUseNativePreview({ sizeBytes: 50 * 1024 * 1024, durationSeconds: 3600, sampleRate: 8000 }, phone), true);
+    assert.equal(shouldUseNativePreview({ sizeBytes: 50 * 1024 * 1024, durationSeconds: 1800 }, phone), false);
   });
 });

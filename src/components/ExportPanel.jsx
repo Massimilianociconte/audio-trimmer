@@ -1,4 +1,4 @@
-import { EXPORT_FORMAT_ORDER, EXPORT_FORMATS, canFastCopy, estimateExportBytes } from '../lib/export.js';
+import { EXPORT_FORMAT_ORDER, EXPORT_FORMATS, estimateExportBytes } from '../lib/export.js';
 import { EXPORT_DESTINATION_ORDER, EXPORT_DESTINATIONS, getExportCapabilities } from '../lib/streamExport.js';
 import { formatBytes, formatClock } from '../lib/time.js';
 import { ExportProgressBar } from './ProgressBars.jsx';
@@ -30,6 +30,10 @@ export function ExportPanel({
   isBusy,
   isExporting,
   exportDetail,
+  engineInfo,
+  naturalFormatId,
+  effectiveFormatId,
+  exportEstimate,
   failedExportIndex,
   onExport,
   onCancelExport,
@@ -43,17 +47,23 @@ export function ExportPanel({
   resumeNotice,
   disabled,
 }) {
-  const format = EXPORT_FORMATS[exportFormat] ?? EXPORT_FORMATS.m4a;
-  const copyAvailable = canFastCopy({ formatId: format.id, sourceExtension: audioFile?.extension });
+  const convertFormat = EXPORT_FORMATS[exportFormat] ?? EXPORT_FORMATS.m4a;
+  const format = EXPORT_FORMATS[effectiveFormatId] ?? convertFormat;
+  const copyAvailable = Boolean(naturalFormatId);
+  const copyMode = Boolean(fastCopy && copyAvailable);
   const capabilities = getExportCapabilities();
-  const totalEstimate = plan.segments.reduce(
-    (sum, seg) => sum + estimateExportBytes({ durationSeconds: seg.duration, bitrateKbps: exportBitrate, formatId: format.id }),
-    0,
-  );
+  const totalSeconds = plan.segments.reduce((sum, seg) => sum + seg.duration, 0);
+  const totalEstimate = copyMode
+    ? Math.round((audioFile?.size || 0) * (totalSeconds / Math.max(1, audioFile?.duration || totalSeconds)))
+    : plan.segments.reduce(
+      (sum, seg) => sum + estimateExportBytes({ durationSeconds: seg.duration, bitrateKbps: exportBitrate, formatId: format.id }),
+      0,
+    );
   const minSegment = plan.segments.length > 0
     ? Math.min(...plan.segments.map((segment) => segment.duration))
     : Infinity;
-  const fadeIneffective = fadeSeconds > 0 && Number.isFinite(minSegment) && minSegment <= fadeSeconds * 2;
+  const fadeIneffective = !copyMode && fadeSeconds > 0 && Number.isFinite(minSegment) && minSegment <= fadeSeconds * 2;
+  const naturalLabel = copyAvailable ? EXPORT_FORMATS[naturalFormatId]?.label : '';
 
   return (
     <aside className="summary-column">
@@ -63,6 +73,46 @@ export function ExportPanel({
           {plan.segments.length > 0 ? `${plan.segments.length} file pronti` : 'In attesa'}
         </strong>
       </div>
+
+      <div className="speed-mode" role="radiogroup" aria-label="Modalità di taglio">
+        <label className={`speed-option ${copyMode ? 'speed-option-active' : ''} ${copyAvailable ? '' : 'speed-option-disabled'}`}>
+          <input
+            type="radio"
+            name="speed-mode"
+            checked={copyMode}
+            onChange={() => onFastCopyChange(true)}
+            disabled={disabled || !copyAvailable}
+          />
+          <span>
+            <strong>⚡ Veloce · qualità originale</strong>
+            <em>
+              {copyAvailable
+                ? `Nessuna ricodifica: ${naturalLabel} identico all’originale, pronto in pochi secondi. Precisione ~0,03 s.`
+                : 'Disponibile solo se il file è già MP3 o M4A/AAC.'}
+            </em>
+          </span>
+        </label>
+        <label className={`speed-option ${!copyMode ? 'speed-option-active' : ''}`}>
+          <input
+            type="radio"
+            name="speed-mode"
+            checked={!copyMode}
+            onChange={() => onFastCopyChange(false)}
+            disabled={disabled}
+          />
+          <span>
+            <strong>Converti in {convertFormat.label}{convertFormat.bitrates.length ? ` ${exportBitrate}k` : ''}</strong>
+            <em>Ricodifica al taglio millimetrico, con fade opzionale. Più lento: dipende dalla potenza del dispositivo.</em>
+          </span>
+        </label>
+      </div>
+
+      {plan.segments.length > 0 ? (
+        <p className="export-estimate">
+          <strong>{plan.segments.length} parti</strong> · {formatClock(totalSeconds)} di audio · ~{formatBytes(totalEstimate)}
+          {exportEstimate ? <span> · {exportEstimate.text}</span> : null}
+        </p>
+      ) : null}
 
       <details className="advanced-disclosure">
         <summary>Impostazioni export (formato, qualità, destinazione)</summary>
@@ -85,7 +135,7 @@ export function ExportPanel({
             <span>Formato</span>
             <select
               className="text-input"
-              value={format.id}
+              value={convertFormat.id}
               onChange={(event) => onExportFormatChange(event.target.value)}
               disabled={disabled}
             >
@@ -97,7 +147,7 @@ export function ExportPanel({
             </select>
           </label>
 
-          {format.bitrates.length > 0 ? (
+          {convertFormat.bitrates.length > 0 ? (
             <label className="field">
               <span>Qualità</span>
               <select
@@ -106,7 +156,7 @@ export function ExportPanel({
                 onChange={(event) => onExportBitrateChange(Number(event.target.value))}
                 disabled={disabled}
               >
-                {format.bitrates.map((rate) => (
+                {convertFormat.bitrates.map((rate) => (
                   <option key={rate} value={rate}>
                     {rate} kbps
                   </option>
@@ -121,23 +171,12 @@ export function ExportPanel({
           )}
         </div>
 
-        <p className="helper-text">{format.description}</p>
+        <p className="helper-text">
+          {convertFormat.description}
+          {copyMode ? ' Scegliere un formato passa alla modalità «Converti».' : ''}
+        </p>
 
         <div className="export-toggles">
-          <label className="check-row" title={format.copyHint || 'Taglio senza ricodifica'}>
-            <input
-              type="checkbox"
-              checked={fastCopy && copyAvailable}
-              onChange={(event) => onFastCopyChange(event.target.checked)}
-              disabled={disabled || !format.supportsFastCopy || !copyAvailable}
-            />
-            <span>
-              Taglio veloce (senza ricodifica)
-              {!copyAvailable && format.supportsFastCopy ? (
-                <em> · non disponibile: la sorgente non è già {format.label}</em>
-              ) : null}
-            </span>
-          </label>
 
           <label className="check-row">
             <input
@@ -177,10 +216,13 @@ export function ExportPanel({
                 step="0.25"
                 value={fadeSeconds}
                 onChange={(event) => onFadeChange(Number(event.target.value))}
-                disabled={disabled || fastCopy}
+                disabled={disabled || copyMode}
               />
               <strong>{fadeSeconds === 0 ? 'Off' : `${fadeSeconds.toFixed(2)} s`}</strong>
             </div>
+            {copyMode ? (
+              <em className="fade-warning">Il fade richiede la modalità «Converti».</em>
+            ) : null}
             {fadeIneffective ? (
               <em className="fade-warning">Fade disattivato sulle parti più corte di {(fadeSeconds * 2).toFixed(2)} s.</em>
             ) : null}
@@ -190,7 +232,7 @@ export function ExportPanel({
         {plan.segments.length > 0 ? (
           <p className="preset-estimate">
             Peso stimato totale: <strong>{formatBytes(totalEstimate)}</strong>
-            <span className="preset-estimate-note"> · {format.label}, {plan.segments.length} parti · RAM max ≈ 1 parte</span>
+            <span className="preset-estimate-note"> · {copyMode ? `${format.label} originale` : format.label}, {plan.segments.length} parti · RAM max ≈ 1 parte</span>
           </p>
         ) : null}
         {advisorNote ? (
@@ -242,7 +284,7 @@ export function ExportPanel({
 
       {isExporting ? (
         <div className="export-progress">
-          <ExportProgressBar detail={exportDetail} wakeHeld={wakeHeld} onCancel={onCancelExport} />
+          <ExportProgressBar detail={exportDetail} engineInfo={engineInfo} wakeHeld={wakeHeld} onCancel={onCancelExport} />
         </div>
       ) : (
         <>
@@ -252,7 +294,9 @@ export function ExportPanel({
           onClick={onExport}
           disabled={!canExport}
         >
-          {isBusy ? 'Elaborazione in corso...' : `Taglia e scarica ${format.extension.replace('.', '').toUpperCase()}`}
+          {isBusy
+            ? 'Attendi: operazione in corso…'
+            : `Taglia e scarica ${plan.segments.length >= 2 ? `${plan.segments.length} parti ` : ''}${format.extension.replace('.', '').toUpperCase()}`}
         </button>
         {Number.isInteger(failedExportIndex) ? (
           <p className="error-text">Ultimo errore alla parte {failedExportIndex + 1}: rilancia l’export per riprovare da lì.</p>
@@ -312,6 +356,9 @@ export function ExportPanel({
             <button type="button" className="ghost-button" onClick={onDownloadZipAgain}>
               Riscarica ZIP
             </button>
+          ) : null}
+          {lastResult.elapsedLabel ? (
+            <p className="helper-text">Completato in {lastResult.elapsedLabel}.</p>
           ) : null}
           {lastResult.retainBlobs === false ? (
             <p className="helper-text">Re-download disattivato per risparmiare memoria su questo job pesante.</p>

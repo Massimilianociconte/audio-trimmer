@@ -108,13 +108,15 @@ export function PlayerControls({
             <input
               id="zoom-slider"
               type="range"
-              min="1"
+              min="0"
               max="400"
               step="1"
               value={zoom}
               onChange={(event) => onZoomChange(Number(event.target.value))}
               disabled={disabled}
+              aria-valuetext={zoom === 0 ? 'Adattato alla larghezza' : `${zoom} pixel al secondo`}
             />
+            <span className="zoom-value">{zoom === 0 ? 'Adatta' : `${zoom} px/s`}</span>
           </div>
         )}
       </div>

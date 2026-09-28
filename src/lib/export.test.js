@@ -5,8 +5,10 @@ import {
   buildExportArgs,
   buildSegmentFileName,
   canFastCopy,
+  describeFfmpegFailure,
   estimateExportBytes,
   getExportFormat,
+  naturalCopyFormat,
   sanitizeFileName,
 } from './export.js';
 
@@ -259,4 +261,59 @@ test('wav export applies triangular dither without breaking fade', () => {
   const filter = faded[faded.indexOf('-af') + 1];
   assert.ok(filter.includes('afade'));
   assert.ok(filter.includes('dither_method=triangular'));
+});
+
+test('naturalCopyFormat maps sources that can be cut without re-encode', () => {
+  assert.equal(naturalCopyFormat('.mp3'), 'mp3');
+  assert.equal(naturalCopyFormat('.MP3'), 'mp3');
+  assert.equal(naturalCopyFormat('.m4a'), 'm4a');
+  assert.equal(naturalCopyFormat('.aac'), 'm4a');
+  assert.equal(naturalCopyFormat('.mp4'), 'm4a');
+  for (const src of ['.wav', '.ogg', '.webm', '.flac', '', undefined]) {
+    assert.equal(naturalCopyFormat(src), null, String(src));
+  }
+  for (const src of ['.mp3', '.m4a', '.aac']) {
+    assert.equal(canFastCopy({ formatId: naturalCopyFormat(src), sourceExtension: src }), true, src);
+  }
+});
+
+test('fast copy args avoid negative timestamps and keep m4a streamable', () => {
+  const m4a = buildExportArgs({
+    segment: { start: 12, duration: 30 },
+    inputName: 'in.m4a', outputName: 'out.m4a', formatId: 'm4a', fastCopy: true,
+  });
+  assert.equal(m4a[m4a.indexOf('-avoid_negative_ts') + 1], 'make_zero');
+  assert.ok(m4a.includes('+faststart'));
+  // seek in input prima di -i: copia veloce senza decodifica
+  assert.ok(m4a.indexOf('-ss') < m4a.indexOf('-i'));
+  const mp3 = buildExportArgs({
+    segment: { start: 12, duration: 30 },
+    inputName: 'in.mp3', outputName: 'out.mp3', formatId: 'mp3', fastCopy: true,
+  });
+  assert.ok(mp3.includes('copy'));
+  assert.ok(!mp3.includes('+faststart'));
+  assert.equal(mp3[mp3.length - 1], 'out.mp3');
+});
+
+test('aac always uses the fast coder, other codecs never get it', () => {
+  for (const bitrateKbps of [64, 128, 256]) {
+    const args = buildExportArgs({
+      segment: { start: 0, duration: 10 },
+      inputName: 'i', outputName: 'o.m4a', formatId: 'm4a', bitrateKbps,
+    });
+    assert.equal(args[args.indexOf('-aac_coder') + 1], 'fast', String(bitrateKbps));
+  }
+  const mp3 = buildExportArgs({
+    segment: { start: 0, duration: 10 },
+    inputName: 'i', outputName: 'o.mp3', formatId: 'mp3', bitrateKbps: 128,
+  });
+  assert.ok(!mp3.includes('-aac_coder'));
+});
+
+test('describeFfmpegFailure maps common ffmpeg errors to readable text', () => {
+  assert.match(describeFfmpegFailure('Stream map \'0:a:0\' matches no streams.'), /traccia audio/);
+  assert.match(describeFfmpegFailure('Cannot enlarge memory arrays'), /Memoria/);
+  assert.match(describeFfmpegFailure('in.m4a: Invalid data found when processing input'), /danneggiato/);
+  assert.equal(describeFfmpegFailure('all good'), '');
+  assert.equal(describeFfmpegFailure(null), '');
 });

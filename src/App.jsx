@@ -7,8 +7,10 @@ import {
   buildExportArgs,
   buildSegmentFileName,
   canFastCopy,
+  describeFfmpegFailure,
   estimateExportBytes,
   getExportFormat,
+  naturalCopyFormat,
   sanitizeFileName,
 } from './lib/export.js';
 import {
@@ -35,14 +37,21 @@ import {
 } from './lib/time.js';
 import { WaveformEditor } from './components/WaveformEditor.jsx';
 import { NativeAudioPreview } from './components/NativeAudioPreview.jsx';
-import { LoadingBar, StepsBar, StickyExportBar } from './components/ProgressBars.jsx';
+import {
+  ActivityDock,
+  EngineChip,
+  LoadingBar,
+  StepsBar,
+  StickyExportBar,
+  describeEngine,
+} from './components/ProgressBars.jsx';
 import { PlayerControls, RATE_PRESETS } from './components/PlayerControls.jsx';
 import { BookmarksPanel } from './components/BookmarksPanel.jsx';
 import { AutomationPanel } from './components/AutomationPanel.jsx';
 import { ExportPanel } from './components/ExportPanel.jsx';
 import { Recorder } from './components/Recorder.jsx';
 import { ProjectLibrary } from './components/ProjectLibrary.jsx';
-import { useFfmpegEngine, safeDelete } from './hooks/useFfmpegEngine.js';
+import { runFfmpeg, safeDelete, useFfmpegEngine } from './hooks/useFfmpegEngine.js';
 import {
   KEYBOARD_HINTS,
   useKeyboardShortcuts,
@@ -53,7 +62,10 @@ import {
   silencesToCutPoints,
 } from './lib/silence.js';
 import {
+  CLEANUP_PRESETS,
   buildCleanupFilter,
+  buildCleanupOutputArgs,
+  cleanupChangesTimeline,
   estimateCleanupSeconds,
   getCleanupPreset,
 } from './lib/cleanup.js';
@@ -65,24 +77,27 @@ import {
 } from './lib/storage.js';
 import {
   decideAudioAcceptance,
-  decodeProbeText,
-  hasAudioStreamText,
   parseFfmpegInputLog,
+  parseProbeJson,
 } from './lib/probe.js';
 import {
   isMobileDevice,
   mobileLoadLimitBytes,
   resolveExportModeForDevice,
   shouldUseNativePreview,
+  shouldWarmEngineInBackground,
+  waveformSampleRate,
 } from './lib/device.js';
-import { readFileBytesWithProgress } from './lib/fileInput.js';
 import { hardResetApp } from './lib/cacheReset.js';
 import {
+  FAST_LOAD_STAGES,
+  LOAD_STAGES,
   clamp01,
-  combineExportProgress,
-  combineLoadProgress,
-  etaMsRemaining,
-  throughputBytesPerSec,
+  combineSecondsProgress,
+  etaMsFromSpeed,
+  formatDurationShort,
+  formatSpeedFactor,
+  speedFactor,
 } from './lib/progress.js';
 
 const ACCEPTED_AUDIO_TYPES = [
@@ -261,53 +276,93 @@ async function assertStorageFor(bytes) {
   }
 }
 
+// Velocità di export (× tempo reale) misurate su questo dispositivo, per
+// stimare la durata PRIMA di premere "Taglia e scarica". Finché non ci sono
+// misure si usano valori prudenti per classe di dispositivo.
+const SPEED_STORAGE_KEY = 'ac-export-speed-v1';
+const SPEED_CHOICE_KEY = 'ac-speed-choice';
+const DEFAULT_SPEEDS = {
+  desktop: { copy: 300, m4a: 60, mp3: 60, ogg: 45, wav: 150, flac: 80 },
+  mobile: { copy: 80, m4a: 12, mp3: 12, ogg: 9, wav: 40, flac: 18 },
+};
+
+function exportSpeedKey({ fastCopy, formatId }) {
+  return fastCopy ? 'copy' : formatId;
+}
+
+function readSpeedMemory() {
+  const stored = loadSetting(SPEED_STORAGE_KEY, {});
+  return stored && typeof stored === 'object' ? stored : {};
+}
+
+function expectedSpeed(key) {
+  const measured = Number(readSpeedMemory()[key]);
+  if (Number.isFinite(measured) && measured > 0) {
+    return { speed: measured, measured: true };
+  }
+  const table = isMobileDevice() ? DEFAULT_SPEEDS.mobile : DEFAULT_SPEEDS.desktop;
+  return { speed: table[key] ?? table.m4a, measured: false };
+}
+
+function rememberSpeed(key, speed) {
+  if (!Number.isFinite(speed) || speed <= 0) {
+    return;
+  }
+  const memory = readSpeedMemory();
+  const previous = Number(memory[key]);
+  // Media mobile: una misura anomala (tab in background) non sballa la stima.
+  memory[key] = Number.isFinite(previous) && previous > 0 ? previous * 0.6 + speed * 0.4 : speed;
+  saveSetting(SPEED_STORAGE_KEY, memory);
+}
+
+let mountSequence = 0;
+
+/**
+ * "Cancello" per annullare subito un'attesa (es. il download del motore)
+ * senza interrompere il lavoro condiviso sottostante, che continua in background.
+ */
+function createAbortGate() {
+  let rejectGate = null;
+  const promise = new Promise((_, reject) => {
+    rejectGate = reject;
+  });
+  promise.catch(() => {});
+  return {
+    promise,
+    abort: () => {
+      const error = new Error('Operazione annullata.');
+      error.cancelled = true;
+      rejectGate?.(error);
+    },
+  };
+}
+
 export default function App() {
   const inputRef = useRef(null);
   const objectUrlRef = useRef('');
-  const activeInputRef = useRef('');
-  const activeProbeRef = useRef('');
   const dragDepthRef = useRef(0);
   const waveformRef = useRef(null);
   const exportAbortRef = useRef(false);
+  const exportGateRef = useRef(null);
+  const exportStageRef = useRef('');
   const previewTimeoutRef = useRef(null);
   const lastResultUrlsRef = useRef([]);
   const analysisIdRef = useRef(0);
   const isBusyRef = useRef(false);
   const isRecorderBusyRef = useRef(false);
   const sourceFileRef = useRef(null);
+  // Input montato nel motore via WORKERFS (zero copie in RAM/wasm):
+  // { ffmpeg, blob, dir, path, memfs }.
+  const mountRef = useRef({ ffmpeg: null, blob: null, dir: '', path: '', memfs: false });
 
   const {
     ffmpegRef,
-    engineState,
-    setEngineState,
-    phaseProgress,
-    setPhaseProgress,
+    engineInfo,
     technicalLog,
     setTechnicalLog,
-    ensureReady: ensureEngineReadyBase,
-    runWithLogCapture,
+    ensureReady: ensureEngineReady,
     resetAfterAbort,
   } = useFfmpegEngine();
-
-  async function ensureEngineReady(options) {
-    const silent = options?.silent ?? false;
-    const hasRealProgress = typeof options?.onEngineProgress === 'function';
-    if (!silent && !hasRealProgress) {
-      setStatusText('Carico il motore locale di taglio. Succede solo la prima volta.');
-      setPhaseProgress(0.08);
-    }
-    try {
-      const ffmpeg = await ensureEngineReadyBase(options);
-      if (!silent && !hasRealProgress) {
-        setStatusText('Motore pronto. Ora puoi analizzare e tagliare il file.');
-        setPhaseProgress(0);
-      }
-      return ffmpeg;
-    } catch (error) {
-      setEngineState('idle');
-      throw error;
-    }
-  }
 
   const [statusText, setStatusText] = useState(INITIAL_MESSAGE);
   const [dragActive, setDragActive] = useState(false);
@@ -322,7 +377,9 @@ export default function App() {
   const [audioFile, setAudioFile] = useState(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
-  const [zoom, setZoom] = useState(60);
+  // 0 = forma d'onda adattata alla larghezza: panoramica immediata anche
+  // su lezioni lunghe e rendering leggero; lo zoom resta a portata di slider.
+  const [zoom, setZoom] = useState(0);
   const [loopRegion, setLoopRegion] = useState(null);
   const [loopDraft, setLoopDraft] = useState(null);
   const [bookmarks, setBookmarks] = useState([]);
@@ -330,7 +387,17 @@ export default function App() {
   const [silenceThresholdDb, setSilenceThresholdDb] = useState(-30);
   const [silenceMinDuration, setSilenceMinDuration] = useState(2);
   const [silenceMinSegment, setSilenceMinSegment] = useState(8);
-  const [cleanupPreset, setCleanupPreset] = useState('none');
+  const [cleanupPreset, setCleanupPreset] = useState(() => {
+    const saved = loadSetting('ac-cleanup-preset', 'lecture');
+    return CLEANUP_PRESETS[saved] && saved !== 'none' ? saved : 'lecture';
+  });
+  const [shortenPauses, setShortenPauses] = useState(() => loadSetting('ac-shorten-pauses', false));
+  // { presetId, label, start, duration, originalUrl, cleanedUrl } dell'ultima anteprima A/B.
+  const [cleanupPreview, setCleanupPreview] = useState(null);
+  // { presetId, label, shortenPauses } della pulizia applicata al file corrente.
+  const [appliedCleanup, setAppliedCleanup] = useState(null);
+  // Conferma breve a fine lavoro nel dock ("Fatto in 3 s").
+  const [doneNote, setDoneNote] = useState(null);
   const [originalAudioBackup, setOriginalAudioBackup] = useState(null);
   const [lastDetectionSummary, setLastDetectionSummary] = useState('');
   const [activeCapture, setActiveCapture] = useState('none');
@@ -342,7 +409,9 @@ export default function App() {
   const [isRecorderBusy, setIsRecorderBusy] = useState(false);
   const [exportFormat, setExportFormat] = useState(() => loadSetting('ac-export-format', 'm4a'));
   const [exportBitrate, setExportBitrate] = useState(() => Number(loadSetting('ac-export-bitrate', 128)) || 128);
-  const [fastCopy, setFastCopy] = useState(() => loadSetting('ac-fast-copy', false));
+  // true = taglio senza ricodifica (se la sorgente lo permette). Impostato a
+  // ogni caricamento dalla scelta ricordata dell'utente (default: veloce).
+  const [fastCopy, setFastCopy] = useState(false);
   const [fadeSeconds, setFadeSeconds] = useState(() => Number(loadSetting('ac-fade', 0)) || 0);
   const [exportDest, setExportDest] = useState(() => loadSetting('ac-export-dest', 'auto'));
   const [skipExisting, setSkipExisting] = useState(true);
@@ -360,18 +429,20 @@ export default function App() {
   const [loadJob, setLoadJob] = useState(null);
   const [waveformError, setWaveformError] = useState('');
   const [swWaiting, setSwWaiting] = useState(false);
+  // Operazione lunga non-export (silenzi, pulizia, AI, selezione A-B):
+  // { kind, title, detail, frac, etaMs, speed, stage, startedAt }.
+  const [task, setTask] = useState(null);
   const loadAbortRef = useRef(null);
-  const inputStaleRef = useRef(false);
-  const backupFsMissingRef = useRef(false);
   const audioFileRef = useRef(null);
   const loadJobRef = useRef(null);
+  const timeUpdateRef = useRef({ lastAt: 0, value: 0 });
 
-  const plan = buildPlan({
+  const plan = useMemo(() => buildPlan({
     duration: audioFile?.duration ?? 0,
     mode,
     equalParts,
     customCuts,
-  });
+  }), [audioFile?.duration, mode, equalParts, customCuts]);
 
   const backupUrlRef = useRef(null);
   backupUrlRef.current = originalAudioBackup?.objectUrl ?? null;
@@ -389,6 +460,13 @@ export default function App() {
   }, []);
 
   const effectiveBaseName = baseNameOverride.trim() || audioFile?.baseName || 'audio';
+  // Formato in cui la sorgente si taglia senza ricodifica (null = serve convertire).
+  const naturalFormatId = naturalCopyFormat(audioFile?.extension);
+  const effectiveFastCopy = Boolean(fastCopy && naturalFormatId);
+  const effectiveFormatId = effectiveFastCopy ? naturalFormatId : getExportFormat(exportFormat).id;
+
+  // Frequenza di decodifica della sola forma d'onda (3 kHz sui dispositivi deboli).
+  const waveformRate = useMemo(() => waveformSampleRate(), []);
 
   // Su mobile con file molto pesanti la decodifica integrale per la waveform
   // (GB di PCM) uccide la tab: si usa l'anteprima nativa leggera.
@@ -396,9 +474,74 @@ export default function App() {
     () => shouldUseNativePreview({
       sizeBytes: audioFile?.size ?? 0,
       durationSeconds: audioFile?.duration ?? 0,
+      sampleRate: waveformRate,
     }),
-    [audioFile?.size, audioFile?.duration],
+    [audioFile?.size, audioFile?.duration, waveformRate],
   );
+
+  /**
+   * Rende disponibile l'audio corrente al motore SENZA copiarlo: WORKERFS
+   * legge il File/Blob a pezzi dal worker (niente lettura integrale in RAM,
+   * niente copia nella memoria wasm che non si restringe mai).
+   * Fallback MEMFS solo se il mount non è disponibile.
+   */
+  async function ensureInputMounted(ffmpeg, source = audioFileRef.current) {
+    const blob = source?.blob;
+    if (!blob) {
+      throw new Error('Audio non più disponibile in memoria: ricarica il file.');
+    }
+    const current = mountRef.current;
+    if (current.ffmpeg === ffmpeg && current.blob === blob && current.path) {
+      return current.path;
+    }
+    if (current.ffmpeg === ffmpeg) {
+      await releaseMount(ffmpeg);
+    }
+    mountSequence += 1;
+    const extension = String(source.extension || getExtension(source.name || '') || '.audio').replace(/[^.a-z0-9]/gi, '') || '.audio';
+    const fileName = `input${extension}`;
+    const dir = `/in${mountSequence}`;
+    let path = '';
+    let memfs = false;
+    try {
+      await ffmpeg.createDir(dir);
+      const mounted = await ffmpeg.mount('WORKERFS', { blobs: [{ name: fileName, data: blob }] }, dir);
+      if (mounted === false) {
+        throw new Error('WORKERFS non disponibile');
+      }
+      path = `${dir}/${fileName}`;
+    } catch {
+      try {
+        await ffmpeg.deleteDir(dir);
+      } catch {
+        // ignore
+      }
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      path = `/input-${mountSequence}${extension}`;
+      await ffmpeg.writeFile(path, bytes);
+      memfs = true;
+    }
+    mountRef.current = { ffmpeg, blob, dir: memfs ? '' : dir, path, memfs };
+    return path;
+  }
+
+  async function releaseMount(ffmpeg = ffmpegRef.current) {
+    const current = mountRef.current;
+    mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
+    if (!ffmpeg || current.ffmpeg !== ffmpeg || !current.path) {
+      return;
+    }
+    try {
+      if (current.memfs) {
+        await safeDelete(ffmpeg, current.path);
+      } else if (current.dir) {
+        await ffmpeg.unmount(current.dir);
+        await ffmpeg.deleteDir(current.dir);
+      }
+    } catch {
+      // best-effort: il motore resta usabile anche con un mount orfano
+    }
+  }
 
   function handleCancelAnalysis() {
     analysisIdRef.current += 1;
@@ -411,8 +554,9 @@ export default function App() {
     isBusyRef.current = false;
     setIsBusy(false);
     setLoadJob(null);
-    setStatusText('Caricamento annullato. Scegli di nuovo il file quando vuoi.');
-    setPhaseProgress(0);
+    setStatusText(audioFileRef.current
+      ? 'Forma d’onda interrotta: ascolto, tagli ed export restano attivi.'
+      : 'Caricamento annullato. Scegli di nuovo il file quando vuoi.');
   }
 
   const waveformCuts = useMemo(() => {
@@ -451,8 +595,7 @@ export default function App() {
         window.clearTimeout(previewTimeoutRef.current);
       }
 
-      activeInputRef.current = '';
-      activeProbeRef.current = '';
+      mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
     };
   }, []);
 
@@ -472,8 +615,8 @@ export default function App() {
       setErrorText('Il file è vuoto (0 byte). Scegli un file audio valido.');
       return false;
     }
-    // Guardia anti-crash mobile PRIMA di copiare in RAM/wasm: su iPad/Android
-    // la tripla copia (Blob + heap JS + MEMFS) + decode uccide la tab.
+    // Guardia anti-crash mobile PRIMA di decodificare: su iPad/Android
+    // la decodifica di file enormi uccide la tab.
     const loadLimit = mobileLoadLimitBytes();
     if (Number.isFinite(loadLimit) && file.size > loadLimit) {
       const limitMb = Math.round(loadLimit / 1024 / 1024);
@@ -493,271 +636,79 @@ export default function App() {
     const abortController = new AbortController();
     loadAbortRef.current = abortController;
 
+    const extension = getExtension(file.name);
+    const outputExtension = extension || '.audio';
+    const baseName = stripExtension(file.name);
+    const mimeType = getAudioMime(file, outputExtension);
+    const startedAt = Date.now();
     let objectUrl = '';
     let keepObjectUrl = false;
-    let ffmpeg = null;
-    let cleanedStale = false;
-    const hadBackup = Boolean(originalAudioBackup);
 
     setErrorText('');
     setLastResult(null);
     setWaveformError('');
     isBusyRef.current = true;
     setIsBusy(true);
-    setStatusText('Analizzo il file e recupero la durata esatta...');
-    setPhaseProgress(0.12);
+    setStatusText(`Leggo "${file.name}"…`);
     setLoadJob({
       active: true,
-      stage: 'reading',
-      frac: 0,
-      bytesRead: 0,
-      totalBytes: file.size,
+      stage: 'metadata',
+      stages: FAST_LOAD_STAGES,
+      frac: null,
       fileName: file.name,
+      startedAt,
     });
 
     try {
-      const extension = getExtension(file.name);
-      const outputExtension = extension || '.audio';
-      const baseName = stripExtension(file.name);
-      const virtualInputName = `source-${Date.now()}-${analysisId}${outputExtension}`;
-      const probeOutputName = `probe-${Date.now()}-${analysisId}.json`;
       let duration = NaN;
       let technicalMessage = 'File pronto.';
-      let formatLabel = getFormatLabel(file, outputExtension);
-
-      if (file.size > HEAVY_INPUT_BYTES) {
-        const heavyMb = Math.round(HEAVY_INPUT_BYTES / 1024 / 1024);
-        technicalMessage = 'File molto grande: l’analisi potrebbe richiedere tempo e memoria.';
-        setStatusText(`File molto grande (>${heavyMb} MB): analisi in corso, potrebbe volerci un po’...`);
-      }
+      const formatLabel = getFormatLabel(file, outputExtension);
 
       objectUrl = URL.createObjectURL(file);
 
+      // Percorso veloce: se il browser legge il file, è pronto SUBITO
+      // (ascolto, forma d'onda, tagli). Il motore serve solo per esportare
+      // e intanto si scarica in background.
       let browserDurationOk = false;
       try {
-        duration = await readAudioDurationFromBrowser(objectUrl, getAudioMime(file, outputExtension));
-        if (isStale()) {
-          URL.revokeObjectURL(objectUrl);
-          return false;
-        }
+        duration = await readAudioDurationFromBrowser(objectUrl, mimeType);
         browserDurationOk = Number.isFinite(duration) && duration > 0;
-        technicalMessage = 'Durata recuperata direttamente dal browser.';
+        technicalMessage = 'Durata letta direttamente dal browser (nessun download necessario).';
       } catch {
+        technicalMessage = 'Il browser non legge questo formato: uso il motore locale.';
+      }
+      if (isStale()) {
+        return false;
+      }
+
+      if (!browserDurationOk) {
+        // Percorso motore: formato che il browser non sa leggere (wma, amr, …).
+        setLoadJob((previous) => previous?.active
+          ? { ...previous, stage: 'engine', stages: LOAD_STAGES, frac: null }
+          : previous);
+        setStatusText(
+          file.size > HEAVY_INPUT_BYTES
+            ? 'Formato non letto dal browser e file molto grande: preparo il motore locale, può volerci un po’…'
+            : 'Formato non letto dal browser: preparo il motore locale per analizzarlo…',
+        );
+        const ffmpeg = await ensureEngineReady();
         if (isStale()) {
-          URL.revokeObjectURL(objectUrl);
           return false;
         }
-        technicalMessage = 'Il browser non legge la durata, provo con ffprobe.';
-      }
-
-      if (isMobileDevice() && !browserDurationOk && !isStale()) {
-        setStatusText('Formato poco supportato su questo dispositivo: uso il motore locale (richiede il download una tantum)…');
-      }
-
-      setLoadJob((previous) => previous?.active
-        ? { ...previous, stage: 'engine', frac: null, bytesRead: 0, totalBytes: 0 }
-        : previous);
-      ffmpeg = await ensureEngineReady({
-        onEngineProgress: (loaded, total) => {
-          if (isStale()) {
-            return;
-          }
-          setLoadJob((previous) => {
-            if (!previous?.active) {
-              return previous;
-            }
-            const frac = total > 0 ? loaded / total : null;
-            return { ...previous, stage: 'engine', frac, bytesRead: loaded, totalBytes: total };
-          });
-        },
-        onEngineStage: (stage) => {
-          if (isStale() || stage !== 'compiling') {
-            return;
-          }
-          setStatusText('Motore scaricato: compilazione sul dispositivo, ancora pochi secondi…');
-          setLoadJob((previous) => previous?.active
-            ? { ...previous, stage: 'engine', frac: null }
-            : previous);
-        },
-        signal: abortController.signal,
-      });
-      if (isStale()) {
-        return false;
-      }
-
-      const staleVirtualNames = new Set(
-        [
-          activeInputRef.current,
-          activeProbeRef.current,
-          originalAudioBackup?.virtualInputName,
-        ].filter(Boolean),
-      );
-      for (const virtualName of staleVirtualNames) {
-        await safeDelete(ffmpeg, virtualName);
-      }
-      activeInputRef.current = '';
-      activeProbeRef.current = '';
-      cleanedStale = true;
-
-      // Lettura con progresso reale (una sola copia, trasferibile al worker).
-      setLoadJob((previous) => previous?.active
-        ? { ...previous, stage: 'reading', frac: 0, bytesRead: 0, totalBytes: file.size }
-        : previous);
-      let fileBytes = null;
-      try {
-        fileBytes = await readFileBytesWithProgress(file, {
-          signal: abortController.signal,
-          onProgress: (loaded, total) => {
-            if (isStale()) {
-              return;
-            }
-            setLoadJob((previous) => previous?.active
-              ? { ...previous, stage: 'reading', frac: total > 0 ? loaded / total : null, bytesRead: loaded, totalBytes: total }
-              : previous);
-          },
-        });
-      } catch (readError) {
-        if (readError?.name === 'AbortError' || abortController.signal.aborted || isStale()) {
+        setLoadJob((previous) => previous?.active ? { ...previous, stage: 'analysis', frac: null } : previous);
+        setStatusText('Analizzo il file con il motore locale…');
+        const source = { blob: file, extension: outputExtension, name: file.name };
+        const inputPath = await ensureInputMounted(ffmpeg, source);
+        const inspection = await inspectWithEngine(ffmpeg, inputPath, analysisId);
+        if (isStale()) {
           return false;
         }
-        throw new Error('Non sono riuscito a leggere il file dal dispositivo. Riprova.');
-      }
-      await ffmpeg.writeFile(virtualInputName, fileBytes);
-      fileBytes = null;
-      if (isStale()) {
-        await safeDelete(ffmpeg, virtualInputName);
-        return false;
-      }
-      activeInputRef.current = virtualInputName;
-      inputStaleRef.current = false;
-      setLoadJob((previous) => previous?.active
-        ? { ...previous, stage: 'analysis', frac: null }
-        : previous);
-
-      if (!Number.isFinite(duration) || duration <= 0) {
-        activeProbeRef.current = probeOutputName;
-
-        const exitCode = await ffmpeg.ffprobe([
-          '-v',
-          'error',
-          '-show_entries',
-          'format=duration',
-          '-of',
-          'default=noprint_wrappers=1:nokey=1',
-          virtualInputName,
-          '-o',
-          probeOutputName,
-        ]);
-
-        if (exitCode !== 0) {
-          throw new Error('Impossibile leggere i metadati del file audio.');
-        }
-
-        const probeRaw = await ffmpeg.readFile(probeOutputName, 'utf8');
-        await safeDelete(ffmpeg, probeOutputName);
-        activeProbeRef.current = '';
-        duration = Number(decodeProbeText(probeRaw).trim());
-        technicalMessage = 'Durata recuperata con ffprobe.';
-      }
-
-      if (isStale()) {
-        return false;
+        duration = inspection.durationSeconds;
+        technicalMessage = `Durata letta con il motore locale${inspection.note}`;
       }
 
       if (!Number.isFinite(duration) || duration <= 0) {
         throw new Error('Durata non valida. Prova con un file audio differente.');
-      }
-
-      // Verifica resiliente della traccia audio:
-      // - se ffprobe elenca gli stream e nessuno è audio => rifiuto (vero positivo)
-      // - se ffprobe fallisce (exit != 0, -o non scritto, readFile vuota) => NON si
-      //   deve mascherare da "nessuna traccia": fallback su `ffmpeg -i` e, in ultima
-      //   istanza, sulla durata già validata dal browser. L'export segnalerà l'errore reale.
-      {
-        const streamProbeName = `streams-${Date.now()}-${analysisId}.txt`;
-        activeProbeRef.current = streamProbeName;
-        let ffprobeOk = false;
-        let ffprobeHasAudio = false;
-        let ffprobeDetail = '';
-        try {
-          const streamExit = await ffmpeg.ffprobe([
-            '-v', 'error',
-            '-show_entries', 'stream=codec_type',
-            '-of', 'csv=p=0',
-            virtualInputName,
-            '-o', streamProbeName,
-          ]);
-          if (streamExit === 0) {
-            try {
-              const raw = await ffmpeg.readFile(streamProbeName, 'utf8');
-              const text = decodeProbeText(raw);
-              ffprobeDetail = text.slice(0, 200);
-              if (text.trim().length > 0) {
-                ffprobeOk = true;
-                ffprobeHasAudio = hasAudioStreamText(text);
-              }
-            } catch (readError) {
-              ffprobeDetail = readError?.message ?? 'readFile fallita';
-            }
-          } else {
-            ffprobeDetail = `ffprobe exit ${streamExit}`;
-          }
-        } catch (probeError) {
-          ffprobeDetail = probeError?.message ?? String(probeError);
-        } finally {
-          await safeDelete(ffmpeg, streamProbeName);
-          activeProbeRef.current = '';
-        }
-        if (isStale()) {
-          return false;
-        }
-
-        if (!ffprobeOk || !ffprobeHasAudio) {
-          // Fallback: `ffmpeg -i` stampa sempre gli stream nel log (esce != 0 senza output).
-          let logHasAudio = false;
-          let logHasVideo = false;
-          try {
-            const logs = [];
-            const capture = ({ message }) => {
-              if (typeof message === 'string') {
-                logs.push(message);
-              }
-            };
-            ffmpeg.on('log', capture);
-            try {
-              await ffmpeg.exec(['-hide_banner', '-i', virtualInputName]);
-            } finally {
-              ffmpeg.off('log', capture);
-            }
-            const parsed = parseFfmpegInputLog(logs.join('\n'));
-            logHasAudio = parsed.hasAudio;
-            logHasVideo = parsed.hasVideo;
-          } catch {
-            // Log non disponibile: la decisione sotto userà il fallback browser.
-          }
-          if (isStale()) {
-            return false;
-          }
-
-          const decision = decideAudioAcceptance({
-            ffprobeOk,
-            ffprobeHasAudio,
-            ffmpegLogHasAudio: logHasAudio,
-            ffmpegLogHasVideo: logHasVideo,
-            browserDurationOk,
-          });
-          if (!decision.accept) {
-            throw new Error(decision.error);
-          }
-          if (decision.reason === 'browser-duration-fallback') {
-            technicalMessage += ' (traccia verificata via browser: probe ffmpeg non conclusiva).';
-          } else if (decision.reason === 'ffmpeg-log-audio') {
-            technicalMessage += ' (traccia audio confermata via ffmpeg).';
-          }
-          if (ffprobeDetail && !ffprobeOk) {
-            console.warn('[audio-cutter] stream probe inconclusiva:', ffprobeDetail);
-          }
-        }
       }
 
       if (objectUrlRef.current) {
@@ -766,21 +717,24 @@ export default function App() {
       objectUrlRef.current = objectUrl;
       keepObjectUrl = true;
 
-      setAudioFile({
+      const nextAudio = {
         baseName,
         duration,
         extension: outputExtension,
         formatLabel,
-        mimeType: getAudioMime(file, outputExtension),
+        mimeType,
         name: file.name,
         objectUrl,
         size: file.size,
-        virtualInputName,
-        // Il File è già un Blob: il salvataggio progetto lo riusa senza riletture.
-        blob: file instanceof File ? file : null,
+        // Il File è già un Blob: montato nel motore e riusato dal salvataggio
+        // progetto senza nessuna copia in RAM.
+        blob: file,
         lastModified: file?.lastModified ?? null,
-      });
-      // Riferimento al File originale: evita una copia in RAM al salvataggio progetto.
+        // false = il browser non sa riprodurlo (wma, aiff, amr…): serve un'anteprima.
+        browserPlayable: browserDurationOk,
+      };
+      audioFileRef.current = nextAudio;
+      setAudioFile(nextAudio);
       sourceFileRef.current = file instanceof File ? file : null;
       setMode('equal');
       setEqualParts(2);
@@ -789,18 +743,20 @@ export default function App() {
       setCurrentTime(0);
       setIsPlaying(false);
       setPlaybackRate(1);
-      setZoom(60);
+      setZoom(0);
       setLoopRegion(null);
       setLoopDraft(null);
       setBookmarks([]);
-      setCleanupPreset('none');
+      setAppliedCleanup(null);
+      setCleanupPreview(null);
       setLastDetectionSummary('');
       setBaseNameOverride('');
       setSegmentNames({});
       setPreviewIndex(null);
-      setExportFormat('m4a');
-      setExportBitrate(128);
-      setFastCopy(false);
+      // Default più veloce possibile: se la sorgente è già MP3/M4A si taglia
+      // senza ricodifica (qualità identica, secondi invece di minuti), a meno
+      // che l'utente non abbia scelto esplicitamente «Converti».
+      setFastCopy(loadSetting(SPEED_CHOICE_KEY, 'fast') !== 'convert' && Boolean(naturalCopyFormat(outputExtension)));
       setFadeSeconds(0);
       setIsExporting(false);
       for (const url of lastResultUrlsRef.current) {
@@ -813,74 +769,45 @@ export default function App() {
       lastResultUrlsRef.current = [];
 
       setOriginalAudioBackup((previousBackup) => {
-        if (previousBackup?.objectUrl) {
+        if (previousBackup?.objectUrl && previousBackup.objectUrl !== objectUrl) {
           URL.revokeObjectURL(previousBackup.objectUrl);
         }
         return null;
       });
-      backupFsMissingRef.current = false;
 
-      setStatusText('File pronto. Scegli il tipo di taglio e scarica tutte le parti insieme.');
-      setPhaseProgress(0);
+      setStatusText(
+        browserDurationOk
+          ? `File pronto (${formatClock(duration)}). Ascolta, segna i tagli e premi «Taglia e scarica».`
+          : `File pronto (${formatClock(duration)}). Il browser non riproduce questo formato: puoi già tagliare per tempi o parti uguali, oppure creare un’anteprima ascoltabile.`,
+      );
       setTechnicalLog(technicalMessage);
       // La waveform (o l'anteprima nativa) completa la barra di caricamento.
-      setLoadJob({
-        active: true,
-        stage: 'waveform',
-        frac: 0.1,
-        bytesRead: 0,
-        totalBytes: 0,
-        fileName: file.name,
-      });
+      setLoadJob(browserDurationOk
+        ? (previous) => ({
+          active: true,
+          stage: 'waveform',
+          stages: previous?.stages ?? FAST_LOAD_STAGES,
+          frac: 0,
+          fileName: file.name,
+          startedAt,
+        })
+        : null);
       loadAbortRef.current = null;
       clearPreview();
       return true;
     } catch (error) {
       console.error(error);
-      if (analysisIdRef.current !== analysisId) {
+      if (isStale()) {
         return false;
-      }
-      // L'analisi fallita non deve lasciare orfani nella FS wasm né ref incoerenti.
-      try {
-        if (ffmpeg) {
-          await safeDelete(ffmpeg, virtualInputName);
-          await safeDelete(ffmpeg, probeOutputName);
-        }
-      } catch {
-        // ignore: pulizia best-effort
-      }
-      activeProbeRef.current = '';
-      if (cleanedStale) {
-        // Il cleanup iniziale ha già cancellato il file del backup:
-        // lo stato non deve puntare a un file inesistente.
-        activeInputRef.current = '';
-        // Il file mostrato (vecchio audioFile) ha perso i byte nella FS:
-        // forza la reidratazione dal Blob al prossimo uso del motore.
-        inputStaleRef.current = true;
-        if (hadBackup) {
-          // Revoca il Blob orfano prima di nillare (60MB pinnati a evento).
-          setOriginalAudioBackup((previousBackup) => {
-            if (previousBackup?.objectUrl) {
-              try {
-                URL.revokeObjectURL(previousBackup.objectUrl);
-              } catch {
-                // ignore
-              }
-            }
-            return null;
-          });
-        }
       }
       setErrorText(error.message || 'Non sono riuscito ad analizzare il file.');
       setStatusText('Qualcosa è andato storto durante l’analisi del file.');
-      setPhaseProgress(0);
       setLoadJob(null);
       return false;
     } finally {
       if (objectUrl && !keepObjectUrl) {
         URL.revokeObjectURL(objectUrl);
       }
-
       if (loadAbortRef.current === abortController) {
         loadAbortRef.current = null;
       }
@@ -889,6 +816,67 @@ export default function App() {
         setIsBusy(false);
       }
     }
+  }
+
+  /**
+   * Durata + verifica traccia audio col motore (solo formati che il browser
+   * non legge). ffprobe di ffmpeg.wasm 0.12 esce SEMPRE con -1 anche quando
+   * riesce: si giudica dal contenuto del JSON, mai dal codice di uscita.
+   * Se il JSON manca, fallback sul log di `ffmpeg -i` (Duration + Stream).
+   */
+  async function inspectWithEngine(ffmpeg, inputPath, analysisId) {
+    const probeOutputName = `probe-${Date.now()}-${analysisId}.json`;
+    let probe = parseProbeJson('');
+    try {
+      await ffmpeg.ffprobe([
+        '-v', 'error',
+        '-show_entries', 'format=duration:stream=codec_type',
+        '-of', 'json',
+        inputPath,
+        '-o', probeOutputName,
+      ]);
+      probe = parseProbeJson(await ffmpeg.readFile(probeOutputName, 'utf8'));
+    } catch {
+      // probe inconclusiva: decide il log di ffmpeg -i
+    } finally {
+      await safeDelete(ffmpeg, probeOutputName);
+    }
+
+    let durationSeconds = probe.durationSeconds;
+    let logHasAudio = false;
+    let logHasVideo = false;
+    if (!probe.ok || !probe.hasAudio || !Number.isFinite(durationSeconds)) {
+      try {
+        // `ffmpeg -i` senza output stampa sempre durata e stream (ed esce != 0).
+        const { logText } = await runFfmpeg(ffmpeg, ['-hide_banner', '-i', inputPath], { captureLog: true });
+        const parsed = parseFfmpegInputLog(logText);
+        logHasAudio = parsed.hasAudio;
+        logHasVideo = parsed.hasVideo;
+        if (!Number.isFinite(durationSeconds) && parsed.durationSeconds > 0) {
+          durationSeconds = parsed.durationSeconds;
+        }
+      } catch {
+        // log non disponibile
+      }
+    }
+
+    const decision = decideAudioAcceptance({
+      ffprobeOk: probe.ok,
+      ffprobeHasAudio: probe.hasAudio,
+      ffmpegLogHasAudio: logHasAudio,
+      ffmpegLogHasVideo: logHasVideo,
+      browserDurationOk: false,
+    });
+    if (!decision.accept) {
+      throw new Error(decision.error);
+    }
+    if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+      throw new Error('Impossibile leggere la durata di questo file. Prova a convertirlo in MP3 o M4A.');
+    }
+    return {
+      durationSeconds,
+      note: decision.reason === 'ffmpeg-log-audio' ? ' (traccia audio confermata via log ffmpeg).' : '.',
+    };
   }
 
   function clearPreview() {
@@ -1207,19 +1195,20 @@ export default function App() {
   }, []);
 
   const handleWaveformReady = useCallback((duration) => {
-    setPhaseProgress(0);
     const current = audioFileRef.current;
     const job = loadJobRef.current;
     // Decode di un file precedente risolta dopo il cambio: non toccare il job nuovo.
     if (job?.active && current && job.fileName && job.fileName !== current.name) {
       return;
     }
-    setLoadJob(null);
+    setLoadJob((previous) => (previous?.stage === 'waveform' ? null : previous));
     if (current && Number.isFinite(duration) && duration > 0) {
       // Seconda guardia: una durata molto diversa da quella caricata è di un altro file.
       if (Math.abs(duration - current.duration) > Math.max(5, (current.duration || 0) * 0.2)) {
         return;
       }
+      // La durata decodificata è esatta (quella dei metadati può essere stimata
+      // sugli MP3 VBR): i tagli usano quella.
       setAudioFile((previous) =>
         previous && Math.abs((previous.duration ?? 0) - duration) > 0.05
           ? { ...previous, duration }
@@ -1234,11 +1223,23 @@ export default function App() {
     if (job?.active && current && job.fileName && job.fileName !== current.name) {
       return;
     }
+    const safe = clamp01(frac);
     setLoadJob((previous) => {
       if (!previous?.active || previous.stage !== 'waveform') {
         return previous;
       }
-      return { ...previous, frac: 0.1 + clamp01(frac) * 0.9 };
+      if (safe >= 0.95) {
+        // Lettura finita: la decodifica non ha una misura → barra animata +
+        // tempo che scorre (mai un 100% fermo che sembra un blocco).
+        return previous.frac === null
+          ? previous
+          : { ...previous, frac: null, detail: 'Decodifico l’audio per la forma d’onda: intanto puoi già ascoltare e segnare i tagli.' };
+      }
+      // Evita re-render inutili: la barra avanza a passi di almeno 2%.
+      if (previous.frac !== null && Math.abs((previous.frac ?? 0) - safe) < 0.02) {
+        return previous;
+      }
+      return { ...previous, frac: safe };
     });
   }, []);
 
@@ -1255,12 +1256,31 @@ export default function App() {
     );
   }, []);
 
+  // La riproduzione emette timeupdate a ogni frame: aggiornare lo stato 60
+  // volte al secondo ri-renderizza tutta l'app (jank sui dispositivi deboli).
+  // 4 aggiornamenti/s bastano per il display; i seek passano subito.
   const handleWaveformTimeUpdate = useCallback((time) => {
+    const tracker = timeUpdateRef.current;
+    const now = performance.now();
+    const jumped = Math.abs(time - tracker.value) > 1;
+    if (!jumped && now - tracker.lastAt < 250) {
+      return;
+    }
+    tracker.lastAt = now;
+    tracker.value = time;
     setCurrentTime(time);
   }, []);
 
   const handleWaveformPlayStateChange = useCallback((playing) => {
     setIsPlaying(playing);
+    if (!playing) {
+      // In pausa il tempo mostrato deve essere esatto (non l'ultimo campione throttled).
+      const exact = waveformRef.current?.getCurrentTime?.();
+      if (Number.isFinite(exact)) {
+        timeUpdateRef.current = { lastAt: performance.now(), value: exact };
+        setCurrentTime(exact);
+      }
+    }
   }, []);
 
   const exportBitrateRef = useRef(exportBitrate);
@@ -1283,13 +1303,15 @@ export default function App() {
     waveformRef.current?.seekTo(segment.start + 0.01);
     waveformRef.current?.play?.();
     setPreviewIndex(segmentIndex);
-    const waitMs = Math.min(15 * 60 * 1000, Math.max(500, segment.duration * 1000));
+    // A 2x l'anteprima dura metà: senza dividere per la velocità sconfinerebbe nella parte dopo.
+    const rate = playbackRate > 0 ? playbackRate : 1;
+    const waitMs = Math.min(15 * 60 * 1000, Math.max(500, (segment.duration * 1000) / rate));
     previewTimeoutRef.current = window.setTimeout(() => {
       waveformRef.current?.pause?.();
       setPreviewIndex(null);
       previewTimeoutRef.current = null;
     }, waitMs);
-  }, [plan.segments, previewIndex]);
+  }, [plan.segments, previewIndex, playbackRate]);
 
   const handleExportFormatChange = useCallback((formatId) => {
     const format = getExportFormat(formatId);
@@ -1297,17 +1319,22 @@ export default function App() {
     if (format.bitrates.length > 0 && !format.bitrates.includes(exportBitrateRef.current)) {
       setExportBitrate(format.defaultBitrate);
     }
-    if (!format.supportsFastCopy) {
-      setFastCopy(false);
-    }
+    // Scegliere un formato = convertire: la modalità veloce (stesso formato) si spegne.
+    setFastCopy(false);
+    saveSetting(SPEED_CHOICE_KEY, 'convert');
   }, []);
 
-  // Auto-disinserisce il fast-copy quando sorgente/formato non sono compatibili.
+  const handleSpeedModeChange = useCallback((fast) => {
+    setFastCopy(Boolean(fast));
+    saveSetting(SPEED_CHOICE_KEY, fast ? 'fast' : 'convert');
+  }, []);
+
+  // La modalità veloce esiste solo se la sorgente è già MP3/M4A.
   useEffect(() => {
-    if (fastCopy && !canFastCopy({ formatId: exportFormat, sourceExtension: audioFile?.extension })) {
+    if (fastCopy && audioFile && !naturalFormatId) {
       setFastCopy(false);
     }
-  }, [fastCopy, exportFormat, audioFile?.extension]);
+  }, [fastCopy, audioFile, naturalFormatId]);
 
   // Persiste le preferenze di export (default invariati se storage assente).
   useEffect(() => {
@@ -1317,14 +1344,36 @@ export default function App() {
     saveSetting('ac-export-bitrate', exportBitrate);
   }, [exportBitrate]);
   useEffect(() => {
-    saveSetting('ac-fast-copy', fastCopy);
-  }, [fastCopy]);
-  useEffect(() => {
     saveSetting('ac-fade', fadeSeconds);
   }, [fadeSeconds]);
   useEffect(() => {
     saveSetting('ac-export-dest', exportDest);
   }, [exportDest]);
+  useEffect(() => {
+    saveSetting('ac-cleanup-preset', cleanupPreset);
+  }, [cleanupPreset]);
+  useEffect(() => {
+    saveSetting('ac-shorten-pauses', shortenPauses);
+  }, [shortenPauses]);
+
+  // Le anteprime A/B sono Blob in memoria: liberale quando cambiano o si chiudono.
+  const cleanupPreviewRef = useRef(null);
+  useEffect(() => {
+    const previous = cleanupPreviewRef.current;
+    cleanupPreviewRef.current = cleanupPreview;
+    if (previous && previous !== cleanupPreview) {
+      URL.revokeObjectURL(previous.originalUrl);
+      URL.revokeObjectURL(previous.cleanedUrl);
+    }
+  }, [cleanupPreview]);
+
+  const doneTimerRef = useRef(null);
+  const flashDone = useCallback((title, detail = '') => {
+    window.clearTimeout(doneTimerRef.current);
+    setDoneNote({ title, detail, at: Date.now() });
+    doneTimerRef.current = window.setTimeout(() => setDoneNote(null), 5000);
+  }, []);
+  useEffect(() => () => window.clearTimeout(doneTimerRef.current), []);
 
   // Avviso di ripresa se un export precedente è stato interrotto.
   useEffect(() => {
@@ -1338,10 +1387,13 @@ export default function App() {
     }
   }, []);
 
-  // Wake lock + avviso uscita durante elaborazioni lunghe (progetti pesanti in background).
-  const wakeHeld = useWakeLock(isExporting);
+  // Wake lock + avviso uscita durante QUALUNQUE elaborazione lunga (export,
+  // pulizia, silenzi, download motore): lo schermo spento sospende la tab.
+  const longWorkActive = isExporting || Boolean(task) || engineInfo.phase === 'downloading'
+    || engineInfo.phase === 'compiling' || Boolean(loadJob?.active && loadJob.stage !== 'waveform');
+  const wakeHeld = useWakeLock(longWorkActive);
   useEffect(() => {
-    if (!isExporting) {
+    if (!isExporting && !task) {
       return undefined;
     }
     const handler = (event) => {
@@ -1350,44 +1402,126 @@ export default function App() {
     };
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
-  }, [isExporting]);
+  }, [isExporting, task]);
+
+  // Motore in background appena il file è pronto (e la forma d'onda ha finito
+  // di decodificare, per non sommare i picchi di memoria): quando l'utente
+  // preme "Taglia e scarica" il motore è già lì. Mai su Risparmio dati / 2G.
+  const waveformPending = Boolean(loadJob?.active);
+  useEffect(() => {
+    if (!audioFile || waveformPending || engineInfo.phase !== 'idle' || !shouldWarmEngineInBackground()) {
+      return undefined;
+    }
+    const handle = window.setTimeout(() => {
+      ensureEngineReady().catch(() => {
+        // l'errore resta visibile nel chip del motore, con "Riprova"
+      });
+    }, 600);
+    return () => window.clearTimeout(handle);
+  }, [audioFile, waveformPending, engineInfo.phase, ensureEngineReady]);
+
+  const taskAbortRef = useRef(false);
+  const taskGateRef = useRef(null);
+  const taskStageRef = useRef('');
+
+  /**
+   * Esegue un'operazione del motore con stato SEMPRE visibile: fase motore
+   * (download/compilazione reali), poi avanzamento misurato sui secondi di
+   * audio elaborati, velocità ed ETA. Annullabile.
+   */
+  async function runEngineTask({ kind, title, durationSeconds }, work) {
+    const startedAt = Date.now();
+    const gate = createAbortGate();
+    taskGateRef.current = gate;
+    taskStageRef.current = 'engine';
+    taskAbortRef.current = false;
+    isBusyRef.current = true;
+    setIsBusy(true);
+    setErrorText('');
+    setTask({ kind, title, stage: 'engine', frac: null, detail: '', startedAt, speed: 0, etaMs: null });
+    try {
+      // Annullare durante il download del motore sblocca subito la UI senza
+      // buttare il download (che continua e resta pronto per dopo).
+      const ffmpeg = await Promise.race([ensureEngineReady(), gate.promise]);
+      if (taskAbortRef.current) {
+        throw new Error('Operazione annullata.');
+      }
+      const inputPath = await ensureInputMounted(ffmpeg);
+      const runStartedAt = performance.now();
+      taskStageRef.current = 'running';
+      setTask((previous) => previous ? { ...previous, stage: 'running', frac: 0 } : previous);
+      const onProgress = (frac, seconds) => {
+        const speed = speedFactor(seconds, performance.now() - runStartedAt);
+        const etaMs = etaMsFromSpeed({ remainingSeconds: Math.max(0, durationSeconds - seconds), speed });
+        setTask((previous) => previous
+          ? { ...previous, frac: frac === null ? null : Math.min(0.99, frac), speed, etaMs, processedSeconds: seconds }
+          : previous);
+      };
+      return await work({ ffmpeg, inputPath, onProgress });
+    } catch (error) {
+      if (taskAbortRef.current) {
+        const cancelled = new Error('Operazione annullata.');
+        cancelled.cancelled = true;
+        throw cancelled;
+      }
+      throw error;
+    } finally {
+      taskAbortRef.current = false;
+      taskGateRef.current = null;
+      taskStageRef.current = '';
+      setTask(null);
+      isBusyRef.current = false;
+      setIsBusy(false);
+    }
+  }
+
+  function handleCancelTask() {
+    taskAbortRef.current = true;
+    setStatusText('Annullo l’operazione…');
+    taskGateRef.current?.abort();
+    if (taskStageRef.current === 'running') {
+      // Terminate interrompe l'exec in corso; il motore si ricrea al prossimo uso.
+      resetAfterAbort();
+    }
+  }
+
+  function failureMessage(error, fallback, tailText = '') {
+    return describeFfmpegFailure(`${tailText}\n${error?.message ?? ''}`) || error?.message || fallback;
+  }
 
   async function handleDetectSilences() {
-    if (!audioFile || isBusy) {
+    if (!audioFile || isBusyRef.current) {
       return;
     }
-
-    setErrorText('');
-    setIsBusy(true);
-    setStatusText('Analisi dell’audio per trovare le pause lunghe...');
-    setPhaseProgress(0.15);
-
+    const duration = audioFile.duration;
+    setStatusText('Cerco le pause lunghe nell’audio…');
     try {
-      const ffmpeg = await ensureEngineReady();
-      await ensureInputPresent(ffmpeg);
-      setPhaseProgress(0.4);
-
-      const filter = buildSilenceDetectFilter({
-        thresholdDb: silenceThresholdDb,
-        minSilenceSeconds: silenceMinDuration,
-      });
-
-      const logText = await runWithLogCapture([
-        '-hide_banner',
-        '-nostats',
-        '-i',
-        audioFile.virtualInputName,
-        '-af',
-        filter,
-        '-f',
-        'null',
-        '-',
-      ]);
-
-      const silences = parseSilenceLog(logText);
+      const silences = await runEngineTask(
+        { kind: 'silence', title: 'Cerco le pause per creare i capitoli', durationSeconds: duration },
+        async ({ ffmpeg, inputPath, onProgress }) => {
+          const filter = buildSilenceDetectFilter({
+            thresholdDb: silenceThresholdDb,
+            minSilenceSeconds: silenceMinDuration,
+          });
+          const result = await runFfmpeg(ffmpeg, [
+            '-hide_banner',
+            '-i',
+            inputPath,
+            '-af',
+            filter,
+            '-f',
+            'null',
+            '-',
+          ], { durationSeconds: duration, onProgress, captureLog: true });
+          if (result.exitCode !== 0) {
+            throw new Error(describeFfmpegFailure(result.tailText) || 'Analisi dei silenzi non riuscita.');
+          }
+          return parseSilenceLog(result.logText);
+        },
+      );
       const cutPositions = silencesToCutPoints({
         silences,
-        duration: audioFile.duration,
+        duration,
         minSegmentLength: silenceMinSegment,
       });
 
@@ -1396,7 +1530,6 @@ export default function App() {
           `Nessun taglio utile con soglia ${silenceThresholdDb} dB e pausa ≥ ${silenceMinDuration}s. Prova ad abbassare la pausa o ad alzare la soglia.`,
         );
         setStatusText('Analisi completata: nessuna pausa adatta.');
-        setPhaseProgress(0);
         return;
       }
 
@@ -1411,190 +1544,273 @@ export default function App() {
       );
 
       setLastDetectionSummary(
-        `${cutPositions.length} taglio${cutPositions.length === 1 ? '' : 'i'} auto da ${silences.length} pause rilevate.`,
+        `${cutPositions.length === 1 ? '1 taglio automatico' : `${cutPositions.length} tagli automatici`} da `
+        + `${silences.length === 1 ? '1 pausa rilevata' : `${silences.length} pause rilevate`}.`,
       );
       setStatusText(
-        `Rilevati ${silences.length} silenzi; suggeriti ${cutPositions.length} punti di taglio.`,
+        `${silences.length === 1 ? 'Rilevata 1 pausa' : `Rilevate ${silences.length} pause`}; `
+        + `${cutPositions.length === 1 ? 'suggerito 1 punto' : `suggeriti ${cutPositions.length} punti`} di taglio.`,
       );
       setTechnicalLog(
         `silencedetect: threshold=${silenceThresholdDb}dB, min=${silenceMinDuration}s → ${silences.length} gap.`,
       );
-      setPhaseProgress(1);
+      flashDone(
+        `${cutPositions.length === 1 ? '1 taglio creato' : `${cutPositions.length} tagli creati`} dalle pause`,
+        'Controllali sulla forma d’onda e trascinali se serve.',
+      );
     } catch (error) {
+      if (error?.cancelled) {
+        setStatusText('Ricerca delle pause annullata.');
+        return;
+      }
       console.error(error);
-      setErrorText(error.message || 'Non sono riuscito ad analizzare i silenzi.');
+      setErrorText(failureMessage(error, 'Non sono riuscito ad analizzare i silenzi.'));
       setStatusText('Analisi dei silenzi non completata.');
-      setPhaseProgress(0);
-    } finally {
-      setIsBusy(false);
     }
   }
 
+  function cleanupSpeedKey(presetId) {
+    return `cleanup-${presetId}`;
+  }
+
+  const cleanupEstimateLabel = useMemo(() => {
+    const seconds = estimateCleanupSeconds(cleanupPreset, audioFile?.duration ?? 0, {
+      mobile: isMobileDevice(),
+      measuredSpeed: Number(readSpeedMemory()[cleanupSpeedKey(cleanupPreset)]) || 0,
+    });
+    if (!seconds) {
+      return '';
+    }
+    return `${seconds < 8 ? 'pochi secondi' : `~${formatDurationShort(seconds)}`}${engineInfo.phase !== 'ready' ? ' + preparazione motore' : ''}`;
+    // appliedCleanup: ricalcola dopo una pulizia (velocità appena misurata).
+  }, [cleanupPreset, audioFile?.duration, engineInfo.phase, appliedCleanup]);
+
   async function handleApplyCleanup() {
-    if (!audioFile || isBusy) {
+    if (!audioFile || isBusyRef.current) {
       return;
     }
     const preset = getCleanupPreset(cleanupPreset);
     if (!preset || preset.filters.length === 0) {
       return;
     }
-
-    setErrorText('');
-    setIsBusy(true);
-
-    const audioDuration = audioFile.duration || 60;
-    const estimatedSeconds = estimateCleanupSeconds(cleanupPreset, audioDuration) || 20;
-    const describeTime = (seconds) => {
-      if (!seconds || seconds <= 0) {
-        return '';
-      }
-      if (seconds < 60) {
-        return `~${Math.max(1, Math.round(seconds))}s`;
-      }
-      const minutes = Math.floor(seconds / 60);
-      const remaining = Math.round(seconds % 60);
-      return remaining === 0
-        ? `~${minutes} min`
-        : `~${minutes}:${String(remaining).padStart(2, '0')} min`;
-    };
-    const initialEstimateLabel = describeTime(estimatedSeconds);
-
-    setStatusText(
-      `Applico "${preset.label}" su ${formatClock(audioDuration)} di audio — stima ${initialEstimateLabel}.`,
-    );
-    setPhaseProgress(0.05);
-
+    const sourceAudio = audioFile;
+    const audioDuration = sourceAudio.duration || 60;
+    const changesTimeline = cleanupChangesTimeline({ shortenPauses });
     const cleanedVirtualName = `cleaned-${Date.now()}.m4a`;
-    let ffmpeg = null;
     let cleanedObjectUrl = '';
-    const startTime = performance.now();
-    const tickerHandle = window.setInterval(() => {
-      const elapsedSeconds = (performance.now() - startTime) / 1000;
-      const fractional = Math.min(0.9, elapsedSeconds / Math.max(estimatedSeconds, 1));
-      setPhaseProgress((current) => Math.max(current, fractional));
-      const remaining = Math.max(0, estimatedSeconds - elapsedSeconds);
-      const remainingLabel = describeTime(remaining) || 'pochi secondi';
-      setStatusText(
-        `Applico "${preset.label}" — ${remainingLabel} rimanenti (${Math.round(elapsedSeconds)}s trascorsi).`,
-      );
-    }, 700);
+    let measuredSpeed = 0;
+    setCleanupPreview(null);
+    waveformRef.current?.pause?.();
+    setStatusText(`Applico "${preset.label}" su ${formatClock(audioDuration)} di audio…`);
 
     try {
-      ffmpeg = await ensureEngineReady();
-      await ensureInputPresent(ffmpeg);
-      setPhaseProgress((current) => Math.max(current, 0.1));
-
-      const filterChain = buildCleanupFilter(cleanupPreset);
-      const cleanupExitCode = await ffmpeg.exec([
-        '-hide_banner',
-        '-nostats',
-        '-i',
-        audioFile.virtualInputName,
-        '-af',
-        filterChain,
-        '-c:a',
-        'aac',
-        '-b:a',
-        '128k',
-        '-movflags',
-        '+faststart',
-        cleanedVirtualName,
-      ]);
-      if (cleanupExitCode !== 0) {
-        throw new Error('Pulizia audio non riuscita: FFmpeg ha restituito un errore.');
-      }
-      setPhaseProgress((current) => Math.max(current, 0.92));
-
-      const cleanedData = await ffmpeg.readFile(cleanedVirtualName);
-      const cleanedBlob = new Blob([cleanedData], { type: 'audio/mp4' });
+      const cleanedBlob = await runEngineTask(
+        { kind: 'cleanup', title: `Pulizia audio: ${preset.label}`, durationSeconds: audioDuration },
+        async ({ ffmpeg, inputPath, onProgress }) => {
+          try {
+            const startedAt = performance.now();
+            const result = await runFfmpeg(ffmpeg, [
+              '-hide_banner',
+              '-i',
+              inputPath,
+              '-map',
+              '0:a:0',
+              '-vn',
+              '-af',
+              buildCleanupFilter(cleanupPreset, { shortenPauses }),
+              ...buildCleanupOutputArgs(cleanupPreset),
+              cleanedVirtualName,
+            ], { durationSeconds: audioDuration, onProgress });
+            if (result.exitCode !== 0) {
+              throw new Error(describeFfmpegFailure(result.tailText) || 'Pulizia audio non riuscita: FFmpeg ha restituito un errore.');
+            }
+            measuredSpeed = speedFactor(audioDuration, performance.now() - startedAt);
+            const cleanedData = await ffmpeg.readFile(cleanedVirtualName);
+            return new Blob([cleanedData], { type: 'audio/mp4' });
+          } finally {
+            // Il risultato vive nel Blob (montato via WORKERFS al prossimo uso):
+            // niente copia residente nella memoria wasm.
+            await safeDelete(ffmpeg, cleanedVirtualName);
+          }
+        },
+      );
+      rememberSpeed(cleanupSpeedKey(cleanupPreset), measuredSpeed);
       cleanedObjectUrl = URL.createObjectURL(cleanedBlob);
 
       let probedDuration = NaN;
       try {
-        probedDuration = await readAudioDurationFromBrowser(cleanedObjectUrl);
+        probedDuration = await readAudioDurationFromBrowser(cleanedObjectUrl, 'audio/mp4');
       } catch {
         probedDuration = NaN;
       }
-      const newDuration =
-        typeof probedDuration === 'number' && Number.isFinite(probedDuration) && probedDuration > 0
-          ? probedDuration
-          : audioFile.duration;
+      const newDuration = changesTimeline && Number.isFinite(probedDuration) && probedDuration > 0
+        ? probedDuration
+        : sourceAudio.duration;
 
       setOriginalAudioBackup((previousBackup) => {
         if (previousBackup) {
           return previousBackup;
         }
         return {
-          objectUrl: audioFile.objectUrl,
-          virtualInputName: audioFile.virtualInputName,
-          extension: audioFile.extension,
-          duration: audioFile.duration,
-          formatLabel: audioFile.formatLabel,
-          mimeType: audioFile.mimeType,
-          size: audioFile.size,
-          baseName: audioFile.baseName,
-          name: audioFile.name,
-          lastModified: audioFile.lastModified ?? null,
+          objectUrl: sourceAudio.objectUrl,
+          blob: sourceAudio.blob,
+          extension: sourceAudio.extension,
+          duration: sourceAudio.duration,
+          formatLabel: sourceAudio.formatLabel,
+          mimeType: sourceAudio.mimeType,
+          size: sourceAudio.size,
+          baseName: sourceAudio.baseName,
+          name: sourceAudio.name,
+          lastModified: sourceAudio.lastModified ?? null,
+          browserPlayable: sourceAudio.browserPlayable,
+          previewOnly: sourceAudio.previewOnly,
         };
       });
 
-      if (!originalAudioBackup && objectUrlRef.current === audioFile.objectUrl) {
-        // Keep the old objectUrl alive (it is tracked inside the backup)
-      } else if (audioFile.objectUrl && audioFile.objectUrl !== originalAudioBackup?.objectUrl) {
-        URL.revokeObjectURL(audioFile.objectUrl);
+      // L'objectUrl dell'originale resta vivo dentro il backup; una pulizia
+      // successiva (su audio già pulito) può revocare l'intermedio.
+      if (originalAudioBackup && sourceAudio.objectUrl !== originalAudioBackup.objectUrl) {
+        URL.revokeObjectURL(sourceAudio.objectUrl);
       }
       objectUrlRef.current = cleanedObjectUrl;
 
-      // Libera subito i byte precedenti dalla MEMFS (niente doppia residenza):
-      // il restore li riscrive dal Blob del backup quando serve.
-      if (audioFile.virtualInputName !== cleanedVirtualName) {
-        await safeDelete(ffmpeg, audioFile.virtualInputName);
+      const nextAudio = {
+        ...sourceAudio,
+        objectUrl: cleanedObjectUrl,
+        extension: '.m4a',
+        duration: newDuration,
+        formatLabel: `${preset.label} · AAC ${preset.bitrateKbps}k${preset.mono ? ' mono' : ''}`,
+        mimeType: 'audio/mp4',
+        size: cleanedBlob.size,
+        name: `${sourceAudio.baseName || stripExtension(sourceAudio.name)}.m4a`,
+        blob: cleanedBlob,
+        browserPlayable: true,
+        previewOnly: false,
+      };
+      audioFileRef.current = nextAudio;
+      setAudioFile(nextAudio);
+      if (changesTimeline) {
+        // Le pause accorciate spostano i tempi: i vecchi punti non corrispondono più.
+        setCustomCuts([]);
+        setBookmarks([]);
+        setLoopRegion(null);
+        setLoopDraft(null);
       }
-      backupFsMissingRef.current = true;
-
-      setAudioFile((previous) =>
-        previous
-          ? {
-              ...previous,
-              objectUrl: cleanedObjectUrl,
-              virtualInputName: cleanedVirtualName,
-              extension: '.m4a',
-              duration: newDuration,
-              formatLabel: `${preset.label} · AAC 128k`,
-              mimeType: 'audio/mp4',
-              size: cleanedBlob.size,
-              name: `${previous.baseName || stripExtension(previous.name)}.m4a`,
-              // Blob tenuto per il salvataggio progetto senza riletture (+1 copia evitata).
-              blob: cleanedBlob,
-            }
-          : previous,
-      );
-
-      activeInputRef.current = cleanedVirtualName;
-      setCustomCuts([]);
-      setBookmarks([]);
-      setLoopRegion(null);
-      setLoopDraft(null);
       setCurrentTime(0);
       setIsPlaying(false);
       setLastDetectionSummary('');
-      setStatusText(`Pulizia applicata (${preset.label}). Il file è pronto per il taglio.`);
-      setTechnicalLog(`cleanup: ${preset.filters.join(' → ')}`);
-      setPhaseProgress(1);
+      setAppliedCleanup({ presetId: preset.id, label: preset.label, shortenPauses: changesTimeline });
+      const tookLabel = measuredSpeed > 0 ? formatDurationShort(audioDuration / measuredSpeed) : '';
+      setStatusText(
+        `Pulizia applicata (${preset.label}${changesTimeline ? ', pause accorciate' : ''}). `
+        + (changesTimeline ? 'Durata aggiornata: rimetti i tagli.' : 'Tagli e segnalibri conservati.'),
+      );
+      setTechnicalLog(`cleanup ${preset.id}: ${formatSpeedFactor(measuredSpeed) ?? '—'} tempo reale.`);
+      flashDone(`Pulizia applicata: ${preset.label}`, tookLabel ? `Completata in ${tookLabel}` : '');
     } catch (error) {
-      console.error(error);
-      setErrorText(error.message || 'Pulizia dell’audio non completata.');
-      setStatusText('Pulizia non completata.');
-      setPhaseProgress(0);
       if (cleanedObjectUrl) {
         URL.revokeObjectURL(cleanedObjectUrl);
       }
-      if (ffmpeg) {
-        await safeDelete(ffmpeg, cleanedVirtualName);
+      if (error?.cancelled) {
+        setStatusText('Pulizia annullata: il file originale è invariato.');
+        return;
       }
-    } finally {
-      window.clearInterval(tickerHandle);
-      setIsBusy(false);
+      console.error(error);
+      setErrorText(failureMessage(error, 'Pulizia dell’audio non completata.'));
+      setStatusText('Pulizia non completata.');
+    }
+  }
+
+  /**
+   * Anteprima A/B: 20 s dalla posizione attuale, originale e pulito codificati
+   * allo stesso modo. Pre-roll di 4 s scartato: denoise adattivo e livellatore
+   * hanno bisogno di qualche secondo per "sentire" il rumore e il livello,
+   * così l'anteprima suona come il risultato sul file intero.
+   */
+  async function handleCleanupPreview() {
+    const sourceAudio = audioFileRef.current;
+    if (!sourceAudio || isBusyRef.current) {
+      return;
+    }
+    const preset = getCleanupPreset(cleanupPreset);
+    if (!preset || preset.filters.length === 0) {
+      return;
+    }
+    waveformRef.current?.pause?.();
+    const clipSeconds = Math.min(20, Math.max(1, sourceAudio.duration));
+    const position = waveformRef.current?.getCurrentTime?.() ?? currentTime;
+    const start = clamp(position, 0, Math.max(0, sourceAudio.duration - clipSeconds));
+    const preroll = Math.min(4, start);
+    const stamp = Date.now();
+    const originalName = `ab-original-${stamp}.m4a`;
+    const cleanedName = `ab-cleaned-${stamp}.m4a`;
+    const commonOut = ['-c:a', 'aac', '-aac_coder', 'fast', '-b:a', '160k'];
+    try {
+      const clips = await runEngineTask(
+        { kind: 'cleanup-preview', title: `Anteprima A/B: ${preset.label}`, durationSeconds: clipSeconds * 2 },
+        async ({ ffmpeg, inputPath, onProgress }) => {
+          try {
+            const original = await runFfmpeg(ffmpeg, [
+              '-hide_banner',
+              '-ss', start.toFixed(3),
+              '-t', clipSeconds.toFixed(3),
+              '-i', inputPath,
+              '-map', '0:a:0', '-vn',
+              ...(preset.mono ? ['-ac', '1'] : []),
+              ...commonOut,
+              originalName,
+            ], { durationSeconds: clipSeconds, onProgress: (frac, seconds) => onProgress(frac === null ? null : frac / 2, seconds) });
+            if (original.exitCode !== 0) {
+              throw new Error(describeFfmpegFailure(original.tailText) || 'Anteprima non riuscita.');
+            }
+            const cleaned = await runFfmpeg(ffmpeg, [
+              '-hide_banner',
+              '-ss', (start - preroll).toFixed(3),
+              '-t', (clipSeconds + preroll).toFixed(3),
+              '-i', inputPath,
+              '-map', '0:a:0', '-vn',
+              '-af', `${buildCleanupFilter(cleanupPreset)},atrim=start=${preroll.toFixed(3)},asetpts=PTS-STARTPTS`,
+              ...(preset.mono ? ['-ac', '1'] : []),
+              ...commonOut,
+              cleanedName,
+            ], {
+              durationSeconds: clipSeconds,
+              onProgress: (frac, seconds) => onProgress(frac === null ? null : 0.5 + frac / 2, clipSeconds + seconds),
+            });
+            if (cleaned.exitCode !== 0) {
+              throw new Error(describeFfmpegFailure(cleaned.tailText) || 'Anteprima non riuscita.');
+            }
+            const originalData = await ffmpeg.readFile(originalName);
+            const cleanedData = await ffmpeg.readFile(cleanedName);
+            return {
+              original: new Blob([originalData], { type: 'audio/mp4' }),
+              cleaned: new Blob([cleanedData], { type: 'audio/mp4' }),
+            };
+          } finally {
+            await safeDelete(ffmpeg, originalName);
+            await safeDelete(ffmpeg, cleanedName);
+          }
+        },
+      );
+      if (audioFileRef.current?.blob !== sourceAudio.blob) {
+        return;
+      }
+      setCleanupPreview({
+        presetId: preset.id,
+        label: preset.label,
+        start,
+        duration: clipSeconds,
+        originalUrl: URL.createObjectURL(clips.original),
+        cleanedUrl: URL.createObjectURL(clips.cleaned),
+      });
+      setStatusText(`Anteprima pronta: confronta originale e "${preset.label}" e poi applica a tutto il file.`);
+    } catch (error) {
+      if (error?.cancelled) {
+        setStatusText('Anteprima annullata.');
+        return;
+      }
+      console.error(error);
+      setErrorText(failureMessage(error, 'Anteprima non riuscita.'));
     }
   }
 
@@ -1618,58 +1834,37 @@ export default function App() {
     }
   }, [activeCapture, refreshProjects]);
 
+  /**
+   * Operazioni su IndexedDB (salva/apri/duplica): non misurabili a byte, ma
+   * con file grandi su telefono durano secondi. Stato visibile nel dock con
+   * tempo che scorre, mai uno schermo muto.
+   */
+  async function runStorageTask({ title, detail }, work) {
+    isBusyRef.current = true;
+    setIsBusy(true);
+    setTask({ kind: 'storage', title, detail, frac: null, stage: 'running', startedAt: Date.now(), cancellable: false });
+    try {
+      return await work();
+    } finally {
+      setTask(null);
+      isBusyRef.current = false;
+      setIsBusy(false);
+    }
+  }
+
   async function handleSaveProject() {
     if (!audioFile || isBusyRef.current) {
       return;
     }
     setSaveStatus('Salvo il progetto…');
     try {
-      // Ordine a costo zero: blob già in mano > File originale > rilettura.
-      // (Niente fetch→blob duplicato in RAM quando evitabile.)
-      const sameAsSource = Boolean(sourceFileRef.current)
-        && audioFile.name === sourceFileRef.current.name
-        && audioFile.size === sourceFileRef.current.size
-        && audioFile.lastModified !== undefined
-        && audioFile.lastModified === sourceFileRef.current.lastModified;
-      const audioBlob = audioFile.blob
-        ?? (sameAsSource
-          ? sourceFileRef.current
-          : await (await fetch(audioFile.objectUrl)).blob());
-      await assertStorageFor(audioBlob.size);
-      const now = Date.now();
-      const record = await saveStoredProject({
-        id: currentProjectId ?? undefined,
-        name: audioFile.baseName || audioFile.name,
-        audioName: audioFile.name,
-        audioExtension: audioFile.extension,
-        audioMimeType: audioFile.mimeType,
-        formatLabel: audioFile.formatLabel,
-        duration: audioFile.duration,
-        audioBlob,
-        mode,
-        equalParts,
-        exportFormat,
-        exportBitrate,
-        fadeSeconds,
-        customCuts: customCuts.map((cut) => ({
-          id: cut.id,
-          value: cut.value,
-          position:
-            typeof cut.position === 'number' && Number.isFinite(cut.position)
-              ? cut.position
-              : null,
-        })),
-        bookmarks: bookmarks.map((bookmark) => ({
-          id: bookmark.id,
-          position: bookmark.position,
-          note: bookmark.note ?? '',
-        })),
-        segmentNames,
-        createdAt: currentProjectId ? undefined : now,
-      });
-      setCurrentProjectId(record.id);
-      setSaveStatus('Progetto salvato.');
-      window.setTimeout(() => setSaveStatus(''), 2500);
+      await runStorageTask(
+        {
+          title: currentProjectId ? 'Aggiorno il progetto salvato' : 'Salvo il progetto nel browser',
+          detail: `${formatBytes(audioFile.size)} di audio + tagli e segnalibri`,
+        },
+        () => saveProjectNow(),
+      );
     } catch (error) {
       console.error(error);
       setSaveStatus('');
@@ -1682,12 +1877,65 @@ export default function App() {
     }
   }
 
+  async function saveProjectNow() {
+    // Ordine a costo zero: blob già in mano > File originale > rilettura.
+    // (Niente fetch→blob duplicato in RAM quando evitabile.)
+    const sameAsSource = Boolean(sourceFileRef.current)
+      && audioFile.name === sourceFileRef.current.name
+      && audioFile.size === sourceFileRef.current.size
+      && audioFile.lastModified !== undefined
+      && audioFile.lastModified === sourceFileRef.current.lastModified;
+    const audioBlob = audioFile.blob
+      ?? (sameAsSource
+        ? sourceFileRef.current
+        : await (await fetch(audioFile.objectUrl)).blob());
+    await assertStorageFor(audioBlob.size);
+    const now = Date.now();
+    const record = await saveStoredProject({
+      id: currentProjectId ?? undefined,
+      name: audioFile.baseName || audioFile.name,
+      audioName: audioFile.name,
+      audioExtension: audioFile.extension,
+      audioMimeType: audioFile.mimeType,
+      formatLabel: audioFile.formatLabel,
+      duration: audioFile.duration,
+      audioBlob,
+      mode,
+      equalParts,
+      exportFormat,
+      exportBitrate,
+      fadeSeconds,
+      customCuts: customCuts.map((cut) => ({
+        id: cut.id,
+        value: cut.value,
+        position:
+          typeof cut.position === 'number' && Number.isFinite(cut.position)
+            ? cut.position
+            : null,
+      })),
+      bookmarks: bookmarks.map((bookmark) => ({
+        id: bookmark.id,
+        position: bookmark.position,
+        note: bookmark.note ?? '',
+      })),
+      segmentNames,
+      createdAt: currentProjectId ? undefined : now,
+    });
+    setCurrentProjectId(record.id);
+    setSaveStatus('Progetto salvato.');
+    flashDone('Progetto salvato', 'Lo ritrovi in «Progetti salvati», anche offline.');
+    window.setTimeout(() => setSaveStatus(''), 2500);
+  }
+
   async function handleOpenProject(projectId) {
     if (!projectId || isBusy) {
       return;
     }
     try {
-      const record = await loadStoredProject(projectId);
+      const record = await runStorageTask(
+        { title: 'Apro il progetto salvato', detail: 'Leggo audio e tagli dal browser…' },
+        () => loadStoredProject(projectId),
+      );
       if (!record || !record.audioBlob) {
         setProjectsError('Progetto non trovato o corrotto.');
         return;
@@ -1732,7 +1980,8 @@ export default function App() {
       }
       // Impostazioni export salvate col progetto (vecchi record: default invariati).
       if (typeof record.exportFormat === 'string') {
-        handleExportFormatChange(record.exportFormat);
+        // Solo il formato di conversione: la modalità veloce/converti resta quella scelta.
+        setExportFormat(getExportFormat(record.exportFormat).id);
       }
       if (typeof record.exportBitrate === 'number' && record.exportBitrate > 0) {
         setExportBitrate(record.exportBitrate);
@@ -1788,7 +2037,10 @@ export default function App() {
       // La copia ricopia l'intero blob: stesso pre-check quota del salvataggio.
       await assertStorageFor(record.size ?? record.audioBlob?.size ?? 0);
       const { id: _dropped, ...rest } = record;
-      await saveStoredProject({ ...rest, id: undefined, name: `${record.name || 'Progetto'} (copia)`, createdAt: Date.now() });
+      await runStorageTask(
+        { title: 'Duplico il progetto', detail: formatBytes(record.audioBlob?.size ?? record.size ?? 0) },
+        () => saveStoredProject({ ...rest, id: undefined, name: `${record.name || 'Progetto'} (copia)`, createdAt: Date.now() }),
+      );
       await refreshProjects();
     } catch (error) {
       console.error(error);
@@ -1832,141 +2084,181 @@ export default function App() {
     await analyzeFile(file);
   }
 
-  async function handleExportForAiStudio() {
-    if (!audioFile || isBusy) {
+  async function handleMakePlayablePreview() {
+    const sourceAudio = audioFileRef.current;
+    if (!sourceAudio || isBusyRef.current) {
       return;
     }
-    setErrorText('');
-    setIsBusy(true);
-    setStatusText('Preparo una copia ottimizzata per Google AI Studio...');
-    setPhaseProgress(0.15);
-
-    const outputName = `ai-studio-${Date.now()}.m4a`;
-    let ffmpeg = null;
-
+    const duration = sourceAudio.duration;
+    const outputName = `preview-${Date.now()}.m4a`;
+    setStatusText('Creo un’anteprima ascoltabile (solo per l’ascolto: l’export usa sempre l’originale)…');
     try {
-      ffmpeg = await ensureEngineReady();
-      await ensureInputPresent(ffmpeg);
-      setPhaseProgress(0.4);
-
-      const exportExitCode = await ffmpeg.exec([
-        '-hide_banner',
-        '-nostats',
-        '-i',
-        audioFile.virtualInputName,
-        // Catena pulita per la trascrizione: resample 16kHz e taglia-rumore basso
-        // che ruba bit a 32k. Il downmix mono resta a -ac 1 (sicuro anche su mono).
-        '-af',
-        'aresample=16000,highpass=f=80',
-        '-ac',
-        '1',
-        '-ar',
-        '16000',
-        '-c:a',
-        'aac',
-        '-b:a',
-        '32k',
-        '-movflags',
-        '+faststart',
-        outputName,
-      ]);
-      if (exportExitCode !== 0) {
-        throw new Error('Export per AI Studio non riuscito: FFmpeg ha restituito un errore.');
+      const previewBlob = await runEngineTask(
+        { kind: 'preview', title: 'Creo l’anteprima ascoltabile', durationSeconds: duration },
+        async ({ ffmpeg, inputPath, onProgress }) => {
+          try {
+            // Mono 22kHz 48k: leggera da generare e da decodificare per la forma d'onda.
+            const result = await runFfmpeg(ffmpeg, [
+              '-hide_banner',
+              '-i', inputPath,
+              '-map', '0:a:0',
+              '-vn',
+              '-ac', '1',
+              '-ar', '22050',
+              '-c:a', 'aac',
+              '-aac_coder', 'fast',
+              '-b:a', '48k',
+              '-movflags', '+faststart',
+              outputName,
+            ], { durationSeconds: duration, onProgress });
+            if (result.exitCode !== 0) {
+              throw new Error(describeFfmpegFailure(result.tailText) || 'Anteprima non riuscita.');
+            }
+            const data = await ffmpeg.readFile(outputName);
+            return new Blob([data], { type: 'audio/mp4' });
+          } finally {
+            await safeDelete(ffmpeg, outputName);
+          }
+        },
+      );
+      const current = audioFileRef.current;
+      if (!current || current.blob !== sourceAudio.blob) {
+        return;
       }
-      setPhaseProgress(0.85);
-
-      const data = await ffmpeg.readFile(outputName);
-      const blob = new Blob([data], { type: 'audio/mp4' });
-      const fileName = `${audioFile.baseName} - AI Studio.m4a`;
-      downloadBlob(blob, fileName);
-
-      setStatusText(
-        `Copia pronta (${formatBytes(blob.size)} · mono 16kHz AAC 32k). Caricala su AI Studio e chiedi la trascrizione.`,
-      );
-      setTechnicalLog(
-        `ai-studio export: mono 16kHz AAC 32k, ${formatBytes(blob.size)}.`,
-      );
-      setPhaseProgress(1);
+      const previewUrl = URL.createObjectURL(previewBlob);
+      if (current.objectUrl && current.objectUrl !== previewUrl) {
+        URL.revokeObjectURL(current.objectUrl);
+      }
+      objectUrlRef.current = previewUrl;
+      const nextAudio = { ...current, objectUrl: previewUrl, browserPlayable: true, previewOnly: true };
+      audioFileRef.current = nextAudio;
+      setAudioFile(nextAudio);
+      setLoadJob({
+        active: true,
+        stage: 'waveform',
+        stages: FAST_LOAD_STAGES,
+        frac: 0,
+        fileName: current.name,
+        startedAt: Date.now(),
+      });
+      setStatusText('Anteprima pronta: ascolta e segna i tagli. L’export userà il file originale.');
     } catch (error) {
-      console.error(error);
-      setErrorText(error.message || 'Export per AI Studio non riuscito.');
-      setStatusText('Export per AI Studio non completato.');
-      setPhaseProgress(0);
-    } finally {
-      if (ffmpeg) {
-        await safeDelete(ffmpeg, outputName);
+      if (error?.cancelled) {
+        setStatusText('Anteprima annullata: puoi comunque tagliare per tempi o parti uguali.');
+        return;
       }
-      setIsBusy(false);
+      console.error(error);
+      setErrorText(failureMessage(error, 'Anteprima non riuscita.'));
     }
   }
 
-  async function handleRestoreOriginal() {
-    if (!originalAudioBackup || isBusy) {
+  async function handleExportForAiStudio() {
+    if (!audioFile || isBusyRef.current) {
       return;
     }
-
-    setErrorText('');
-    isBusyRef.current = true;
-    setIsBusy(true);
-    setStatusText('Ripristino la versione originale del file...');
-
+    const duration = audioFile.duration;
+    const outputName = `ai-studio-${Date.now()}.m4a`;
+    const fileName = `${audioFile.baseName} - AI Studio.m4a`;
+    setStatusText('Preparo una copia ottimizzata per Google AI Studio…');
     try {
-      const ffmpeg = ffmpegRef.current ?? await ensureEngineReady();
-      // L'originale vive solo nel Blob del backup (niente 2x MEMFS): riscrivilo prima di puntarci.
-      if (backupFsMissingRef.current) {
-        const backupBytes = new Uint8Array(await (await fetch(originalAudioBackup.objectUrl)).arrayBuffer());
-        await ffmpeg.writeFile(originalAudioBackup.virtualInputName, backupBytes);
-        backupFsMissingRef.current = false;
-      }
-      const currentVirtual = audioFile?.virtualInputName;
-      if (audioFile?.objectUrl && audioFile.objectUrl !== originalAudioBackup.objectUrl) {
-        URL.revokeObjectURL(audioFile.objectUrl);
-      }
-      if (currentVirtual && currentVirtual !== originalAudioBackup.virtualInputName) {
-        await safeDelete(ffmpeg, currentVirtual);
-      }
-
-      objectUrlRef.current = originalAudioBackup.objectUrl;
-      activeInputRef.current = originalAudioBackup.virtualInputName;
-
-      setAudioFile((previous) =>
-        previous
-          ? {
-              ...previous,
-              objectUrl: originalAudioBackup.objectUrl,
-              virtualInputName: originalAudioBackup.virtualInputName,
-              extension: originalAudioBackup.extension,
-              duration: originalAudioBackup.duration,
-              formatLabel: originalAudioBackup.formatLabel,
-              mimeType: originalAudioBackup.mimeType,
-              size: originalAudioBackup.size,
-              baseName: originalAudioBackup.baseName ?? previous.baseName,
-              name: originalAudioBackup.name ?? previous.name,
-              lastModified: originalAudioBackup.lastModified ?? previous.lastModified,
-              blob: null,
+      const blob = await runEngineTask(
+        { kind: 'ai', title: 'Copia leggera per AI Studio', durationSeconds: duration },
+        async ({ ffmpeg, inputPath, onProgress }) => {
+          try {
+            const result = await runFfmpeg(ffmpeg, [
+              '-hide_banner',
+              '-i',
+              inputPath,
+              // Catena pulita per la trascrizione: resample 16kHz e taglia-rumore basso
+              // che ruba bit a 32k. Il downmix mono resta a -ac 1 (sicuro anche su mono).
+              '-af',
+              'aresample=16000,highpass=f=80',
+              '-ac',
+              '1',
+              '-ar',
+              '16000',
+              '-c:a',
+              'aac',
+              '-aac_coder',
+              'fast',
+              '-b:a',
+              '32k',
+              '-movflags',
+              '+faststart',
+              outputName,
+            ], { durationSeconds: duration, onProgress });
+            if (result.exitCode !== 0) {
+              throw new Error(describeFfmpegFailure(result.tailText) || 'Export per AI Studio non riuscito: FFmpeg ha restituito un errore.');
             }
-          : previous,
+            const data = await ffmpeg.readFile(outputName);
+            return new Blob([data], { type: 'audio/mp4' });
+          } finally {
+            await safeDelete(ffmpeg, outputName);
+          }
+        },
       );
+      downloadBlob(blob, fileName);
+      setStatusText(
+        `Copia pronta (${formatBytes(blob.size)} · mono 16kHz AAC 32k). Caricala su AI Studio e chiedi la trascrizione.`,
+      );
+      setTechnicalLog(`ai-studio export: mono 16kHz AAC 32k, ${formatBytes(blob.size)}.`);
+      flashDone('Copia per AI Studio scaricata', `${formatBytes(blob.size)} · mono 16 kHz`);
+    } catch (error) {
+      if (error?.cancelled) {
+        setStatusText('Export per AI Studio annullato.');
+        return;
+      }
+      console.error(error);
+      setErrorText(failureMessage(error, 'Export per AI Studio non riuscito.'));
+      setStatusText('Export per AI Studio non completato.');
+    }
+  }
+
+  function handleRestoreOriginal() {
+    if (!originalAudioBackup || isBusyRef.current) {
+      return;
+    }
+    // L'originale vive nel suo Blob: nessuna operazione del motore necessaria,
+    // verrà rimontato (zero copie) al prossimo taglio.
+    if (audioFile?.objectUrl && audioFile.objectUrl !== originalAudioBackup.objectUrl) {
+      URL.revokeObjectURL(audioFile.objectUrl);
+    }
+    objectUrlRef.current = originalAudioBackup.objectUrl;
+    const restored = audioFile
+      ? {
+          ...audioFile,
+          objectUrl: originalAudioBackup.objectUrl,
+          extension: originalAudioBackup.extension,
+          duration: originalAudioBackup.duration,
+          formatLabel: originalAudioBackup.formatLabel,
+          mimeType: originalAudioBackup.mimeType,
+          size: originalAudioBackup.size,
+          baseName: originalAudioBackup.baseName ?? audioFile.baseName,
+          name: originalAudioBackup.name ?? audioFile.name,
+          lastModified: originalAudioBackup.lastModified ?? audioFile.lastModified,
+          blob: originalAudioBackup.blob ?? null,
+          browserPlayable: originalAudioBackup.browserPlayable ?? true,
+          previewOnly: originalAudioBackup.previewOnly ?? false,
+        }
+      : null;
+    audioFileRef.current = restored;
+    setAudioFile(restored);
+    // Senza accorciare le pause la durata è la stessa: tagli e segnalibri restano validi.
+    if (appliedCleanup?.shortenPauses !== false) {
       setCustomCuts([]);
       setBookmarks([]);
       setLoopRegion(null);
       setLoopDraft(null);
-      setCurrentTime(0);
-      setIsPlaying(false);
-      setCleanupPreset('none');
-      setLastDetectionSummary('');
-      setOriginalAudioBackup(null);
-      setStatusText('Versione originale ripristinata.');
-      setTechnicalLog('cleanup: ripristino originale completato.');
-      setPhaseProgress(0);
-    } catch (error) {
-      console.error(error);
-      setErrorText(error.message || 'Ripristino non riuscito.');
-      setStatusText('Ripristino non completato.');
-    } finally {
-      isBusyRef.current = false;
-      setIsBusy(false);
     }
+    setCurrentTime(0);
+    setIsPlaying(false);
+    setAppliedCleanup(null);
+    setCleanupPreview(null);
+    setLastDetectionSummary('');
+    setOriginalAudioBackup(null);
+    setErrorText('');
+    setStatusText('Versione originale ripristinata.');
+    setTechnicalLog('cleanup: ripristino originale completato.');
   }
 
   useKeyboardShortcuts(
@@ -2001,28 +2293,13 @@ export default function App() {
   function handleCancelExport() {
     exportAbortRef.current = true;
     setStatusText('Annullamento export in corso…');
-    // Interrompe un exec FFmpeg in corso; il motore verrà ricreato al prossimo uso.
-    resetAfterAbort();
-    // Il terminate azzera la MEMFS: i nomi virtuali non sono più validi.
-    // Vengono reidratati pigramente da ensureInputPresent al prossimo uso.
-    activeInputRef.current = '';
-    activeProbeRef.current = '';
-    inputStaleRef.current = true;
-  }
-
-  /**
-   * Dopo un terminate (annullo export) il nuovo motore nasce con FS vuoto:
-   * riscrive l'audio corrente dal Blob in memoria prima di riusarlo.
-   */
-  async function ensureInputPresent(ffmpeg) {
-    if (!inputStaleRef.current || !audioFile) {
-      return;
+    exportGateRef.current?.abort();
+    if (exportStageRef.current !== 'engine') {
+      // Interrompe un exec FFmpeg in corso; il motore verrà ricreato al prossimo uso
+      // e l'audio rimontato (zero copie) da ensureInputMounted. Durante il download
+      // del motore invece si abbandona solo l'attesa: il download prosegue.
+      resetAfterAbort();
     }
-    const bytes = new Uint8Array(await (await fetch(audioFile.objectUrl)).arrayBuffer());
-    await ffmpeg.writeFile(audioFile.virtualInputName, bytes);
-    activeInputRef.current = audioFile.virtualInputName;
-    activeProbeRef.current = '';
-    inputStaleRef.current = false;
   }
 
   function handleDownloadSingle(part) {
@@ -2265,65 +2542,68 @@ export default function App() {
   }
 
   async function processLoopExport() {
-    if (!audioFile || !loopRegion || loopRegion.end <= loopRegion.start + 0.24 || isBusy) {
+    if (!audioFile || !loopRegion || loopRegion.end <= loopRegion.start + 0.24 || isBusyRef.current) {
       setErrorText('Imposta prima un loop A-B di almeno 0,25 secondi.');
       return;
     }
-    const format = getExportFormat(exportFormat);
-    setErrorText('');
-    isBusyRef.current = true;
-    setIsBusy(true);
-    setStatusText(`Esporto la selezione ${formatClock(loopRegion.start)} → ${formatClock(loopRegion.end)}...`);
+    const format = getExportFormat(effectiveFormatId);
+    const region = { ...loopRegion };
+    const selectionSeconds = region.end - region.start;
     const virtualName = `loop-${Date.now()}${format.extension}`;
-    const loopInputName = audioFile.virtualInputName;
-    const loopSourceExtension = audioFile.extension;
-    let ffmpeg = null;
+    const copy = effectiveFastCopy && canFastCopy({ formatId: format.id, sourceExtension: audioFile.extension });
+    setStatusText(`Esporto la selezione ${formatClock(region.start)} → ${formatClock(region.end)}…`);
     try {
-      ffmpeg = await ensureEngineReady();
-      await ensureInputPresent(ffmpeg);
-      const args = buildExportArgs({
-        segment: { start: loopRegion.start, duration: loopRegion.end - loopRegion.start },
-        inputName: loopInputName,
-        outputName: virtualName,
-        formatId: format.id,
-        bitrateKbps: exportBitrate,
-        fastCopy: fastCopy && canFastCopy({ formatId: format.id, sourceExtension: loopSourceExtension }),
-        // Micro-fade anti-click sui confini A-B (20ms, inudibile come dissolvenza).
-        fadeSeconds: 0.02,
-      });
-      const exitCode = await ffmpeg.exec(args);
-      if (exitCode !== 0) {
-        throw new Error('Export selezione non riuscito.');
-      }
-      const data = await ffmpeg.readFile(virtualName);
-      const blob = new Blob([data], { type: format.mime });
+      const blob = await runEngineTask(
+        { kind: 'loop', title: `Esporto la selezione A-B (${formatClock(selectionSeconds)})`, durationSeconds: selectionSeconds },
+        async ({ ffmpeg, inputPath, onProgress }) => {
+          try {
+            const args = buildExportArgs({
+              segment: { start: region.start, duration: selectionSeconds },
+              inputName: inputPath,
+              outputName: virtualName,
+              formatId: format.id,
+              bitrateKbps: exportBitrate,
+              fastCopy: copy,
+              // Micro-fade anti-click sui confini A-B (20ms, inudibile come dissolvenza).
+              fadeSeconds: copy ? 0 : 0.02,
+            });
+            const result = await runFfmpeg(ffmpeg, args, { durationSeconds: selectionSeconds, onProgress });
+            if (result.exitCode !== 0) {
+              throw new Error(describeFfmpegFailure(result.tailText) || 'Export selezione non riuscito.');
+            }
+            const data = await ffmpeg.readFile(virtualName);
+            return new Blob([data], { type: format.mime });
+          } finally {
+            await safeDelete(ffmpeg, virtualName);
+          }
+        },
+      );
       downloadBlob(blob, `${sanitizeFileName(effectiveBaseName)} - selezione${format.extension}`);
-      setStatusText('Selezione esportata.');
+      setStatusText(`Selezione esportata (${formatBytes(blob.size)}).`);
+      flashDone('Selezione A-B scaricata', formatBytes(blob.size));
     } catch (error) {
-      console.error(error);
-      setErrorText(error.message || 'Export selezione non riuscito.');
-    } finally {
-      if (ffmpeg) {
-        await safeDelete(ffmpeg, virtualName);
+      if (error?.cancelled) {
+        setStatusText('Export della selezione annullato.');
+        return;
       }
-      isBusyRef.current = false;
-      setIsBusy(false);
+      console.error(error);
+      setErrorText(failureMessage(error, 'Export selezione non riuscito.'));
     }
   }
 
   async function processAndDownload() {
+    if (isBusyRef.current) {
+      return;
+    }
     if (!audioFile || plan.error || plan.segments.length < 2) {
       setErrorText(plan.error || 'Definisci almeno due parti prima di esportare.');
       return;
     }
 
-    const format = getExportFormat(exportFormat);
+    const format = getExportFormat(effectiveFormatId);
     const outputExtension = format.extension;
-    // Fast-copy solo se il container lo permette DAVVERO (evita MP3 in .m4a corrotti).
-    const effectiveFastCopy = fastCopy && canFastCopy({ formatId: format.id, sourceExtension: audioFile?.extension });
-    if (fastCopy && !effectiveFastCopy) {
-      setTechnicalLog(`fast-copy richiesto ma non compatibile (${audioFile?.extension} → ${format.id}): uso re-encode.`);
-    }
+    // Copia senza ricodifica solo se il container lo permette DAVVERO (evita MP3 in .m4a corrotti).
+    const jobFastCopy = effectiveFastCopy && canFastCopy({ formatId: format.id, sourceExtension: audioFile.extension });
 
     setErrorText('');
     for (const url of lastResultUrlsRef.current) {
@@ -2338,34 +2618,42 @@ export default function App() {
     setFailedExportIndex(null);
     setResumeNotice('');
     clearPreview();
+    waveformRef.current?.pause?.();
 
-    // Snapshot del job: i controlli restano usabili mentre il job gira in background.
-    // Il flag sync chiude la race con analyzeFile (che controlla il ref, non lo state).
+    // Snapshot del job. Il flag sync chiude la race con analyzeFile (che controlla il ref).
     isBusyRef.current = true;
+    const jobAudio = audioFileRef.current ?? audioFile;
     const jobSegments = plan.segments.map((segment) => ({ ...segment }));
-    const jobInputName = audioFile.virtualInputName;
     const jobBaseName = effectiveBaseName;
     const jobFormatId = format.id;
     const jobBitrate = exportBitrate;
-    const jobFade = effectiveFastCopy ? 0 : fadeSeconds;
+    const jobFade = jobFastCopy ? 0 : fadeSeconds;
+    const speedKey = exportSpeedKey({ fastCopy: jobFastCopy, formatId: jobFormatId });
+    const modeLabel = jobFastCopy
+      ? `${format.label} · qualità originale`
+      : `${format.label}${format.bitrates.length ? ` ${jobBitrate}k` : ''}`;
     const jobNames = jobSegments.map((segment) => buildSegmentFileName(
       jobBaseName,
       segment.index,
       outputExtension,
       segmentNames[segment.index] ?? '',
     ));
-    const totalEstimate = jobSegments.reduce(
-      (sum, segment) => sum + estimateExportBytes({
-        durationSeconds: segment.duration,
-        bitrateKbps: jobBitrate,
-        formatId: jobFormatId,
-      }),
-      0,
-    );
+    const totalSeconds = jobSegments.reduce((sum, segment) => sum + segment.duration, 0);
+    const totalEstimate = jobFastCopy
+      // In copia il peso è quello della sorgente, non del bitrate scelto.
+      ? Math.round((jobAudio.size || 0) * (totalSeconds / Math.max(1, jobAudio.duration || totalSeconds)))
+      : jobSegments.reduce(
+        (sum, segment) => sum + estimateExportBytes({
+          durationSeconds: segment.duration,
+          bitrateKbps: jobBitrate,
+          formatId: jobFormatId,
+        }),
+        0,
+      );
 
     const capabilities = getExportCapabilities();
     const advice = adviseExportStrategy({
-      fileSizeBytes: audioFile.size ?? 0,
+      fileSizeBytes: jobAudio.size ?? 0,
       totalEstimateBytes: totalEstimate,
       segmentCount: jobSegments.length,
       capabilities,
@@ -2382,70 +2670,82 @@ export default function App() {
     // Gli handle disco vanno chiesti NEL gesto utente, prima del lavoro pesante.
     let dirHandle = null;
     let zipFileHandle = null;
-    if (destMode === 'folder') {
-      if (typeof window.showDirectoryPicker !== 'function') {
-        setErrorText('Scrittura su cartella non supportata da questo browser. Scegli un’altra destinazione.');
-        return;
-      }
-      try {
-        dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-      } catch (pickerError) {
-        if (pickerError?.name === 'AbortError') {
-          setStatusText('Scelta cartella annullata.');
-          return;
+    try {
+      if (destMode === 'folder') {
+        if (typeof window.showDirectoryPicker !== 'function') {
+          throw new Error('Scrittura su cartella non supportata da questo browser. Scegli un’altra destinazione.');
         }
-        throw pickerError;
-      }
-    } else if (destMode === 'zip-stream') {
-      if (typeof window.showSaveFilePicker !== 'function') {
-        setErrorText('Salvataggio diretto non supportato da questo browser. Scegli un’altra destinazione.');
-        return;
-      }
-      try {
+        dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      } else if (destMode === 'zip-stream') {
+        if (typeof window.showSaveFilePicker !== 'function') {
+          throw new Error('Salvataggio diretto non supportato da questo browser. Scegli un’altra destinazione.');
+        }
         zipFileHandle = await window.showSaveFilePicker({
           suggestedName: `${sanitizeFileName(jobBaseName)} - ${jobSegments.length} parti.zip`,
           types: [{ description: 'Archivio ZIP', accept: { 'application/zip': ['.zip'] } }],
         });
-      } catch (pickerError) {
-        if (pickerError?.name === 'AbortError') {
-          setStatusText('Salvataggio annullato.');
-          return;
-        }
-        throw pickerError;
       }
+    } catch (pickerError) {
+      isBusyRef.current = false;
+      if (pickerError?.name === 'AbortError') {
+        setStatusText(destMode === 'folder' ? 'Scelta cartella annullata.' : 'Salvataggio annullato.');
+        return;
+      }
+      setErrorText(
+        pickerError?.name === 'SecurityError' || pickerError?.name === 'NotAllowedError'
+          ? 'Il browser ha bloccato la finestra di salvataggio: premi di nuovo «Taglia e scarica».'
+          : pickerError?.message || 'Non riesco ad aprire la destinazione scelta.',
+      );
+      return;
     }
 
+    const partStates = jobSegments.map(() => 'todo');
+    const startedAt = Date.now();
     setIsBusy(true);
     setIsExporting(true);
+    exportAbortRef.current = false;
     setExportDetail({
       active: true,
+      stage: 'engine',
       segIndex: 0,
       segCount: jobSegments.length,
       frac: 0,
-      bytesDone: 0,
-      bytesTotal: totalEstimate,
-      throughputBps: 0,
+      doneSeconds: 0,
+      totalSeconds,
+      speed: 0,
       etaMs: null,
+      bytesDone: 0,
+      parts: [...partStates],
+      startedAt,
+      modeLabel,
+      destMode,
     });
-    setCurrentSegmentIndex(0);
-    exportAbortRef.current = false;
-    setPhaseProgress(0.05);
-    const exportStartedAt = performance.now();
-    setStatusText(
-      `Sto creando ${jobSegments.length} parti in ${format.label} (${destMode === 'folder' ? 'cartella' : destMode === 'zip-stream' ? 'ZIP su disco' : destMode === 'zip-classic' ? 'ZIP' : 'singoli'})... ` +
-      'Puoi cambiare scheda: tieni questa aperta, il job continua in background.',
-    );
-    const previousTitle = document.title;
+    const destLabel = destMode === 'folder'
+      ? 'nella cartella scelta'
+      : destMode === 'zip-stream'
+        ? 'in uno ZIP su disco'
+        : destMode === 'zip-classic'
+          ? 'in un unico ZIP'
+          : 'come file singoli';
+    setStatusText(`Creo ${jobSegments.length} parti in ${modeLabel} ${destLabel}…`);
 
     const runPrefix = `segment-${Date.now()}`;
     let ffmpeg = null;
     const createdVirtualNames = [];
     let zipWriter = null;
     let zipWritable = null;
+    let engineCrashed = false;
 
+    const gate = createAbortGate();
+    exportGateRef.current = gate;
+    exportStageRef.current = 'engine';
     try {
-      ffmpeg = await ensureEngineReady();
-      await ensureInputPresent(ffmpeg);
+      ffmpeg = await Promise.race([ensureEngineReady(), gate.promise]);
+      if (exportAbortRef.current) {
+        throw new Error('Export annullato.');
+      }
+      exportStageRef.current = 'segments';
+      const inputPath = await ensureInputMounted(ffmpeg, jobAudio);
       if (destMode === 'zip-stream') {
         zipWritable = await zipFileHandle.createWritable();
         zipWriter = await createZipStreamWriter(zipWritable);
@@ -2463,6 +2763,37 @@ export default function App() {
         doneNames: [],
       });
 
+      const workStartedAt = performance.now();
+      let doneSeconds = 0;
+      let workedSeconds = 0;
+      let bytesDone = 0;
+      let lastPublishAt = 0;
+      const publish = (index, segFrac, segDuration, force = false) => {
+        const now = performance.now();
+        if (!force && now - lastPublishAt < 200) {
+          return;
+        }
+        lastPublishAt = now;
+        const processed = workedSeconds + segDuration * segFrac;
+        const speed = speedFactor(processed, now - workStartedAt);
+        const frac = combineSecondsProgress({ doneSeconds, segSeconds: segDuration, segFrac, totalSeconds });
+        const remainingSeconds = Math.max(0, totalSeconds - doneSeconds - segDuration * segFrac);
+        const etaMs = etaMsFromSpeed({ remainingSeconds, speed });
+        setExportDetail((previous) => previous?.active
+          ? {
+            ...previous,
+            stage: 'segments',
+            segIndex: index,
+            frac,
+            doneSeconds,
+            speed,
+            etaMs,
+            bytesDone,
+            parts: [...partStates],
+          }
+          : previous);
+      };
+
       for (let index = 0; index < jobSegments.length; index += 1) {
         if (exportAbortRef.current) {
           throw new Error('Export annullato.');
@@ -2470,36 +2801,8 @@ export default function App() {
         const segment = jobSegments[index];
         const downloadName = jobNames[index];
         const virtualName = buildVirtualSegmentName(runPrefix, index, outputExtension);
-        const segEstimate = estimateExportBytes({
-          durationSeconds: segment.duration,
-          bitrateKbps: jobBitrate,
-          formatId: jobFormatId,
-        });
-        const reportExport = (bytesDone, segFrac) => {
-          const frac = combineExportProgress({
-            bytesDone,
-            segFrac,
-            segEstimate,
-            bytesTotal: totalEstimate,
-          });
-          const elapsedMs = performance.now() - exportStartedAt;
-          const throughput = throughputBytesPerSec(bytesDone, elapsedMs);
-          setExportDetail((previous) => previous?.active
-            ? {
-              ...previous,
-              segIndex: index,
-              frac,
-              bytesDone,
-              throughputBps: throughput,
-              etaMs: etaMsRemaining({ bytesDone, bytesTotal: totalEstimate, throughputBps: throughput }),
-            }
-            : previous);
-          document.title = `(${index + 1}/${jobSegments.length} · ${Math.round(frac * 100)}%) Export audio…`;
-        };
-        setStatusText(
-          `Creo parte ${index + 1} di ${jobSegments.length} in ${format.label} (${destMode})...`,
-        );
-        setPhaseProgress(0.08 + (index / jobSegments.length) * 0.82);
+        partStates[index] = 'active';
+        publish(index, 0, segment.duration, true);
 
         // Modalità cartella + ripresa: salta i file già presenti e validi.
         if (destMode === 'folder' && skipExisting) {
@@ -2513,8 +2816,9 @@ export default function App() {
                 duration: segment.duration,
                 skipped: true,
               });
-              const doneBytes = exportedParts.reduce((sum, part) => sum + (part.size || 0), 0);
-              reportExport(doneBytes, 1);
+              partStates[index] = 'skipped';
+              doneSeconds += segment.duration;
+              publish(index, 0, 0, true);
               await yieldToUI();
               continue;
             }
@@ -2525,39 +2829,45 @@ export default function App() {
 
         const args = buildExportArgs({
           segment,
-          inputName: jobInputName,
+          inputName: inputPath,
           outputName: virtualName,
           formatId: format.id,
           bitrateKbps: jobBitrate,
-          fastCopy: effectiveFastCopy,
+          fastCopy: jobFastCopy,
           fadeSeconds: jobFade,
         });
 
-        // Avanzamento intra-segmento reale dagli eventi progress di ffmpeg.
-        let segFrac = 0;
-        const doneBytesBase = exportedParts.reduce((sum, part) => sum + (part.size || 0), 0);
-        const onSegmentProgress = ({ progress }) => {
-          const safe = clamp01(progress);
-          segFrac = safe;
-          reportExport(doneBytesBase, safe);
-        };
-        ffmpeg.on('progress', onSegmentProgress);
-        let segmentExitCode = 1;
+        // Avanzamento intra-segmento reale (secondi di output scritti da ffmpeg).
+        let result;
         try {
-          segmentExitCode = await ffmpeg.exec(args);
-        } finally {
-          ffmpeg.off('progress', onSegmentProgress);
+          result = await runFfmpeg(ffmpeg, args, {
+            durationSeconds: segment.duration,
+            onProgress: (frac) => publish(index, frac ?? 0, segment.duration),
+          });
+        } catch (execError) {
+          if (!exportAbortRef.current) {
+            // Il worker è morto (OOM, abort wasm): va ricreato al prossimo uso.
+            engineCrashed = true;
+          }
+          const failed = new Error(
+            exportAbortRef.current
+              ? 'Export annullato.'
+              : describeFfmpegFailure(execError?.message) || `Il motore si è fermato alla parte ${index + 1}. Riprova: riparte da capo in pochi secondi.`,
+          );
+          failed.failedIndex = index;
+          throw failed;
         }
 
         if (exportAbortRef.current) {
           throw new Error('Export annullato.');
         }
 
-        if (segmentExitCode !== 0) {
+        if (result.exitCode !== 0) {
           // Il segmento parziale resterebbe orfano nella FS: eliminalo subito.
           await safeDelete(ffmpeg, virtualName);
+          const reason = describeFfmpegFailure(result.tailText);
           const failed = new Error(
-            `Non sono riuscito a esportare la parte ${index + 1} in ${format.label}.`,
+            `Non sono riuscito a esportare la parte ${index + 1} in ${format.label}.${reason ? ` ${reason}` : ''}`,
           );
           failed.failedIndex = index;
           throw failed;
@@ -2566,23 +2876,18 @@ export default function App() {
         createdVirtualNames.push(virtualName);
 
         let outputData = await ffmpeg.readFile(virtualName);
+        // Libera SUBITO il segmento dalla memoria wasm: mai più di uno in RAM.
+        await safeDelete(ffmpeg, virtualName);
+        createdVirtualNames.pop();
 
         if (destMode === 'folder') {
           const fileHandle = await dirHandle.getFileHandle(downloadName, { create: true });
           // Scrittura diretta dei byte: niente Blob intermedio da ~1 segmento.
           await writeBlobToFileHandle(fileHandle, outputData);
-          exportedParts.push({
-            name: downloadName,
-            size: outputData.length,
-            duration: segment.duration,
-          });
+          exportedParts.push({ name: downloadName, size: outputData.length, duration: segment.duration });
         } else if (destMode === 'zip-stream' || destMode === 'zip-classic') {
           await zipWriter.add(downloadName, outputData);
-          exportedParts.push({
-            name: downloadName,
-            size: outputData.length,
-            duration: segment.duration,
-          });
+          exportedParts.push({ name: downloadName, size: outputData.length, duration: segment.duration });
         } else {
           const blob = new Blob([outputData], { type: format.mime });
           let url = null;
@@ -2599,10 +2904,12 @@ export default function App() {
           downloadBlob(blob, downloadName);
         }
 
-        // Libera SUBITO il segmento: mai più di uno in RAM.
-        await safeDelete(ffmpeg, virtualName);
+        bytesDone += outputData.length;
         outputData = null;
-        reportExport(exportedParts.reduce((sum, part) => sum + (part.size || 0), 0), 1);
+        doneSeconds += segment.duration;
+        workedSeconds += segment.duration;
+        partStates[index] = 'done';
+        publish(Math.min(index + 1, jobSegments.length - 1), 0, 0, true);
         await yieldToUI();
         writeCheckpoint({
           baseName: jobBaseName,
@@ -2615,15 +2922,29 @@ export default function App() {
         });
       }
 
+      const workMs = performance.now() - workStartedAt;
+      if (workedSeconds > 0) {
+        rememberSpeed(speedKey, speedFactor(workedSeconds, workMs));
+      }
+
       let zipUrl = null;
       let zipName = '';
+      if (destMode === 'zip-stream' || destMode === 'zip-classic') {
+        setExportDetail((previous) => previous?.active
+          ? {
+            ...previous,
+            stage: 'finalizing',
+            frac: 1,
+            parts: [...partStates],
+            finalizingLabel: destMode === 'zip-stream' ? 'Chiudo lo ZIP su disco…' : 'Creo lo ZIP da scaricare…',
+          }
+          : previous);
+      }
       if (destMode === 'zip-stream') {
-        setStatusText('Finalizzo il file ZIP su disco...');
         await zipWriter.close();
         zipWriter = null;
         zipName = `${sanitizeFileName(jobBaseName)} - ${exportedParts.length} parti.zip`;
       } else if (destMode === 'zip-classic') {
-        setStatusText('Creo lo ZIP...');
         const zipBlob = await zipWriter.close();
         zipWriter = null;
         zipName = `${sanitizeFileName(jobBaseName)} - ${exportedParts.length} parti.zip`;
@@ -2634,6 +2955,7 @@ export default function App() {
       }
 
       clearCheckpoint();
+      const elapsedLabel = formatDurationShort((Date.now() - startedAt) / 1000);
       setLastResult({
         archiveName: destMode === 'folder'
           ? `Cartella: ${exportedParts.length} parti scritte su disco`
@@ -2647,53 +2969,45 @@ export default function App() {
         zipName,
         destMode,
         retainBlobs,
+        elapsedLabel,
       });
       setStatusText(
-        destMode === 'folder'
-          ? `Fatto. ${exportedParts.length} parti scritte nella cartella scelta, senza riempire la memoria.`
+        (destMode === 'folder'
+          ? `Fatto in ${elapsedLabel}. ${exportedParts.length} parti scritte nella cartella scelta.`
           : destMode === 'zip-stream'
-            ? `Fatto. ZIP scritto direttamente su disco con ${exportedParts.length} parti.`
+            ? `Fatto in ${elapsedLabel}. ZIP scritto su disco con ${exportedParts.length} parti.`
             : destMode === 'zip-classic'
-              ? `Fatto. ZIP scaricato con ${exportedParts.length} parti.${retainBlobs ? ' I singoli restano riscaricabili sotto.' : ''}`
-              : `Fatto. Ho scaricato ogni parte come file ${format.label} già rinominato.${retainBlobs ? '' : ' (Re-download disattivato per risparmiare memoria.)'}`,
+              ? `Fatto in ${elapsedLabel}. ZIP scaricato con ${exportedParts.length} parti.${retainBlobs ? ' I singoli restano riscaricabili sotto.' : ''}`
+              : `Fatto in ${elapsedLabel}. Ho scaricato ogni parte come file ${format.label} già rinominato.${retainBlobs ? '' : ' (Re-download disattivato per risparmiare memoria.)'}`),
+      );
+      flashDone(
+        `Fatto in ${elapsedLabel}: ${exportedParts.length} parti ${destMode === 'folder' ? 'nella cartella' : destMode === 'singles' ? 'scaricate' : 'nello ZIP'}`,
+        `${format.label}${jobFastCopy ? ' · qualità originale' : ''} · ${formatBytes(exportedParts.reduce((sum, part) => sum + (part.size || 0), 0))}`,
       );
       setTechnicalLog(
-        `Export ${format.id} ${format.bitrates.length ? `${jobBitrate}k` : 'lossless'}${effectiveFastCopy ? ' fast-copy' : ''}${jobFade ? ` fade ${jobFade}s` : ''} via ${destMode}: ${exportedParts.length} file.`,
+        `Export ${format.id} ${jobFastCopy ? 'senza ricodifica' : format.bitrates.length ? `${jobBitrate}k` : 'lossless'}${jobFade ? ` fade ${jobFade}s` : ''} via ${destMode}: ${exportedParts.length} file, ${formatSpeedFactor(speedFactor(workedSeconds, workMs)) ?? '—'} tempo reale.`,
       );
-      setPhaseProgress(1);
     } catch (error) {
       console.error(error);
       const cancelled = exportAbortRef.current || error?.message === 'Export annullato.';
+      for (const url of lastResultUrlsRef.current) {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {
+          // ignore
+        }
+      }
+      lastResultUrlsRef.current = [];
       if (cancelled) {
         setErrorText('');
         setFailedExportIndex(null);
-        for (const url of lastResultUrlsRef.current) {
-          try {
-            URL.revokeObjectURL(url);
-          } catch {
-            // ignore
-          }
-        }
-        lastResultUrlsRef.current = [];
         setStatusText('Export annullato. Puoi rilanciarlo quando vuoi.');
-        setPhaseProgress(0);
       } else {
         if (Number.isInteger(error?.failedIndex)) {
           setFailedExportIndex(error.failedIndex);
         }
-        // Le parti parziali non sono esposte (lastResult resta null): revoca subito
-        // gli URL orfani per non tenere in RAM blob inutilizzabili.
-        for (const url of lastResultUrlsRef.current) {
-          try {
-            URL.revokeObjectURL(url);
-          } catch {
-            // ignore
-          }
-        }
-        lastResultUrlsRef.current = [];
-        setErrorText(error.message || 'Non sono riuscito a esportare le parti.');
+        setErrorText(failureMessage(error, 'Non sono riuscito a esportare le parti.'));
         setStatusText('Esportazione non completata.');
-        setPhaseProgress(0);
       }
     } finally {
       // Su errore/annullo lo stream ZIP va chiuso o interrotto, altrimenti
@@ -2716,14 +3030,18 @@ export default function App() {
           // ignore
         }
       }
-      if (ffmpeg) {
+      if (ffmpeg && !engineCrashed && !exportAbortRef.current) {
         for (const virtualName of createdVirtualNames) {
           await safeDelete(ffmpeg, virtualName);
         }
       }
+      if (engineCrashed) {
+        resetAfterAbort();
+      }
 
-      document.title = previousTitle;
       exportAbortRef.current = false;
+      exportGateRef.current = null;
+      exportStageRef.current = '';
       setExportDetail(null);
       isBusyRef.current = false;
       setIsBusy(false);
@@ -2733,15 +3051,103 @@ export default function App() {
 
   const canExport = Boolean(audioFile) && !plan.error && plan.segments.length >= 2 && !isBusy;
   const activeStep = !audioFile ? 0 : (plan.error || plan.segments.length < 2 ? 1 : (!lastResult ? 2 : 3));
-  const showStickyCta = Boolean(audioFile) && canExport && !isExporting && !isBusy;
+  const effectiveFormat = getExportFormat(effectiveFormatId);
+  const formatBadge = effectiveFastCopy ? `${effectiveFormat.label} originale` : effectiveFormat.label;
   const helperChips = [
     'Locale nel browser',
-    'Un solo upload',
-    `Export ${getExportFormat(exportFormat).label}`,
+    'Nessun upload',
+    effectiveFastCopy ? 'Taglio senza ricodifica' : `Export ${effectiveFormat.label}`,
   ];
 
+  // Stima PRIMA dell'export: secondi di audio / velocità (misurata su questo
+  // dispositivo dopo il primo export, prudente prima) + motore se manca.
+  const exportEstimate = useMemo(() => {
+    if (!audioFile || plan.segments.length < 2) {
+      return null;
+    }
+    const totalSeconds = plan.segments.reduce((sum, segment) => sum + segment.duration, 0);
+    const { speed, measured } = expectedSpeed(exportSpeedKey({ fastCopy: effectiveFastCopy, formatId: effectiveFormatId }));
+    const workSeconds = totalSeconds / speed + plan.segments.length * 0.15;
+    const engineMissing = engineInfo.phase !== 'ready';
+    const label = workSeconds < 8 ? 'pochi secondi' : `~${formatDurationShort(workSeconds)}`;
+    return {
+      workSeconds,
+      measured,
+      engineMissing,
+      label,
+      text: `${measured ? 'Tempo stimato' : 'Stima'}: ${label}${engineMissing ? ' + download motore (solo la prima volta)' : ''}`,
+    };
+  }, [audioFile, plan.segments, effectiveFastCopy, effectiveFormatId, engineInfo.phase]);
+
+  // Una sola "attività in corso" alla volta nel dock fisso, con priorità:
+  // export > operazioni del motore > caricamento bloccante.
+  const activity = (() => {
+    if (exportDetail?.active) {
+      const engine = exportDetail.stage === 'engine' && engineInfo.phase !== 'ready' ? describeEngine(engineInfo) : null;
+      const speed = formatSpeedFactor(exportDetail.speed);
+      const eta = exportDetail.etaMs !== null && exportDetail.etaMs !== undefined
+        ? formatDurationShort(exportDetail.etaMs / 1000)
+        : null;
+      const partNumber = Math.min(exportDetail.segIndex + 1, exportDetail.segCount);
+      return {
+        title: engine
+          ? engine.title
+          : exportDetail.stage === 'finalizing'
+            ? (exportDetail.finalizingLabel || 'Finalizzo lo ZIP…')
+            : `Taglio ${exportDetail.segCount} parti · ${exportDetail.modeLabel}`,
+        detail: engine
+          ? engine.detail
+          : exportDetail.stage === 'finalizing'
+            ? `${exportDetail.segCount} parti pronte`
+            : [`Parte ${partNumber} di ${exportDetail.segCount}`, speed ? `${speed} tempo reale` : null, eta ? `restano ~${eta}` : null]
+              .filter(Boolean).join(' · '),
+        frac: engine ? engine.frac : exportDetail.stage === 'finalizing' ? null : exportDetail.frac,
+        startedAt: exportDetail.startedAt,
+        onCancel: handleCancelExport,
+        cancelLabel: 'Annulla export',
+        hint: 'puoi cambiare scheda, tienila aperta',
+      };
+    }
+    if (task) {
+      // Motore già pronto: la fase "engine" dura un attimo, mostra il compito vero.
+      const engine = task.stage === 'engine' && engineInfo.phase !== 'ready' ? describeEngine(engineInfo) : null;
+      const speed = formatSpeedFactor(task.speed);
+      const eta = task.etaMs !== null && task.etaMs !== undefined ? formatDurationShort(task.etaMs / 1000) : null;
+      return {
+        title: engine ? engine.title : task.title,
+        detail: engine
+          ? engine.detail
+          : task.detail || [
+            Number.isFinite(task.processedSeconds) ? `${formatClock(task.processedSeconds)} elaborati` : 'Avvio…',
+            speed ? `${speed} tempo reale` : null,
+            eta ? `restano ~${eta}` : null,
+          ].filter(Boolean).join(' · '),
+        frac: engine ? engine.frac : task.frac,
+        startedAt: task.startedAt,
+        onCancel: task.cancellable === false ? null : handleCancelTask,
+        hint: task.hint,
+      };
+    }
+    // Il caricamento rapido (metadati, < 1 s) resta nella barra in linea: il dock
+    // compare solo per le fasi lunghe (motore, analisi) dei formati non letti dal browser.
+    if (loadJob?.active && (loadJob.stage === 'engine' || loadJob.stage === 'analysis')) {
+      const engine = loadJob.stage === 'engine' ? describeEngine(engineInfo) : null;
+      return {
+        title: engine ? engine.title : loadJob.stage === 'analysis' ? 'Analizzo il file' : `Apro ${loadJob.fileName}`,
+        detail: engine ? engine.detail : loadJob.fileName,
+        frac: engine ? engine.frac : null,
+        startedAt: loadJob.startedAt,
+        onCancel: handleCancelAnalysis,
+      };
+    }
+    return null;
+  })();
+
+  const showStickyCta = Boolean(audioFile) && canExport && !isExporting && !activity && !doneNote;
+  const deviceLoadLimit = mobileLoadLimitBytes();
+
   return (
-    <div className={`shell${showStickyCta ? ' shell-has-cta' : ''}`}>
+    <div className={`shell${showStickyCta || activity || doneNote ? ' shell-has-cta' : ''}`}>
       <div className="aurora aurora-left" />
       <div className="aurora aurora-right" />
 
@@ -2762,7 +3168,7 @@ export default function App() {
         </div>
       ) : null}
 
-      <header className="topbar">
+      <header className={`topbar${audioFile ? ' topbar-compact' : ''}`}>
         <div>
           <p className="eyebrow">Audio cutter pensato per GitHub Pages</p>
           <h1>
@@ -2895,38 +3301,34 @@ export default function App() {
                 className="sr-only"
                 aria-label="Scegli un file audio"
               />
-              <span className="dropzone-kicker">Drag & drop oppure click</span>
-              <strong>Carica un file audio</strong>
+              <span className="dropzone-kicker">{isBusy ? 'Attendi…' : 'Trascina qui oppure tocca'}</span>
+              <strong>{audioFile ? 'Carica un altro file audio' : 'Carica un file audio'}</strong>
               <p>
-                Supporto pensato per i formati più comuni. Il file resta locale e non viene
-                caricato su server esterni.
+                MP3, M4A, WAV, OGG, FLAC, AAC, WMA, AIFF… Il file resta sul tuo dispositivo:
+                nessun upload.
               </p>
+              {Number.isFinite(deviceLoadLimit) ? (
+                <span className="dropzone-limit">Su questo dispositivo fino a ~{Math.round(deviceLoadLimit / 1024 / 1024)} MB</span>
+              ) : null}
             </label>
           ) : null}
 
           <div className="status-strip">
-            <div>
-              <span className={`status-dot status-${engineState}`} />
-              <strong>{engineState === 'ready' ? 'Motore pronto' : 'Motore locale'}</strong>
-            </div>
+            <EngineChip
+              engineInfo={engineInfo}
+              onRetry={() => {
+                ensureEngineReady().catch(() => {});
+              }}
+            />
             <p role="status" aria-live="polite">{statusText}</p>
           </div>
 
-          <div className="progress-track" aria-hidden="true">
-            <span
-              className={`progress-bar ${isBusy ? 'progress-bar-busy' : ''}`}
-              style={{ transform: `scaleX(${clamp(phaseProgress || 0.02, 0, 1)})` }}
-            />
-          </div>
+          {!audioFile && errorText ? <p className="error-text" role="alert">{errorText}</p> : null}
 
           {loadJob?.active ? (
             <LoadingBar
-              job={loadJob.frac === null || loadJob.frac === undefined
-                ? loadJob
-                : {
-                  ...loadJob,
-                  frac: combineLoadProgress({ stage: loadJob.stage, stageFrac: loadJob.frac }),
-                }}
+              job={loadJob}
+              engineInfo={engineInfo}
               onCancel={handleCancelAnalysis}
             />
           ) : (
@@ -2955,7 +3357,23 @@ export default function App() {
                 </button>
               </div>
 
-              {useNativePreview ? (
+              {audioFile.browserPlayable === false ? (
+                <div className="native-preview">
+                  <p className="native-note">
+                    Il browser non sa riprodurre il formato {audioFile.formatLabel}. Puoi già tagliare
+                    per tempi (mm:ss) o in parti uguali ed esportare in M4A/MP3; per ascoltare e usare
+                    la forma d’onda crea un’anteprima leggera (l’export userà comunque l’originale).
+                  </p>
+                  <button
+                    type="button"
+                    className="primary-button"
+                    onClick={handleMakePlayablePreview}
+                    disabled={isBusy}
+                  >
+                    Crea anteprima ascoltabile
+                  </button>
+                </div>
+              ) : useNativePreview ? (
                 <NativeAudioPreview
                   ref={waveformRef}
                   src={audioFile.objectUrl}
@@ -2981,10 +3399,11 @@ export default function App() {
                   onBookmarkJump={handleBookmarkJump}
                   onLoadingProgress={handleWaveformProgress}
                   onWaveformError={handleWaveformError}
+                  sampleRate={waveformRate}
                 />
               )}
               {waveformError ? <p className="error-text" role="alert">{waveformError}</p> : null}
-              <div role="timer" aria-live="polite" className="sr-only">
+              <div role="timer" className="sr-only">
                 {isPlaying ? 'In riproduzione' : 'In pausa'} {formatClock(currentTime)} di {formatClock(audioFile.duration)}
               </div>
 
@@ -3039,7 +3458,7 @@ export default function App() {
 
           {audioFile ? (
             <details className="advanced-disclosure">
-              <summary>Strumenti avanzati: rileva silenzi e pulisci audio</summary>
+              <summary>Pulizia audio professionale e capitoli automatici</summary>
               <AutomationPanel
                 silenceThresholdDb={silenceThresholdDb}
                 silenceMinDuration={silenceMinDuration}
@@ -3049,14 +3468,22 @@ export default function App() {
                 onSilenceMinSegmentChange={setSilenceMinSegment}
                 onDetectSilences={handleDetectSilences}
                 cleanupPreset={cleanupPreset}
-                onCleanupPresetChange={setCleanupPreset}
+                onCleanupPresetChange={(presetId) => {
+                  setCleanupPreset(presetId);
+                  setCleanupPreview(null);
+                }}
+                shortenPauses={shortenPauses}
+                onShortenPausesChange={setShortenPauses}
+                cleanupEstimateLabel={cleanupEstimateLabel}
+                cleanupPreview={cleanupPreview}
+                onCleanupPreview={handleCleanupPreview}
+                onCloseCleanupPreview={() => setCleanupPreview(null)}
                 onApplyCleanup={handleApplyCleanup}
                 onRestoreOriginal={handleRestoreOriginal}
                 hasOriginalBackup={Boolean(originalAudioBackup)}
-                hasCleanedAudio={Boolean(originalAudioBackup)}
+                appliedCleanup={appliedCleanup}
                 disabled={isBusy}
                 lastDetectionSummary={lastDetectionSummary}
-                audioDurationSeconds={audioFile?.duration ?? 0}
               />
             </details>
           ) : null}
@@ -3247,7 +3674,7 @@ export default function App() {
               exportBitrate={exportBitrate}
               onExportBitrateChange={setExportBitrate}
               fastCopy={fastCopy}
-              onFastCopyChange={setFastCopy}
+              onFastCopyChange={handleSpeedModeChange}
               fadeSeconds={fadeSeconds}
               onFadeChange={setFadeSeconds}
               exportDest={exportDest}
@@ -3266,6 +3693,10 @@ export default function App() {
               isBusy={isBusy}
               isExporting={isExporting}
               exportDetail={exportDetail}
+              engineInfo={engineInfo}
+              naturalFormatId={naturalFormatId}
+              effectiveFormatId={effectiveFormatId}
+              exportEstimate={exportEstimate}
               failedExportIndex={failedExportIndex}
               onExport={processAndDownload}
               onCancelExport={handleCancelExport}
@@ -3467,10 +3898,12 @@ export default function App() {
       <StickyExportBar
         visible={showStickyCta}
         partsCount={plan.segments.length}
-        formatLabel={getExportFormat(exportFormat).label}
+        formatLabel={formatBadge}
+        speedHint={exportEstimate ? exportEstimate.label : ''}
         disabled={!canExport}
         onExport={processAndDownload}
       />
+      <ActivityDock activity={activity} done={activity ? null : doneNote} />
     </div>
   );
 }

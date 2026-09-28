@@ -1,9 +1,10 @@
-import { describe, it } from 'node:test';
+import { describe, it, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   decodeProbeText,
   hasAudioStreamText,
   parseFfmpegInputLog,
+  parseProbeJson,
   decideAudioAcceptance,
 } from './probe.js';
 
@@ -124,4 +125,18 @@ describe('decideAudioAcceptance (bug produzione)', () => {
     assert.equal(decision.accept, false);
     assert.match(decision.error, /Impossibile verificare/);
   });
+});
+
+test('parseProbeJson reads duration and stream types regardless of exit code', () => {
+  const json = '{"programs":[],"streams":[{"codec_type":"audio"}],"format":{"duration":"49.000000"}}';
+  assert.deepEqual(parseProbeJson(json), { ok: true, durationSeconds: 49, hasAudio: true, hasVideo: false });
+  const bytes = new TextEncoder().encode('{"streams":[{"codec_type":"video"}],"format":{"duration":"N/A"}}');
+  const video = parseProbeJson(bytes);
+  assert.equal(video.ok, true);
+  assert.equal(video.hasAudio, false);
+  assert.equal(video.hasVideo, true);
+  assert.ok(Number.isNaN(video.durationSeconds));
+  assert.equal(parseProbeJson('').ok, false);
+  assert.equal(parseProbeJson('not json').ok, false);
+  assert.equal(parseProbeJson('{"streams":[]}').ok, false);
 });

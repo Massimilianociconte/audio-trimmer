@@ -1,15 +1,58 @@
+import { copyFileSync, existsSync, statSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { join } from 'node:path';
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 
+// Peso esatto del wasm del motore: la barra di download resta precisa anche
+// quando il server comprime la risposta (content-length ≠ byte decompressi).
+function ffmpegWasmBytes() {
+  try {
+    const require = createRequire(import.meta.url);
+    const corePath = require.resolve('@ffmpeg/core');
+    return statSync(corePath.replace(/ffmpeg-core\.js$/, 'ffmpeg-core.wasm')).size;
+  } catch {
+    return 32 * 1024 * 1024;
+  }
+}
+
+// GitHub Pages: 404.html = index.html (fallback SPA). emptyOutDir la cancella
+// a ogni build: rigenerarla qui evita di perderla nei deploy.
+function githubPages404() {
+  let outDir = 'docs';
+  return {
+    name: 'github-pages-404',
+    apply: 'build',
+    configResolved(config) {
+      outDir = config.build.outDir;
+    },
+    closeBundle() {
+      const index = join(outDir, 'index.html');
+      if (existsSync(index)) {
+        copyFileSync(index, join(outDir, '404.html'));
+      }
+    },
+  };
+}
+
 export default defineConfig({
   base: './',
+  define: {
+    __FFMPEG_WASM_BYTES__: JSON.stringify(ffmpegWasmBytes()),
+  },
+  // Il pre-bundle di Vite sposta @ffmpeg/ffmpeg in .vite/deps ma non il suo
+  // worker: in dev il worker non si carica e ffmpeg.load() resta appeso.
+  optimizeDeps: {
+    exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
+  },
   build: {
     outDir: 'docs',
     emptyOutDir: true,
   },
   plugins: [
     react(),
+    githubPages404(),
     VitePWA({
       // 'prompt': il nuovo SW resta in attesa finché l'utente preme "Ricarica ora"
       // (autoUpdate ricaricherebbe da solo, anche mentre si taglia audio).

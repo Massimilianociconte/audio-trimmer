@@ -125,7 +125,10 @@ export function buildExportArgs({
   const length = formatFfmpegTime(segment.duration);
 
   if (fastCopy && format.supportsFastCopy) {
-    return [
+    // Copia pacchetti: nessuna ricodifica, qualità identica e decine di volte
+    // più veloce. Precisione al frame (~23-26 ms per AAC/MP3). make_zero evita
+    // timestamp negativi dopo il seek (player che sbagliano durata/inizio).
+    const copyArgs = [
       '-hide_banner',
       '-nostats',
       '-y',
@@ -136,8 +139,13 @@ export function buildExportArgs({
       '-vn',
       '-sn',
       '-c:a', 'copy',
-      outputName,
+      '-avoid_negative_ts', 'make_zero',
     ];
+    if (format.needsMovflags) {
+      copyArgs.push('-movflags', '+faststart');
+    }
+    copyArgs.push(outputName);
+    return copyArgs;
   }
 
   const args = [
@@ -178,6 +186,11 @@ export function buildExportArgs({
       Math.abs(candidate - bitrateKbps) < Math.abs(best - bitrateKbps) ? candidate : best,
     );
     args.push('-c:a', format.codec, '-b:a', `${nearest}k`);
+    if (format.id === 'm4a') {
+      // Coder AAC "fast": 2x più veloce del twoloop a 128k e ~9x a 256k
+      // (misurato nel core wasm single-thread), differenza non udibile.
+      args.push('-aac_coder', 'fast');
+    }
   }
 
   if (format.needsMovflags) {
@@ -186,6 +199,21 @@ export function buildExportArgs({
 
   args.push(outputName);
   return args;
+}
+
+/**
+ * Formato di uscita in cui la sorgente si può tagliare SENZA ricodifica
+ * (stesso codec/container), null se serve convertire.
+ */
+export function naturalCopyFormat(sourceExtension) {
+  const src = String(sourceExtension || '').toLowerCase();
+  if (src === '.mp3') {
+    return 'mp3';
+  }
+  if (['.m4a', '.aac', '.mp4'].includes(src)) {
+    return 'm4a';
+  }
+  return null;
 }
 
 export function canFastCopy({ formatId, sourceExtension }) {
@@ -214,4 +242,31 @@ export function estimateExportBytes({ durationSeconds, bitrateKbps, formatId }) 
   }
   const kbps = Number(bitrateKbps) || format.defaultBitrate || 128;
   return Math.round((kbps * 1000 * durationSeconds) / 8);
+}
+
+/**
+ * Traduce la coda del log FFmpeg in un messaggio comprensibile.
+ * Ritorna '' se non riconosce la causa (resta il messaggio generico).
+ */
+export function describeFfmpegFailure(logText) {
+  const text = String(logText ?? '');
+  if (!text) {
+    return '';
+  }
+  if (/matches no streams|does not contain any stream|Output file .* does not contain any stream/i.test(text)) {
+    return 'Il file non contiene una traccia audio utilizzabile.';
+  }
+  if (/Cannot enlarge memory|out of memory|memory access out of bounds|Cannot allocate memory|OOM/i.test(text)) {
+    return 'Memoria del browser esaurita: chiudi altre schede, riduci il numero di parti o usa un file più leggero.';
+  }
+  if (/Invalid data found when processing input|moov atom not found|could not find codec parameters/i.test(text)) {
+    return 'Il file sembra danneggiato o in un formato non supportato.';
+  }
+  if (/Unknown encoder|Encoder not found/i.test(text)) {
+    return 'Formato di uscita non supportato da questo motore: scegli M4A o MP3.';
+  }
+  if (/No space left|Quota|QuotaExceeded/i.test(text)) {
+    return 'Spazio su disco esaurito durante la scrittura.';
+  }
+  return '';
 }

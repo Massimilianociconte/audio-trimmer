@@ -27,6 +27,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     onWaveformClick,
     onLoadingProgress,
     onWaveformError,
+    sampleRate = 8000,
   },
   ref,
 ) {
@@ -41,6 +42,10 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
   const latestRateRef = useRef(playbackRate);
   const latestZoomRef = useRef(zoom);
   const [readyRevision, setReadyRevision] = useState(0);
+  const [isDecoded, setIsDecoded] = useState(false);
+  // Se il browser rifiuta la frequenza ridotta si ripiega a 8 kHz (una volta).
+  const [fallbackRate, setFallbackRate] = useState(null);
+  const decodeRate = fallbackRate ?? sampleRate;
 
   callbacksRef.current = {
     onReady,
@@ -106,13 +111,15 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     }
 
     isReadyRef.current = false;
+    setIsDecoded(false);
 
     const regionsPlugin = RegionsPlugin.create();
+    // Intervalli adattivi (default del plugin in base ai px/secondo): con un
+    // intervallo fisso di 1s una lezione di 2h creava 7.200 tacche DOM
+    // ricalcolate a ogni zoom/scroll, pesantissime sui dispositivi deboli.
     const timelinePlugin = TimelinePlugin.create({
       height: 16,
       insertPosition: 'beforebegin',
-      timeInterval: 1,
-      primaryLabelInterval: 5,
       style: {
         fontSize: '10px',
         color: '#715742',
@@ -135,8 +142,11 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       cursorWidth: 2,
       barWidth: 2,
       barGap: 1,
-      barRadius: 2,
+      // Niente barRadius: le barre arrotondate costano un path per barra.
       height: 120,
+      minPxPerSec: Math.max(0, Number(latestZoomRef.current) || 0),
+      // Il PCM decodificato serve solo al disegno: a bassa frequenza pesa molto meno.
+      sampleRate: decodeRate,
       normalize: true,
       dragToSeek: true,
       plugins: [regionsPlugin, timelinePlugin, hoverPlugin],
@@ -166,6 +176,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       } catch (error) {
         // ignore: zoom will re-apply when the user moves the slider
       }
+      setIsDecoded(true);
       callbacksRef.current.onReady?.(instance.getDuration());
       setReadyRevision((revision) => revision + 1);
     };
@@ -184,6 +195,12 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     };
     const handleDecode = () => callbacksRef.current.onLoadingProgress?.(0.95);
     const handleDecodeError = (error) => {
+      if (decodeRate < 8000) {
+        // Frequenza ridotta non accettata da questo browser: riprova a 8 kHz.
+        setFallbackRate(8000);
+        return;
+      }
+      setIsDecoded(true);
       callbacksRef.current.onWaveformError?.(
         error?.message || String(error) || 'Decodifica anteprima non riuscita',
       );
@@ -248,7 +265,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       bookmarkRegionsRef.current = new Map();
       loopRegionRef.current = null;
     };
-  }, [src]);
+  }, [src, decodeRate]);
 
   useEffect(() => {
     const ws = wsRef.current;
@@ -267,7 +284,8 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
 
   useEffect(() => {
     const ws = wsRef.current;
-    if (!ws || typeof zoom !== 'number' || zoom <= 0) {
+    // zoom 0 = adatta alla larghezza (va applicato anche per tornare alla panoramica).
+    if (!ws || typeof zoom !== 'number' || zoom < 0) {
       return;
     }
     if (!isInstanceReady(ws)) {
@@ -487,6 +505,11 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       aria-label="Forma d'onda dell'audio caricato. Usa i pulsanti Taglia qui e Segnalibro o gli slider dei punti di taglio per modificare."
     >
       <div ref={containerRef} className="waveform-container" />
+      {!isDecoded ? (
+        <div className="waveform-skeleton" aria-hidden="true">
+          <span>Disegno la forma d’onda…</span>
+        </div>
+      ) : null}
     </div>
   );
 });
