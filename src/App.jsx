@@ -61,6 +61,12 @@ import {
   loadProject as loadStoredProject,
   saveProject as saveStoredProject,
 } from './lib/storage.js';
+import {
+  decideAudioAcceptance,
+  decodeProbeText,
+  hasAudioStreamText,
+  parseFfmpegInputLog,
+} from './lib/probe.js';
 
 const ACCEPTED_AUDIO_TYPES = [
   'audio/*',
@@ -110,11 +116,16 @@ function createPointId() {
 
 function getAudioMime(file, extension) {
   if (file?.type) {
-    return file.type;
+    // Normalizza "audio/webm;codecs=opus" ecc. prima di persistere riusare il type.
+    return String(file.type).split(';')[0].trim() || file.type;
   }
 
   const mimeByExtension = {
     '.aac': 'audio/aac',
+    '.aif': 'audio/aiff',
+    '.aiff': 'audio/aiff',
+    '.alac': 'audio/mp4',
+    '.amr': 'audio/amr',
     '.flac': 'audio/flac',
     '.m4a': 'audio/mp4',
     '.mp3': 'audio/mpeg',
@@ -124,7 +135,7 @@ function getAudioMime(file, extension) {
     '.wma': 'audio/x-ms-wma',
   };
 
-  return mimeByExtension[extension] ?? 'application/octet-stream';
+  return mimeByExtension[String(extension ?? '').toLowerCase()] ?? 'application/octet-stream';
 }
 
 function getFormatLabel(file, extension) {
@@ -393,12 +404,14 @@ export default function App() {
 
       objectUrl = URL.createObjectURL(file);
 
+      let browserDurationOk = false;
       try {
         duration = await readAudioDurationFromBrowser(objectUrl);
         if (isStale()) {
           URL.revokeObjectURL(objectUrl);
           return false;
         }
+        browserDurationOk = Number.isFinite(duration) && duration > 0;
         technicalMessage = 'Durata recuperata direttamente dal browser.';
       } catch {
         if (isStale()) {
@@ -455,7 +468,7 @@ export default function App() {
         const probeRaw = await ffmpeg.readFile(probeOutputName, 'utf8');
         await safeDelete(ffmpeg, probeOutputName);
         activeProbeRef.current = '';
-        duration = Number(String(probeRaw).trim());
+        duration = Number(decodeProbeText(probeRaw).trim());
         technicalMessage = 'Durata recuperata con ffprobe.';
       }
 
@@ -467,31 +480,96 @@ export default function App() {
         throw new Error('Durata non valida. Prova con un file audio differente.');
       }
 
-      // Verifica che esista davvero una traccia audio (evita video/mascherati accettati per durata).
-      try {
+      // Verifica resiliente della traccia audio:
+      // - se ffprobe elenca gli stream e nessuno è audio => rifiuto (vero positivo)
+      // - se ffprobe fallisce (exit != 0, -o non scritto, readFile vuota) => NON si
+      //   deve mascherare da "nessuna traccia": fallback su `ffmpeg -i` e, in ultima
+      //   istanza, sulla durata già validata dal browser. L'export segnalerà l'errore reale.
+      {
         const streamProbeName = `streams-${Date.now()}-${analysisId}.txt`;
         activeProbeRef.current = streamProbeName;
-        const streamExit = await ffmpeg.ffprobe([
-          '-v', 'error',
-          '-show_entries', 'stream=codec_type',
-          '-of', 'csv=p=0',
-          virtualInputName,
-          '-o', streamProbeName,
-        ]);
-        const streamRaw = streamExit === 0 ? await ffmpeg.readFile(streamProbeName, 'utf8') : '';
-        await safeDelete(ffmpeg, streamProbeName);
-        activeProbeRef.current = '';
+        let ffprobeOk = false;
+        let ffprobeHasAudio = false;
+        let ffprobeDetail = '';
+        try {
+          const streamExit = await ffmpeg.ffprobe([
+            '-v', 'error',
+            '-show_entries', 'stream=codec_type',
+            '-of', 'csv=p=0',
+            virtualInputName,
+            '-o', streamProbeName,
+          ]);
+          if (streamExit === 0) {
+            try {
+              const raw = await ffmpeg.readFile(streamProbeName, 'utf8');
+              const text = decodeProbeText(raw);
+              ffprobeDetail = text.slice(0, 200);
+              if (text.trim().length > 0) {
+                ffprobeOk = true;
+                ffprobeHasAudio = hasAudioStreamText(text);
+              }
+            } catch (readError) {
+              ffprobeDetail = readError?.message ?? 'readFile fallita';
+            }
+          } else {
+            ffprobeDetail = `ffprobe exit ${streamExit}`;
+          }
+        } catch (probeError) {
+          ffprobeDetail = probeError?.message ?? String(probeError);
+        } finally {
+          await safeDelete(ffmpeg, streamProbeName);
+          activeProbeRef.current = '';
+        }
         if (isStale()) {
           return false;
         }
-        if (!String(streamRaw).toLowerCase().includes('audio')) {
-          throw new Error('Nessuna traccia audio trovata in questo file. Scegli un file audio valido.');
+
+        if (!ffprobeOk || !ffprobeHasAudio) {
+          // Fallback: `ffmpeg -i` stampa sempre gli stream nel log (esce != 0 senza output).
+          let logHasAudio = false;
+          let logHasVideo = false;
+          try {
+            const logs = [];
+            const capture = ({ message }) => {
+              if (typeof message === 'string') {
+                logs.push(message);
+              }
+            };
+            ffmpeg.on('log', capture);
+            try {
+              await ffmpeg.exec(['-hide_banner', '-i', virtualInputName]);
+            } finally {
+              ffmpeg.off('log', capture);
+            }
+            const parsed = parseFfmpegInputLog(logs.join('\n'));
+            logHasAudio = parsed.hasAudio;
+            logHasVideo = parsed.hasVideo;
+          } catch {
+            // Log non disponibile: la decisione sotto userà il fallback browser.
+          }
+          if (isStale()) {
+            return false;
+          }
+
+          const decision = decideAudioAcceptance({
+            ffprobeOk,
+            ffprobeHasAudio,
+            ffmpegLogHasAudio: logHasAudio,
+            ffmpegLogHasVideo: logHasVideo,
+            browserDurationOk,
+          });
+          if (!decision.accept) {
+            throw new Error(decision.error);
+          }
+          if (decision.reason === 'browser-duration-fallback') {
+            technicalMessage += ' (traccia verificata via browser: probe ffmpeg non conclusiva).';
+          } else if (decision.reason === 'ffmpeg-log-audio') {
+            technicalMessage += ' (traccia audio confermata via ffmpeg).';
+          }
+          if (ffprobeDetail && !ffprobeOk) {
+            console.warn('[audio-cutter] stream probe inconclusiva:', ffprobeDetail);
+          }
         }
-      } catch (probeError) {
-        if (probeError?.message?.includes('Nessuna traccia audio')) {
-          throw probeError;
-        }
-        // Probe stream non disponibile: prosegui (l'export segnalerà l'errore reale).
       }
 
       if (objectUrlRef.current) {
