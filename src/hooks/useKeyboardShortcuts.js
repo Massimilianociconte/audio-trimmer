@@ -45,6 +45,10 @@ export function useKeyboardShortcuts(handlers, { enabled = true } = {}) {
       }
 
       if (key === ' ' || event.code === 'Space') {
+        // Su un bottone focalizzato vince il click nativo (altrimenti doppio toggle).
+        if (event.target instanceof HTMLElement && event.target.tagName === 'BUTTON') {
+          return;
+        }
         if (map.togglePlay) {
           event.preventDefault();
           map.togglePlay();

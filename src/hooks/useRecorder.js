@@ -168,6 +168,9 @@ export function useRecorder() {
       recorder.addEventListener('error', (event) => {
         const err = event?.error ?? event;
         setError(err?.message || 'Errore di registrazione.');
+        // microfono/loop fermi: niente interval, rAF, AudioContext o mic aperti.
+        stopMonitors();
+        releaseStream();
       });
 
       startTimestampRef.current = Date.now();

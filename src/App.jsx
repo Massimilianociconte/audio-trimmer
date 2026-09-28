@@ -12,6 +12,7 @@ import {
   sanitizeFileName,
 } from './lib/export.js';
 import {
+  HEAVY_INPUT_BYTES,
   RETAIN_BLOBS_BYTES,
   adviseExportStrategy,
   clearCheckpoint,
@@ -240,6 +241,25 @@ function downloadBlob(blob, filename) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1200);
 }
 
+async function assertStorageFor(bytes) {
+  try {
+    const estimate = await navigator.storage?.estimate?.();
+    if (estimate?.quota && estimate?.usage !== undefined) {
+      const free = estimate.quota - estimate.usage;
+      if (bytes > free) {
+        throw new Error(
+          `Spazio insufficiente nel browser (mancano ~${Math.ceil((bytes - free) / 1024 / 1024)} MB). Elimina vecchi progetti e riprova.`,
+        );
+      }
+    }
+  } catch (estimateError) {
+    if (estimateError?.message?.includes('Spazio insufficiente')) {
+      throw estimateError;
+    }
+    // estimate opzionale: ignora
+  }
+}
+
 export default function App() {
   const inputRef = useRef(null);
   const objectUrlRef = useRef('');
@@ -330,9 +350,7 @@ export default function App() {
   const [baseNameOverride, setBaseNameOverride] = useState('');
   const [segmentNames, setSegmentNames] = useState({});
   const [isExporting, setIsExporting] = useState(false);
-  const [exportProgress, setExportProgress] = useState(0);
   const [exportDetail, setExportDetail] = useState(null);
-  const [currentSegmentIndex, setCurrentSegmentIndex] = useState(0);
   const [previewIndex, setPreviewIndex] = useState(null);
   const [failedExportIndex, setFailedExportIndex] = useState(null);
   const [chaptersStatus, setChaptersStatus] = useState('');
@@ -340,7 +358,11 @@ export default function App() {
   const [projectJsonStatus, setProjectJsonStatus] = useState('');
   const [loadJob, setLoadJob] = useState(null);
   const [waveformError, setWaveformError] = useState('');
+  const [swWaiting, setSwWaiting] = useState(false);
   const loadAbortRef = useRef(null);
+  const inputStaleRef = useRef(false);
+  const audioFileRef = useRef(null);
+  const loadJobRef = useRef(null);
 
   const plan = buildPlan({
     duration: audioFile?.duration ?? 0,
@@ -351,6 +373,18 @@ export default function App() {
 
   const backupUrlRef = useRef(null);
   backupUrlRef.current = originalAudioBackup?.objectUrl ?? null;
+
+  useEffect(() => {
+    audioFileRef.current = audioFile;
+  }, [audioFile]);
+  useEffect(() => {
+    loadJobRef.current = loadJob;
+  }, [loadJob]);
+  useEffect(() => {
+    const handleSwWaiting = () => setSwWaiting(true);
+    window.addEventListener('app-sw-waiting', handleSwWaiting);
+    return () => window.removeEventListener('app-sw-waiting', handleSwWaiting);
+  }, []);
 
   const effectiveBaseName = baseNameOverride.trim() || audioFile?.baseName || 'audio';
 
@@ -459,6 +493,9 @@ export default function App() {
 
     let objectUrl = '';
     let keepObjectUrl = false;
+    let ffmpeg = null;
+    let cleanedStale = false;
+    const hadBackup = Boolean(originalAudioBackup);
 
     setErrorText('');
     setLastResult(null);
@@ -486,9 +523,10 @@ export default function App() {
       let technicalMessage = 'File pronto.';
       let formatLabel = getFormatLabel(file, outputExtension);
 
-      if (file.size > 350 * 1024 * 1024) {
+      if (file.size > HEAVY_INPUT_BYTES) {
+        const heavyMb = Math.round(HEAVY_INPUT_BYTES / 1024 / 1024);
         technicalMessage = 'File molto grande: l’analisi potrebbe richiedere tempo e memoria.';
-        setStatusText('File molto grande (>350 MB): analisi in corso, potrebbe volerci un po’...');
+        setStatusText(`File molto grande (>${heavyMb} MB): analisi in corso, potrebbe volerci un po’...`);
       }
 
       objectUrl = URL.createObjectURL(file);
@@ -517,7 +555,7 @@ export default function App() {
       setLoadJob((previous) => previous?.active
         ? { ...previous, stage: 'engine', frac: null, bytesRead: 0, totalBytes: 0 }
         : previous);
-      const ffmpeg = await ensureEngineReady({
+      ffmpeg = await ensureEngineReady({
         onEngineProgress: (loaded, total) => {
           if (isStale()) {
             return;
@@ -548,6 +586,7 @@ export default function App() {
       }
       activeInputRef.current = '';
       activeProbeRef.current = '';
+      cleanedStale = true;
 
       // Lettura con progresso reale (una sola copia, trasferibile al worker).
       setLoadJob((previous) => previous?.active
@@ -749,7 +788,6 @@ export default function App() {
       setFastCopy(false);
       setFadeSeconds(0);
       setIsExporting(false);
-      setExportProgress(0);
       for (const url of lastResultUrlsRef.current) {
         try {
           URL.revokeObjectURL(url);
@@ -785,6 +823,24 @@ export default function App() {
       console.error(error);
       if (analysisIdRef.current !== analysisId) {
         return false;
+      }
+      // L'analisi fallita non deve lasciare orfani nella FS wasm né ref incoerenti.
+      try {
+        if (ffmpeg) {
+          await safeDelete(ffmpeg, virtualInputName);
+          await safeDelete(ffmpeg, probeOutputName);
+        }
+      } catch {
+        // ignore: pulizia best-effort
+      }
+      activeProbeRef.current = '';
+      if (cleanedStale) {
+        // Il cleanup iniziale ha già cancellato il file del backup:
+        // lo stato non deve puntare a un file inesistente.
+        activeInputRef.current = '';
+        if (hadBackup) {
+          setOriginalAudioBackup(null);
+        }
       }
       setErrorText(error.message || 'Non sono riuscito ad analizzare il file.');
       setStatusText('Qualcosa è andato storto durante l’analisi del file.');
@@ -1123,8 +1179,18 @@ export default function App() {
 
   const handleWaveformReady = useCallback((duration) => {
     setPhaseProgress(0);
+    const current = audioFileRef.current;
+    const job = loadJobRef.current;
+    // Decode di un file precedente risolta dopo il cambio: non toccare il job nuovo.
+    if (job?.active && current && job.fileName && job.fileName !== current.name) {
+      return;
+    }
     setLoadJob(null);
-    if (Number.isFinite(duration) && duration > 0) {
+    if (current && Number.isFinite(duration) && duration > 0) {
+      // Seconda guardia: una durata molto diversa da quella caricata è di un altro file.
+      if (Math.abs(duration - current.duration) > Math.max(5, (current.duration || 0) * 0.2)) {
+        return;
+      }
       setAudioFile((previous) =>
         previous && Math.abs((previous.duration ?? 0) - duration) > 0.05
           ? { ...previous, duration }
@@ -1134,6 +1200,11 @@ export default function App() {
   }, []);
 
   const handleWaveformProgress = useCallback((frac) => {
+    const current = audioFileRef.current;
+    const job = loadJobRef.current;
+    if (job?.active && current && job.fileName && job.fileName !== current.name) {
+      return;
+    }
     setLoadJob((previous) => {
       if (!previous?.active || previous.stage !== 'waveform') {
         return previous;
@@ -1143,6 +1214,11 @@ export default function App() {
   }, []);
 
   const handleWaveformError = useCallback((message) => {
+    const current = audioFileRef.current;
+    const job = loadJobRef.current;
+    if (job?.active && current && job.fileName && job.fileName !== current.name) {
+      return;
+    }
     setLoadJob(null);
     setWaveformError(
       'Anteprima grafica non disponibile per questo file su questo browser, ma taglio ed export restano attivi. ' +
@@ -1259,6 +1335,7 @@ export default function App() {
 
     try {
       const ffmpeg = await ensureEngineReady();
+      await ensureInputPresent(ffmpeg);
       setPhaseProgress(0.4);
 
       const filter = buildSilenceDetectFilter({
@@ -1375,6 +1452,7 @@ export default function App() {
 
     try {
       ffmpeg = await ensureEngineReady();
+      await ensureInputPresent(ffmpeg);
       setPhaseProgress((current) => Math.max(current, 0.1));
 
       const filterChain = buildCleanupFilter(cleanupPreset);
@@ -1521,22 +1599,7 @@ export default function App() {
       const audioBlob = sameAsSource
         ? sourceFileRef.current
         : await (await fetch(audioFile.objectUrl)).blob();
-      try {
-        const estimate = await navigator.storage?.estimate?.();
-        if (estimate?.quota && estimate?.usage !== undefined) {
-          const free = estimate.quota - estimate.usage;
-          if (audioBlob.size > free) {
-            throw new Error(
-              `Spazio insufficiente nel browser (mancano ~${Math.ceil((audioBlob.size - free) / 1024 / 1024)} MB). Elimina vecchi progetti e riprova.`,
-            );
-          }
-        }
-      } catch (estimateError) {
-        if (estimateError?.message?.includes('Spazio insufficiente')) {
-          throw estimateError;
-        }
-        // estimate opzionale: ignora
-      }
+      await assertStorageFor(audioBlob.size);
       const now = Date.now();
       const record = await saveStoredProject({
         id: currentProjectId ?? undefined,
@@ -1549,6 +1612,9 @@ export default function App() {
         audioBlob,
         mode,
         equalParts,
+        exportFormat,
+        exportBitrate,
+        fadeSeconds,
         customCuts: customCuts.map((cut) => ({
           id: cut.id,
           value: cut.value,
@@ -1628,6 +1694,16 @@ export default function App() {
       if (typeof record.equalParts === 'number' && record.equalParts > 0) {
         setEqualParts(record.equalParts);
       }
+      // Impostazioni export salvate col progetto (vecchi record: default invariati).
+      if (typeof record.exportFormat === 'string') {
+        handleExportFormatChange(record.exportFormat);
+      }
+      if (typeof record.exportBitrate === 'number' && record.exportBitrate > 0) {
+        setExportBitrate(record.exportBitrate);
+      }
+      if (typeof record.fadeSeconds === 'number' && record.fadeSeconds >= 0) {
+        setFadeSeconds(Math.min(2, Math.max(0, record.fadeSeconds)));
+      }
       if (record.segmentNames && typeof record.segmentNames === 'object') {
         setSegmentNames(record.segmentNames);
       }
@@ -1673,12 +1749,19 @@ export default function App() {
         setProjectsError('Progetto non trovato.');
         return;
       }
+      // La copia ricopia l'intero blob: stesso pre-check quota del salvataggio.
+      await assertStorageFor(record.size ?? record.audioBlob?.size ?? 0);
       const { id: _dropped, ...rest } = record;
       await saveStoredProject({ ...rest, id: undefined, name: `${record.name || 'Progetto'} (copia)`, createdAt: Date.now() });
       await refreshProjects();
     } catch (error) {
       console.error(error);
-      setProjectsError(error.message || 'Duplicazione non riuscita.');
+      const isQuota = error?.name === 'QuotaExceededError' || /quota|spazio/i.test(error?.message ?? '');
+      setProjectsError(
+        isQuota
+          ? 'Spazio esaurito in IndexedDB. Elimina vecchi progetti e riprova.'
+          : error.message || 'Duplicazione non riuscita.',
+      );
     }
   }
 
@@ -1727,6 +1810,7 @@ export default function App() {
 
     try {
       ffmpeg = await ensureEngineReady();
+      await ensureInputPresent(ffmpeg);
       setPhaseProgress(0.4);
 
       const exportExitCode = await ffmpeg.exec([
@@ -1734,6 +1818,10 @@ export default function App() {
         '-nostats',
         '-i',
         audioFile.virtualInputName,
+        // Catena pulita per la trascrizione: resample 16kHz e taglia-rumore basso
+        // che ruba bit a 32k. Il downmix mono resta a -ac 1 (sicuro anche su mono).
+        '-af',
+        'aresample=16000,highpass=f=80',
         '-ac',
         '1',
         '-ar',
@@ -1868,6 +1956,26 @@ export default function App() {
     setStatusText('Annullamento export in corso…');
     // Interrompe un exec FFmpeg in corso; il motore verrà ricreato al prossimo uso.
     resetAfterAbort();
+    // Il terminate azzera la MEMFS: i nomi virtuali non sono più validi.
+    // Vengono reidratati pigramente da ensureInputPresent al prossimo uso.
+    activeInputRef.current = '';
+    activeProbeRef.current = '';
+    inputStaleRef.current = true;
+  }
+
+  /**
+   * Dopo un terminate (annullo export) il nuovo motore nasce con FS vuoto:
+   * riscrive l'audio corrente dal Blob in memoria prima di riusarlo.
+   */
+  async function ensureInputPresent(ffmpeg) {
+    if (!inputStaleRef.current || !audioFile) {
+      return;
+    }
+    const bytes = new Uint8Array(await (await fetch(audioFile.objectUrl)).arrayBuffer());
+    await ffmpeg.writeFile(audioFile.virtualInputName, bytes);
+    activeInputRef.current = audioFile.virtualInputName;
+    activeProbeRef.current = '';
+    inputStaleRef.current = false;
   }
 
   function handleDownloadSingle(part) {
@@ -2116,20 +2224,25 @@ export default function App() {
     }
     const format = getExportFormat(exportFormat);
     setErrorText('');
+    isBusyRef.current = true;
     setIsBusy(true);
     setStatusText(`Esporto la selezione ${formatClock(loopRegion.start)} → ${formatClock(loopRegion.end)}...`);
     const virtualName = `loop-${Date.now()}${format.extension}`;
+    const loopInputName = audioFile.virtualInputName;
+    const loopSourceExtension = audioFile.extension;
     let ffmpeg = null;
     try {
       ffmpeg = await ensureEngineReady();
+      await ensureInputPresent(ffmpeg);
       const args = buildExportArgs({
         segment: { start: loopRegion.start, duration: loopRegion.end - loopRegion.start },
-        inputName: audioFile.virtualInputName,
+        inputName: loopInputName,
         outputName: virtualName,
         formatId: format.id,
         bitrateKbps: exportBitrate,
-        fastCopy: fastCopy && canFastCopy({ formatId: format.id, sourceExtension: audioFile?.extension }),
-        fadeSeconds: 0,
+        fastCopy: fastCopy && canFastCopy({ formatId: format.id, sourceExtension: loopSourceExtension }),
+        // Micro-fade anti-click sui confini A-B (20ms, inudibile come dissolvenza).
+        fadeSeconds: 0.02,
       });
       const exitCode = await ffmpeg.exec(args);
       if (exitCode !== 0) {
@@ -2146,6 +2259,7 @@ export default function App() {
       if (ffmpeg) {
         await safeDelete(ffmpeg, virtualName);
       }
+      isBusyRef.current = false;
       setIsBusy(false);
     }
   }
@@ -2179,7 +2293,10 @@ export default function App() {
     clearPreview();
 
     // Snapshot del job: i controlli restano usabili mentre il job gira in background.
+    // Il flag sync chiude la race con analyzeFile (che controlla il ref, non lo state).
+    isBusyRef.current = true;
     const jobSegments = plan.segments.map((segment) => ({ ...segment }));
+    const jobInputName = audioFile.virtualInputName;
     const jobBaseName = effectiveBaseName;
     const jobFormatId = format.id;
     const jobBitrate = exportBitrate;
@@ -2252,7 +2369,6 @@ export default function App() {
 
     setIsBusy(true);
     setIsExporting(true);
-    setExportProgress(0);
     setExportDetail({
       active: true,
       segIndex: 0,
@@ -2281,6 +2397,7 @@ export default function App() {
 
     try {
       ffmpeg = await ensureEngineReady();
+      await ensureInputPresent(ffmpeg);
       if (destMode === 'zip-stream') {
         zipWritable = await zipFileHandle.createWritable();
         zipWriter = await createZipStreamWriter(zipWritable);
@@ -2329,11 +2446,8 @@ export default function App() {
               etaMs: etaMsRemaining({ bytesDone, bytesTotal: totalEstimate, throughputBps: throughput }),
             }
             : previous);
-          setExportProgress(frac);
           document.title = `(${index + 1}/${jobSegments.length} · ${Math.round(frac * 100)}%) Export audio…`;
         };
-        setCurrentSegmentIndex(index);
-        setExportProgress(index / jobSegments.length);
         setStatusText(
           `Creo parte ${index + 1} di ${jobSegments.length} in ${format.label} (${destMode})...`,
         );
@@ -2363,7 +2477,7 @@ export default function App() {
 
         const args = buildExportArgs({
           segment,
-          inputName: audioFile.virtualInputName,
+          inputName: jobInputName,
           outputName: virtualName,
           formatId: format.id,
           bitrateKbps: jobBitrate,
@@ -2392,6 +2506,8 @@ export default function App() {
         }
 
         if (segmentExitCode !== 0) {
+          // Il segmento parziale resterebbe orfano nella FS: eliminalo subito.
+          await safeDelete(ffmpeg, virtualName);
           const failed = new Error(
             `Non sono riuscito a esportare la parte ${index + 1} in ${format.label}.`,
           );
@@ -2496,7 +2612,6 @@ export default function App() {
         `Export ${format.id} ${format.bitrates.length ? `${jobBitrate}k` : 'lossless'}${effectiveFastCopy ? ' fast-copy' : ''}${jobFade ? ` fade ${jobFade}s` : ''} via ${destMode}: ${exportedParts.length} file.`,
       );
       setPhaseProgress(1);
-      setExportProgress(1);
     } catch (error) {
       console.error(error);
       const cancelled = exportAbortRef.current || error?.message === 'Export annullato.';
@@ -2544,6 +2659,13 @@ export default function App() {
           // ignore: il file parziale resta eliminabile dall'utente
         }
         zipWriter = null;
+      } else if (zipWritable) {
+        // createZipStreamWriter ha fallito dopo createWritable: sblocca il file.
+        try {
+          await zipWritable.abort();
+        } catch {
+          // ignore
+        }
       }
       if (ffmpeg) {
         for (const virtualName of createdVirtualNames) {
@@ -2554,6 +2676,7 @@ export default function App() {
       document.title = previousTitle;
       exportAbortRef.current = false;
       setExportDetail(null);
+      isBusyRef.current = false;
       setIsBusy(false);
       setIsExporting(false);
     }
@@ -2570,6 +2693,23 @@ export default function App() {
     <div className="shell">
       <div className="aurora aurora-left" />
       <div className="aurora aurora-right" />
+
+      {swWaiting ? (
+        <div className="update-banner" role="status">
+          <strong>Nuova versione disponibile.</strong>
+          <span>Ricarica per aggiornarla (fallo a lavoro finito).</span>
+          <button
+            type="button"
+            className="mini-button"
+            onClick={() => {
+              window.dispatchEvent(new CustomEvent('app-sw-skip'));
+              setSwWaiting(false);
+            }}
+          >
+            Ricarica ora
+          </button>
+        </div>
+      ) : null}
 
       <header className="topbar">
         <div>
@@ -2607,7 +2747,7 @@ export default function App() {
             </button>
           </div>
 
-          <div className="capture-switcher" role="tablist">
+          <div className="capture-switcher" role="toolbar" aria-label="Sorgente audio">
             <button
               type="button"
               className={activeCapture === 'none' ? 'capture-tab capture-tab-active' : 'capture-tab'}
@@ -2683,7 +2823,7 @@ export default function App() {
                 isLoading={projectsLoading}
                 disabled={isBusy}
               />
-              {projectsError ? <p className="error-text">{projectsError}</p> : null}
+              {projectsError ? <p className="error-text" role="alert">{projectsError}</p> : null}
             </>
           ) : null}
 
@@ -2701,7 +2841,8 @@ export default function App() {
                 accept={ACCEPTED_AUDIO_TYPES}
                 onChange={handleInputChange}
                 disabled={isBusy}
-                hidden
+                className="sr-only"
+                aria-label="Scegli un file audio"
               />
               <span className="dropzone-kicker">Drag & drop oppure click</span>
               <strong>Carica un file audio</strong>
@@ -2717,7 +2858,7 @@ export default function App() {
               <span className={`status-dot status-${engineState}`} />
               <strong>{engineState === 'ready' ? 'Motore pronto' : 'Motore locale'}</strong>
             </div>
-            <p>{statusText}</p>
+            <p role="status" aria-live="polite">{statusText}</p>
           </div>
 
           <div className="progress-track" aria-hidden="true">
@@ -2789,7 +2930,10 @@ export default function App() {
                   onWaveformError={handleWaveformError}
                 />
               )}
-              {waveformError ? <p className="error-text">{waveformError}</p> : null}
+              {waveformError ? <p className="error-text" role="alert">{waveformError}</p> : null}
+              <div role="timer" aria-live="polite" className="sr-only">
+                {isPlaying ? 'In riproduzione' : 'In pausa'} {formatClock(currentTime)} di {formatClock(audioFile.duration)}
+              </div>
 
               <PlayerControls
                 isPlaying={isPlaying}
@@ -2867,6 +3011,7 @@ export default function App() {
                 <button
                   type="button"
                   className={mode === 'equal' ? 'mode-active' : ''}
+                  aria-pressed={mode === 'equal'}
                   onClick={() => setMode('equal')}
                 >
                   Parti uguali
@@ -2874,6 +3019,7 @@ export default function App() {
                 <button
                   type="button"
                   className={mode === 'custom' ? 'mode-active' : ''}
+                  aria-pressed={mode === 'custom'}
                   onClick={() => setMode('custom')}
                 >
                   Punti personalizzati
@@ -2982,7 +3128,7 @@ export default function App() {
                       </p>
                     ) : null}
 
-                    {customCuts.map((point) => {
+                    {customCuts.map((point, cutIndex) => {
                       const sliderValue = clamp(
                         typeof point.position === 'number' && Number.isFinite(point.position)
                           ? point.position
@@ -2997,6 +3143,7 @@ export default function App() {
                             value={point.value}
                             onChange={(event) => updateCutPoint(point.id, event.target.value)}
                             placeholder="00:30"
+                            aria-label={`Taglio ${cutIndex + 1} (mm:ss o secondi)`}
                           />
                           <input
                             type="range"
@@ -3007,6 +3154,7 @@ export default function App() {
                             onChange={(event) =>
                               updateCutPointPosition(point.id, Number(event.target.value))
                             }
+                            aria-label={`Regola taglio ${cutIndex + 1} in secondi`}
                           />
                           <button type="button" onClick={() => removeCutPoint(point.id)}>
                             Rimuovi
@@ -3059,9 +3207,7 @@ export default function App() {
               canExport={canExport}
               isBusy={isBusy}
               isExporting={isExporting}
-              exportProgress={exportProgress}
               exportDetail={exportDetail}
-              currentSegmentIndex={currentSegmentIndex}
               failedExportIndex={failedExportIndex}
               onExport={processAndDownload}
               onCancelExport={handleCancelExport}
@@ -3076,8 +3222,8 @@ export default function App() {
               disabled={isBusy}
             />
 
-            {plan.error ? <p className="error-text">{plan.error}</p> : null}
-            {errorText ? <p className="error-text">{errorText}</p> : null}
+            {plan.error ? <p className="error-text" role="alert">{plan.error}</p> : null}
+            {errorText ? <p className="error-text" role="alert">{errorText}</p> : null}
 
             <div className="summary-column summary-sub">
               <div className="save-row">
@@ -3117,7 +3263,8 @@ export default function App() {
                       accept="application/json,.json"
                       onChange={handleImportProjectJson}
                       disabled={!audioFile || isBusy}
-                      hidden
+                      className="sr-only"
+                      aria-label="Importa progetto JSON"
                     />
                   </label>
                 </div>

@@ -8,7 +8,10 @@ import {
   HEAVY_OUTPUT_BYTES,
   RETAIN_BLOBS_BYTES,
   adviseExportStrategy,
+  clearCheckpoint,
   getExportCapabilities,
+  readCheckpoint,
+  writeCheckpoint,
 } from './streamExport.js';
 
 test('destination registry is complete', () => {
@@ -116,4 +119,45 @@ test('manual folder without support falls back with warning', () => {
   });
   assert.equal(mode, 'zip-stream');
   assert.ok(warnings.length > 0);
+});
+
+test('manual zip-stream without filePicker falls back to zip-classic', () => {
+  const { mode, warnings } = adviseExportStrategy({
+    fileSizeBytes: 10,
+    totalEstimateBytes: 10,
+    segmentCount: 2,
+    capabilities: { directoryPicker: false, filePicker: false },
+    preference: 'zip-stream',
+  });
+  assert.equal(mode, 'zip-classic');
+  assert.ok(warnings.length > 0);
+});
+
+test('checkpoint round-trips through stubbed localStorage', () => {
+  const store = new Map();
+  const realDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: {
+      getItem: (key) => (store.has(key) ? store.get(key) : null),
+      setItem: (key, value) => void store.set(key, String(value)),
+      removeItem: (key) => void store.delete(key),
+    },
+  });
+  try {
+    assert.equal(readCheckpoint(), null);
+    writeCheckpoint({ baseName: 'lezione', total: 4, doneCount: 2 });
+    const restored = readCheckpoint();
+    assert.equal(restored.baseName, 'lezione');
+    assert.equal(restored.doneCount, 2);
+    assert.ok(Number.isFinite(restored.savedAt));
+    clearCheckpoint();
+    assert.equal(readCheckpoint(), null);
+  } finally {
+    if (realDescriptor) {
+      Object.defineProperty(globalThis, 'localStorage', realDescriptor);
+    } else {
+      delete globalThis.localStorage;
+    }
+  }
 });

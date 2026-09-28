@@ -480,7 +480,12 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
   }, [src]);
 
   return (
-    <div className="waveform-wrapper" title="Doppio click per aggiungere un taglio">
+    <div
+      className="waveform-wrapper"
+      title="Doppio click per aggiungere un taglio"
+      role="img"
+      aria-label="Forma d'onda dell'audio caricato. Usa i pulsanti Taglia qui e Segnalibro o gli slider dei punti di taglio per modificare."
+    >
       <div ref={containerRef} className="waveform-container" />
     </div>
   );

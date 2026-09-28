@@ -47,6 +47,9 @@ export function LoadingBar({ job, onCancel }) {
         aria-label={`${loadStageLabel(job.stage)}${job.fileName ? `: ${job.fileName}` : ''}`}
         aria-valuemin={0}
         aria-valuemax={100}
+        aria-valuetext={determinate
+          ? `${pct} — ${loadStageLabel(job.stage)}${bytesLine ? ` — ${bytesLine}` : ''}`
+          : `${loadStageLabel(job.stage)} in corso`}
         {...(determinate ? { 'aria-valuenow': Math.round(clamp01(job.frac) * 100) } : {})}
       >
         <span
@@ -89,6 +92,7 @@ export function ExportProgressBar({ detail, wakeHeld, onCancel }) {
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={Math.round(clamp01(detail.frac) * 100)}
+        aria-valuetext={`Parte ${detail.segIndex + 1} di ${detail.segCount} — ${pct ?? 'in corso'}`}
       >
         <span
           className="loadbar-fill"

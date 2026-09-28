@@ -220,3 +220,43 @@ test('buildSegmentFileName normalizes extension and strips label chars', () => {
   assert.equal(buildSegmentFileName('', 1, '.m4a'), 'audio - parte 1.m4a');
   assert.equal(buildSegmentFileName('lez', 3, 'mp3', 'a/b:c'), 'lez - 03 - abc.mp3');
 });
+
+test('flac exports lossless compressed without bitrate flag', () => {
+  const args = buildExportArgs({
+    segment: { start: 0, duration: 10 },
+    inputName: 'in.m4a',
+    outputName: 'out.flac',
+    formatId: 'flac',
+    bitrateKbps: 128,
+  });
+  assert.ok(args.includes('flac'));
+  assert.ok(args.includes('-compression_level'));
+  assert.ok(!args.includes('-b:a'));
+  assert.ok(!args.includes('+faststart'));
+  assert.equal(canFastCopy({ formatId: 'flac', sourceExtension: '.flac' }), false);
+  const estimate = estimateExportBytes({ durationSeconds: 60, bitrateKbps: 128, formatId: 'flac' });
+  const wav = estimateExportBytes({ durationSeconds: 60, bitrateKbps: 0, formatId: 'wav' });
+  assert.ok(estimate > 0 && estimate < wav);
+});
+
+test('wav export applies triangular dither without breaking fade', () => {
+  const plain = buildExportArgs({
+    segment: { start: 0, duration: 10 },
+    inputName: 'in.m4a',
+    outputName: 'out.wav',
+    formatId: 'wav',
+    bitrateKbps: 128,
+  });
+  assert.ok(plain.join(' ').includes('dither_method=triangular'));
+  const faded = buildExportArgs({
+    segment: { start: 0, duration: 30 },
+    inputName: 'in.m4a',
+    outputName: 'out.wav',
+    formatId: 'wav',
+    bitrateKbps: 128,
+    fadeSeconds: 1,
+  });
+  const filter = faded[faded.indexOf('-af') + 1];
+  assert.ok(filter.includes('afade'));
+  assert.ok(filter.includes('dither_method=triangular'));
+});

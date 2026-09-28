@@ -11,8 +11,12 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
-      registerType: 'autoUpdate',
-      injectRegister: 'auto',
+      // 'prompt': il nuovo SW resta in attesa finché l'utente preme "Ricarica ora"
+      // (autoUpdate ricaricherebbe da solo, anche mentre si taglia audio).
+      registerType: 'prompt',
+      // Registrazione manuale in main.jsx (banner "Ricarica ora" invece di
+      // reload a sorpresa): evita la doppia registrazione di registerSW.js.
+      injectRegister: false,
       includeAssets: ['favicon.svg'],
       workbox: {
         globPatterns: ['**/*.{js,css,html,svg,woff,woff2}'],
@@ -37,6 +41,10 @@ export default defineConfig({
         ],
       },
       manifest: {
+        id: './',
+        lang: 'it',
+        dir: 'ltr',
+        categories: ['education', 'music', 'utilities'],
         name: 'Audio Cutter per studenti',
         short_name: 'Audio Cutter',
         description:

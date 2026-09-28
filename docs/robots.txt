@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://massimilianociconte.github.io/audio-trimmer/sitemap.xml

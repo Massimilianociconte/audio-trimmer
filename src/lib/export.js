@@ -53,9 +53,22 @@ export const EXPORT_FORMATS = {
     copyHint: '',
     needsMovflags: false,
   },
+  flac: {
+    id: 'flac',
+    label: 'FLAC',
+    description: 'Lossless compresso. Metà peso del WAV, qualità identica.',
+    extension: '.flac',
+    mime: 'audio/flac',
+    codec: 'flac',
+    bitrates: [],
+    defaultBitrate: 0,
+    supportsFastCopy: false,
+    copyHint: '',
+    needsMovflags: false,
+  },
 };
 
-export const EXPORT_FORMAT_ORDER = ['m4a', 'mp3', 'ogg', 'wav'];
+export const EXPORT_FORMAT_ORDER = ['m4a', 'mp3', 'ogg', 'wav', 'flac'];
 
 export function getExportFormat(id) {
   return EXPORT_FORMATS[id] ?? EXPORT_FORMATS.m4a;
@@ -140,12 +153,25 @@ export function buildExportArgs({
   ];
 
   const fadeFilter = buildFadeFilter(segment.duration, fadeSeconds);
+  const filters = [];
   if (fadeFilter) {
-    args.push('-af', fadeFilter);
+    filters.push(fadeFilter);
+  }
+
+  if (format.id === 'wav') {
+    // Dither triangolare col resampler integrato (sempre disponibile nel core wasm):
+    // evita distorsione di quantizzazione su fade e code a basso livello
+    // quando la sorgente è a profondità maggiore di 16 bit.
+    filters.push('aresample=dither_method=triangular');
+  }
+  if (filters.length > 0) {
+    args.push('-af', filters.join(','));
   }
 
   if (format.id === 'wav') {
     args.push('-c:a', format.codec);
+  } else if (format.id === 'flac') {
+    args.push('-c:a', format.codec, '-compression_level', '5');
   } else {
     const available = format.bitrates.length > 0 ? format.bitrates : [bitrateKbps];
     const nearest = available.reduce((best, candidate) =>
@@ -181,6 +207,10 @@ export function estimateExportBytes({ durationSeconds, bitrateKbps, formatId }) 
   const format = getExportFormat(formatId);
   if (format.id === 'wav') {
     return Math.round(durationSeconds * 44100 * 2 * 2);
+  }
+  if (format.id === 'flac') {
+    // Lossless compresso: ~55% del WAV per parlato/musica tipici.
+    return Math.round(durationSeconds * 44100 * 2 * 2 * 0.55);
   }
   const kbps = Number(bitrateKbps) || format.defaultBitrate || 128;
   return Math.round((kbps * 1000 * durationSeconds) / 8);

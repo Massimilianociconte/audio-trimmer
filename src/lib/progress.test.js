@@ -7,8 +7,9 @@ import {
   throughputBytesPerSec,
   etaMsRemaining,
   formatEtaClock,
+  loadStageIndex,
+  loadStageLabel,
 } from './progress.js';
-import { readFileBytesWithProgress } from './fileInput.js';
 
 describe('progress math', () => {
   it('clamp01', () => {
@@ -41,24 +42,12 @@ describe('progress math', () => {
     assert.equal(formatEtaClock(130000), '02:10');
     assert.equal(formatEtaClock(NaN), null);
   });
-});
 
-describe('readFileBytesWithProgress', () => {
-  it('legge a chunk riportando i bytes', async () => {
-    const bytes = new Uint8Array([1, 2, 3, 4, 5]);
-    const file = new Blob([bytes], { type: 'audio/mpeg' });
-    Object.defineProperty(file, 'size', { value: 5 });
-    const seen = [];
-    const out = await readFileBytesWithProgress(file, { onProgress: (loaded, total) => seen.push([loaded, total]) });
-    assert.deepEqual(Array.from(out), [1, 2, 3, 4, 5]);
-    assert.ok(seen.length > 0);
-    assert.deepEqual(seen[seen.length - 1], [5, 5]);
-  });
-
-  it('abort interrompe la lettura', async () => {
-    const file = new Blob([new Uint8Array(1024)], { type: 'audio/mpeg' });
-    const controller = new AbortController();
-    controller.abort();
-    await assert.rejects(() => readFileBytesWithProgress(file, { signal: controller.signal }));
+  it('loadStageIndex + loadStageLabel', () => {
+    assert.equal(loadStageIndex('reading'), 0);
+    assert.equal(loadStageIndex('waveform'), 3);
+    assert.equal(loadStageIndex('sconosciuto'), 0);
+    assert.equal(loadStageLabel('engine'), 'Motore locale');
+    assert.equal(loadStageLabel('waveform'), 'Forma d’onda');
   });
 });

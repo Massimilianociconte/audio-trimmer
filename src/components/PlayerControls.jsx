@@ -89,6 +89,8 @@ export function PlayerControls({
                 key={rate}
                 type="button"
                 className={Math.abs(rate - playbackRate) < 0.01 ? 'rate-active' : ''}
+                aria-pressed={Math.abs(rate - playbackRate) < 0.01}
+                aria-label={`Velocità ${rate}x`}
                 onClick={() => onRateChange(rate)}
                 disabled={disabled}
               >

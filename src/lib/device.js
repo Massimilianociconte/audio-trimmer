@@ -105,14 +105,19 @@ export function shouldPreloadEngine(env = globalThis) {
  * Limite oltre il quale rifiutiamo il caricamento PRIMA di copiare in RAM/wasm,
  * con messaggio azionabile. Desktop resta senza limite rigido (warning 350MB in App).
  */
+export const MOBILE_LOAD_LIMIT_LOW_BYTES = 100 * 1024 * 1024;
+export const MOBILE_LOAD_LIMIT_BYTES = 150 * 1024 * 1024;
+export const NATIVE_PREVIEW_SIZE_BYTES = 80 * 1024 * 1024;
+export const NATIVE_PREVIEW_DURATION_SECONDS = 30 * 60;
+
 export function mobileLoadLimitBytes(env = globalThis) {
   if (!isMobileDevice(env)) {
     return Infinity;
   }
   if (isLowMemoryDevice(env) || isIOS(env)) {
-    return 100 * 1024 * 1024;
+    return MOBILE_LOAD_LIMIT_LOW_BYTES;
   }
-  return 150 * 1024 * 1024;
+  return MOBILE_LOAD_LIMIT_BYTES;
 }
 
 /**
@@ -123,10 +128,10 @@ export function shouldUseNativePreview({ sizeBytes = 0, durationSeconds = 0 } = 
   if (!isMobileDevice(env)) {
     return false;
   }
-  if (Number.isFinite(sizeBytes) && sizeBytes > 80 * 1024 * 1024) {
+  if (Number.isFinite(sizeBytes) && sizeBytes > NATIVE_PREVIEW_SIZE_BYTES) {
     return true;
   }
-  if (Number.isFinite(durationSeconds) && durationSeconds > 30 * 60) {
+  if (Number.isFinite(durationSeconds) && durationSeconds > NATIVE_PREVIEW_DURATION_SECONDS) {
     return true;
   }
   return false;
