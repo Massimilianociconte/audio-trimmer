@@ -22,9 +22,17 @@ export async function readFileBytesWithProgress(file, { onProgress, signal } = {
 
   if (typeof file?.stream === 'function' && total > 0) {
     const reader = file.stream().getReader();
-    const chunks = [];
-    let loaded = 0;
+    // Prealloca: evita il transiente 2x (chunks[] + out) che uccide i tablet.
+    let out = null;
+    let chunks = null;
     try {
+      try {
+        out = new Uint8Array(total);
+      } catch {
+        out = null;
+      }
+      chunks = out ? null : [];
+      let loaded = 0;
       for (;;) {
         throwIfAborted();
         const { done, value } = await reader.read();
@@ -32,11 +40,29 @@ export async function readFileBytesWithProgress(file, { onProgress, signal } = {
           break;
         }
         if (value && value.byteLength) {
-          chunks.push(value);
+          if (out) {
+            out.set(value.subarray(0, Math.min(value.byteLength, total - loaded)), loaded);
+          } else {
+            chunks.push(value);
+          }
           loaded += value.byteLength;
-          report(loaded);
+          report(Math.min(loaded, total));
         }
       }
+      throwIfAborted();
+      if (out) {
+        const exact = loaded === total ? out : out.slice(0, loaded);
+        report(loaded);
+        return exact;
+      }
+      const combined = new Uint8Array(loaded);
+      let offset = 0;
+      for (const chunk of chunks) {
+        combined.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      report(loaded);
+      return combined;
     } finally {
       try {
         reader.releaseLock();
@@ -44,15 +70,6 @@ export async function readFileBytesWithProgress(file, { onProgress, signal } = {
         // ignore
       }
     }
-    throwIfAborted();
-    const out = new Uint8Array(loaded);
-    let offset = 0;
-    for (const chunk of chunks) {
-      out.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    report(loaded);
-    return out;
   }
 
   throwIfAborted();

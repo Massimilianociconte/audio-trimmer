@@ -76,6 +76,7 @@ import {
   shouldUseNativePreview,
 } from './lib/device.js';
 import { readFileBytesWithProgress } from './lib/fileInput.js';
+import { hardResetApp } from './lib/cacheReset.js';
 import {
   clamp01,
   combineExportProgress,
@@ -361,6 +362,7 @@ export default function App() {
   const [swWaiting, setSwWaiting] = useState(false);
   const loadAbortRef = useRef(null);
   const inputStaleRef = useRef(false);
+  const backupFsMissingRef = useRef(false);
   const audioFileRef = useRef(null);
   const loadJobRef = useRef(null);
 
@@ -568,6 +570,15 @@ export default function App() {
             return { ...previous, stage: 'engine', frac, bytesRead: loaded, totalBytes: total };
           });
         },
+        onEngineStage: (stage) => {
+          if (isStale() || stage !== 'compiling') {
+            return;
+          }
+          setStatusText('Motore scaricato: compilazione sul dispositivo, ancora pochi secondi…');
+          setLoadJob((previous) => previous?.active
+            ? { ...previous, stage: 'engine', frac: null }
+            : previous);
+        },
         signal: abortController.signal,
       });
       if (isStale()) {
@@ -618,6 +629,7 @@ export default function App() {
         return false;
       }
       activeInputRef.current = virtualInputName;
+      inputStaleRef.current = false;
       setLoadJob((previous) => previous?.active
         ? { ...previous, stage: 'analysis', frac: null }
         : previous);
@@ -764,6 +776,9 @@ export default function App() {
         objectUrl,
         size: file.size,
         virtualInputName,
+        // Il File è già un Blob: il salvataggio progetto lo riusa senza riletture.
+        blob: file instanceof File ? file : null,
+        lastModified: file?.lastModified ?? null,
       });
       // Riferimento al File originale: evita una copia in RAM al salvataggio progetto.
       sourceFileRef.current = file instanceof File ? file : null;
@@ -803,6 +818,7 @@ export default function App() {
         }
         return null;
       });
+      backupFsMissingRef.current = false;
 
       setStatusText('File pronto. Scegli il tipo di taglio e scarica tutte le parti insieme.');
       setPhaseProgress(0);
@@ -838,8 +854,21 @@ export default function App() {
         // Il cleanup iniziale ha già cancellato il file del backup:
         // lo stato non deve puntare a un file inesistente.
         activeInputRef.current = '';
+        // Il file mostrato (vecchio audioFile) ha perso i byte nella FS:
+        // forza la reidratazione dal Blob al prossimo uso del motore.
+        inputStaleRef.current = true;
         if (hadBackup) {
-          setOriginalAudioBackup(null);
+          // Revoca il Blob orfano prima di nillare (60MB pinnati a evento).
+          setOriginalAudioBackup((previousBackup) => {
+            if (previousBackup?.objectUrl) {
+              try {
+                URL.revokeObjectURL(previousBackup.objectUrl);
+              } catch {
+                // ignore
+              }
+            }
+            return null;
+          });
         }
       }
       setErrorText(error.message || 'Non sono riuscito ad analizzare il file.');
@@ -1505,6 +1534,7 @@ export default function App() {
           size: audioFile.size,
           baseName: audioFile.baseName,
           name: audioFile.name,
+          lastModified: audioFile.lastModified ?? null,
         };
       });
 
@@ -1515,11 +1545,12 @@ export default function App() {
       }
       objectUrlRef.current = cleanedObjectUrl;
 
-      if (!originalAudioBackup) {
-        // Do not delete the original file from ffmpeg FS; keep it so we can restore.
-      } else if (audioFile.virtualInputName !== originalAudioBackup.virtualInputName) {
+      // Libera subito i byte precedenti dalla MEMFS (niente doppia residenza):
+      // il restore li riscrive dal Blob del backup quando serve.
+      if (audioFile.virtualInputName !== cleanedVirtualName) {
         await safeDelete(ffmpeg, audioFile.virtualInputName);
       }
+      backupFsMissingRef.current = true;
 
       setAudioFile((previous) =>
         previous
@@ -1533,6 +1564,8 @@ export default function App() {
               mimeType: 'audio/mp4',
               size: cleanedBlob.size,
               name: `${previous.baseName || stripExtension(previous.name)}.m4a`,
+              // Blob tenuto per il salvataggio progetto senza riletture (+1 copia evitata).
+              blob: cleanedBlob,
             }
           : previous,
       );
@@ -1591,14 +1624,17 @@ export default function App() {
     }
     setSaveStatus('Salvo il progetto…');
     try {
-      // Riutilizza il File originale quando corrisponde all'audio corrente
-      // (niente fetch→blob duplicato in RAM); fallback a fetch per audio pulito/registrato.
-      const sameAsSource = sourceFileRef.current
+      // Ordine a costo zero: blob già in mano > File originale > rilettura.
+      // (Niente fetch→blob duplicato in RAM quando evitabile.)
+      const sameAsSource = Boolean(sourceFileRef.current)
         && audioFile.name === sourceFileRef.current.name
-        && audioFile.size === sourceFileRef.current.size;
-      const audioBlob = sameAsSource
-        ? sourceFileRef.current
-        : await (await fetch(audioFile.objectUrl)).blob();
+        && audioFile.size === sourceFileRef.current.size
+        && audioFile.lastModified !== undefined
+        && audioFile.lastModified === sourceFileRef.current.lastModified;
+      const audioBlob = audioFile.blob
+        ?? (sameAsSource
+          ? sourceFileRef.current
+          : await (await fetch(audioFile.objectUrl)).blob());
       await assertStorageFor(audioBlob.size);
       const now = Date.now();
       const record = await saveStoredProject({
@@ -1870,16 +1906,24 @@ export default function App() {
     }
 
     setErrorText('');
+    isBusyRef.current = true;
     setIsBusy(true);
     setStatusText('Ripristino la versione originale del file...');
 
     try {
+      const ffmpeg = ffmpegRef.current ?? await ensureEngineReady();
+      // L'originale vive solo nel Blob del backup (niente 2x MEMFS): riscrivilo prima di puntarci.
+      if (backupFsMissingRef.current) {
+        const backupBytes = new Uint8Array(await (await fetch(originalAudioBackup.objectUrl)).arrayBuffer());
+        await ffmpeg.writeFile(originalAudioBackup.virtualInputName, backupBytes);
+        backupFsMissingRef.current = false;
+      }
       const currentVirtual = audioFile?.virtualInputName;
       if (audioFile?.objectUrl && audioFile.objectUrl !== originalAudioBackup.objectUrl) {
         URL.revokeObjectURL(audioFile.objectUrl);
       }
-      if (ffmpegRef.current && currentVirtual && currentVirtual !== originalAudioBackup.virtualInputName) {
-        await safeDelete(ffmpegRef.current, currentVirtual);
+      if (currentVirtual && currentVirtual !== originalAudioBackup.virtualInputName) {
+        await safeDelete(ffmpeg, currentVirtual);
       }
 
       objectUrlRef.current = originalAudioBackup.objectUrl;
@@ -1898,6 +1942,8 @@ export default function App() {
               size: originalAudioBackup.size,
               baseName: originalAudioBackup.baseName ?? previous.baseName,
               name: originalAudioBackup.name ?? previous.name,
+              lastModified: originalAudioBackup.lastModified ?? previous.lastModified,
+              blob: null,
             }
           : previous,
       );
@@ -1918,6 +1964,7 @@ export default function App() {
       setErrorText(error.message || 'Ripristino non riuscito.');
       setStatusText('Ripristino non completato.');
     } finally {
+      isBusyRef.current = false;
       setIsBusy(false);
     }
   }
@@ -2329,7 +2376,8 @@ export default function App() {
     const destMode = deviceMode.mode;
     setAdvisorNote([...advice.reasons, ...advice.warnings, ...(deviceMode.note ? [deviceMode.note] : [])].join(' '));
     // Trattiene i Blob per il re-download solo sotto soglia: sopra, solo metadati.
-    const retainBlobs = totalEstimate <= RETAIN_BLOBS_BYTES;
+    // Su mobile la soglia è molto più bassa (i Blob trattengono RAM per l'intera sessione).
+    const retainBlobs = totalEstimate <= (isMobileDevice() ? 30 * 1024 * 1024 : RETAIN_BLOBS_BYTES);
 
     // Gli handle disco vanno chiesti NEL gesto utente, prima del lavoro pesante.
     let dirHandle = null;
@@ -2521,7 +2569,8 @@ export default function App() {
 
         if (destMode === 'folder') {
           const fileHandle = await dirHandle.getFileHandle(downloadName, { create: true });
-          await writeBlobToFileHandle(fileHandle, new Blob([outputData], { type: format.mime }));
+          // Scrittura diretta dei byte: niente Blob intermedio da ~1 segmento.
+          await writeBlobToFileHandle(fileHandle, outputData);
           exportedParts.push({
             name: downloadName,
             size: outputData.length,
@@ -3376,6 +3425,23 @@ export default function App() {
             >
               WebNovis
             </a>
+          </p>
+          <p>
+            <button
+              type="button"
+              className="mini-button"
+              onClick={async () => {
+                const confirmed = window.confirm(
+                  'Pulire cache e ricaricare? Risolve versioni bloccate o file corrotti. I progetti salvati restano.',
+                );
+                if (confirmed) {
+                  await hardResetApp();
+                }
+              }}
+              title="Svuota le cache dell'app e ricarica (i progetti salvati restano)"
+            >
+              Problemi? Pulisci cache e ricarica
+            </button>
           </p>
         </footer>
       </main>

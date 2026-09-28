@@ -138,11 +138,11 @@ export function clearCheckpoint() {
   }
 }
 
-/** Scrive un Blob su un FileSystemFileHandle con abort pulito in caso di errore. */
-export async function writeBlobToFileHandle(fileHandle, blob) {
+/** Scrive su un FileSystemFileHandle. Accetta Blob o Uint8Array (niente Blob intermedio). */
+export async function writeBlobToFileHandle(fileHandle, data) {
   const writable = await fileHandle.createWritable();
   try {
-    await writable.write(blob);
+    await writable.write(data);
     await writable.close();
   } catch (error) {
     try {

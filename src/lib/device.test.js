@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  estimateWaveformBytes,
   isIOS,
   isAndroid,
   isMobileDevice,
@@ -59,15 +60,29 @@ describe('device', () => {
   it('limiti di caricamento differenziati per dispositivo', () => {
     assert.equal(mobileLoadLimitBytes(desktop), Infinity);
     assert.equal(mobileLoadLimitBytes(iPad), 100 * 1024 * 1024);
-    assert.equal(mobileLoadLimitBytes(android), 150 * 1024 * 1024);
+    // Android: deviceMemory inaffidabile, sempre limite basso
+    assert.equal(mobileLoadLimitBytes(android), 100 * 1024 * 1024);
   });
 
-  it('anteprima nativa solo su mobile per file pesanti', () => {
+  it('stima PCM della waveform a 8kHz stereo', () => {
+    // 30min stereo = 1800×8000×2×4 = 115_200_000 byte esatti
+    assert.equal(estimateWaveformBytes(1800), 115200000);
+    assert.equal(estimateWaveformBytes(0), 0);
+    assert.equal(estimateWaveformBytes(NaN), 0);
+  });
+
+  it('anteprima nativa su PCM stimato, non su byte compressi', () => {
     assert.equal(shouldUseNativePreview({ sizeBytes: 10 * 1024 * 1024, durationSeconds: 60 }, desktop), false);
-    assert.equal(shouldUseNativePreview({ sizeBytes: 200 * 1024 * 1024, durationSeconds: 60 }, desktop), false);
+    // 14MB compressi ma 30min di PCM ≈ 115MB: su mobile è nativa, su desktop no
+    assert.equal(shouldUseNativePreview({ sizeBytes: 14 * 1024 * 1024, durationSeconds: 1800 }, iPad), true);
+    assert.equal(shouldUseNativePreview({ sizeBytes: 14 * 1024 * 1024, durationSeconds: 1800 }, desktop), false);
+    // 20min stereo ≈ 77MB PCM > 60MB: nativa anche sotto gli 80MB compressi
+    assert.equal(shouldUseNativePreview({ sizeBytes: 60 * 1024 * 1024, durationSeconds: 1200 }, android), true);
     assert.equal(shouldUseNativePreview({ sizeBytes: 10 * 1024 * 1024, durationSeconds: 60 }, iPad), false);
     assert.equal(shouldUseNativePreview({ sizeBytes: 90 * 1024 * 1024, durationSeconds: 60 }, iPad), true);
-    assert.equal(shouldUseNativePreview({ sizeBytes: 10 * 1024 * 1024, durationSeconds: 2000 }, android), true);
+    // Guardia assoluta desktop: 3h di PCM o 300MB di file
+    assert.equal(shouldUseNativePreview({ sizeBytes: 10 * 1024 * 1024, durationSeconds: 10800 }, desktop), true);
+    assert.equal(shouldUseNativePreview({ sizeBytes: 300 * 1024 * 1024, durationSeconds: 60 }, desktop), true);
   });
 
   it('su iOS i singoli diventano ZIP unico', () => {

@@ -108,33 +108,45 @@ export function shouldPreloadEngine(env = globalThis) {
 export const MOBILE_LOAD_LIMIT_LOW_BYTES = 100 * 1024 * 1024;
 export const MOBILE_LOAD_LIMIT_BYTES = 150 * 1024 * 1024;
 export const NATIVE_PREVIEW_SIZE_BYTES = 80 * 1024 * 1024;
-export const NATIVE_PREVIEW_DURATION_SECONDS = 30 * 60;
+// La waveform decodifica a 8kHz (verificato in wavesurfer): PCM ≈ durata×8000×2ch×4B.
+// Le soglie DEVONO misurarlo, non i byte compressi: 20min stereo ≈ 77MB di PCM.
+export const NATIVE_PREVIEW_PCM_BYTES = 60 * 1024 * 1024;
+export const DESKTOP_NATIVE_PREVIEW_SIZE_BYTES = 250 * 1024 * 1024;
+export const DESKTOP_NATIVE_PREVIEW_PCM_BYTES = 400 * 1024 * 1024;
 
 export function mobileLoadLimitBytes(env = globalThis) {
   if (!isMobileDevice(env)) {
     return Infinity;
   }
-  if (isLowMemoryDevice(env) || isIOS(env)) {
+  // Su Samsung/Android deviceMemory è spesso arrotondato: mai fidarsi per ALZARE i limiti.
+  if (isLowMemoryDevice(env) || isIOS(env) || isAndroid(env)) {
     return MOBILE_LOAD_LIMIT_LOW_BYTES;
   }
   return MOBILE_LOAD_LIMIT_BYTES;
 }
 
+/** Stima del PCM che la waveform allocherebbe (stereo, 8kHz, float32). */
+export function estimateWaveformBytes(durationSeconds) {
+  const seconds = Number(durationSeconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    return 0;
+  }
+  return Math.round(seconds * 8000 * 2 * 4);
+}
+
 /**
- * La decodifica integrale per la waveform (PCM float = GB per ore di audio)
- * uccide la tab su mobile: sopra soglia si usa l'anteprima nativa leggera.
+ * La decodifica integrale per la waveform (PCM + canvas) uccide la tab:
+ * sopra soglia si usa l'anteprima nativa leggera. La soglia è sul PCM stimato,
+ * non sui byte compressi (un m4a da 14MB può valere centinaia di MB di PCM).
  */
 export function shouldUseNativePreview({ sizeBytes = 0, durationSeconds = 0 } = {}, env = globalThis) {
-  if (!isMobileDevice(env)) {
-    return false;
+  const size = Number(sizeBytes) || 0;
+  const pcm = estimateWaveformBytes(durationSeconds);
+  if (isMobileDevice(env)) {
+    return size > NATIVE_PREVIEW_SIZE_BYTES || pcm > NATIVE_PREVIEW_PCM_BYTES;
   }
-  if (Number.isFinite(sizeBytes) && sizeBytes > NATIVE_PREVIEW_SIZE_BYTES) {
-    return true;
-  }
-  if (Number.isFinite(durationSeconds) && durationSeconds > NATIVE_PREVIEW_DURATION_SECONDS) {
-    return true;
-  }
-  return false;
+  // Anche i desktop muoiono su decode enormi: guardia assoluta.
+  return size > DESKTOP_NATIVE_PREVIEW_SIZE_BYTES || pcm > DESKTOP_NATIVE_PREVIEW_PCM_BYTES;
 }
 
 /**

@@ -28,13 +28,16 @@ export default defineConfig({
             urlPattern: ({ url }) => url.pathname.endsWith('.wasm'),
             handler: 'CacheFirst',
             options: {
-              cacheName: 'ffmpeg-wasm',
+              // Nome versionato: un wasm tronco in cache non deve sopravvivere
+              // ai deploy (bump v2→v3 quando cambia @ffmpeg/core).
+              cacheName: 'ffmpeg-wasm-v2',
               expiration: {
                 maxEntries: 4,
-                maxAgeSeconds: 30 * 24 * 60 * 60,
+                maxAgeSeconds: 7 * 24 * 60 * 60,
               },
               cacheableResponse: {
-                statuses: [0, 200],
+                // Solo 200 piene: mai risposte opache/troncate (niente status 0).
+                statuses: [200],
               },
             },
           },
