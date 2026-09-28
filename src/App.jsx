@@ -3339,8 +3339,8 @@ export default function App() {
             <div className="studio">
               <div className="studio-head">
                 <div>
-                  <p className="section-label">01 · Ascolta e segna</p>
-                  <h2>{audioFile.name}</h2>
+                  <p className="section-label" role="heading" aria-level="2">01 · Ascolta e segna</p>
+                  <h2 title={audioFile.name}>{audioFile.name}</h2>
                   <div className="meta-row">
                     <span>{formatClock(audioFile.duration)}</span>
                     <span>{formatBytes(audioFile.size)}</span>
@@ -3360,9 +3360,8 @@ export default function App() {
               {audioFile.browserPlayable === false ? (
                 <div className="native-preview">
                   <p className="native-note">
-                    Il browser non sa riprodurre il formato {audioFile.formatLabel}. Puoi già tagliare
-                    per tempi (mm:ss) o in parti uguali ed esportare in M4A/MP3; per ascoltare e usare
-                    la forma d’onda crea un’anteprima leggera (l’export userà comunque l’originale).
+                    Questo formato non si ascolta nel browser, ma puoi già tagliare per tempi
+                    ed esportare. Crea l’anteprima leggera per ascoltare (l’export userà comunque l’originale).
                   </p>
                   <button
                     type="button"
@@ -3458,7 +3457,7 @@ export default function App() {
 
           {audioFile ? (
             <details className="advanced-disclosure">
-              <summary>Pulizia audio professionale e capitoli automatici</summary>
+              <summary>Pulizia audio e capitoli automatici (opzionale)</summary>
               <AutomationPanel
                 silenceThresholdDb={silenceThresholdDb}
                 silenceMinDuration={silenceMinDuration}
@@ -3491,7 +3490,7 @@ export default function App() {
           {audioFile ? (
             <div className="editor-grid">
               <div className="editor-column">
-                <p className="section-label">02 · Definisci i tagli</p>
+                <p className="section-label" role="heading" aria-level="2">02 · Definisci i tagli</p>
                 <div className="mode-switch">
                 <button
                   type="button"
@@ -3716,7 +3715,7 @@ export default function App() {
 
             <div className="summary-column summary-sub">
               <details className="advanced-disclosure">
-                <summary>Progetto, JSON e trascrizione AI</summary>
+                <summary>Progetto, JSON e trascrizione AI (opzionale)</summary>
                 <div className="summary-sub-body">
               <div className="save-row">
                 <button

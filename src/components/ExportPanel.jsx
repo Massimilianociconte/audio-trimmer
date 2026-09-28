@@ -68,7 +68,7 @@ export function ExportPanel({
   return (
     <aside className="summary-column">
       <div className="summary-head">
-        <p className="section-label">03 · Scarica le parti</p>
+        <p className="section-label" role="heading" aria-level="2">03 · Scarica le parti</p>
         <strong>
           {plan.segments.length > 0 ? `${plan.segments.length} file pronti` : 'In attesa'}
         </strong>
@@ -87,7 +87,7 @@ export function ExportPanel({
             <strong>⚡ Veloce · qualità originale</strong>
             <em>
               {copyAvailable
-                ? `Nessuna ricodifica: ${naturalLabel} identico all’originale, pronto in pochi secondi. Precisione ~0,03 s.`
+                ? `Nessuna ricodifica: qualità originale in pochi secondi (±0,03 s).`
                 : 'Disponibile solo se il file è già MP3 o M4A/AAC.'}
             </em>
           </span>
@@ -102,7 +102,7 @@ export function ExportPanel({
           />
           <span>
             <strong>Converti in {convertFormat.label}{convertFormat.bitrates.length ? ` ${exportBitrate}k` : ''}</strong>
-            <em>Ricodifica al taglio millimetrico, con fade opzionale. Più lento: dipende dalla potenza del dispositivo.</em>
+            <em>Taglio preciso con fade opzionale. Più lento sui telefoni meno potenti.</em>
           </span>
         </label>
       </div>
@@ -115,7 +115,7 @@ export function ExportPanel({
       ) : null}
 
       <details className="advanced-disclosure">
-        <summary>Impostazioni export (formato, qualità, destinazione)</summary>
+        <summary>Impostazioni export (opzionale: formato, qualità, destinazione)</summary>
       <div className="export-settings">
         <label className="field">
           <span>Nome base dei file</span>
@@ -221,10 +221,10 @@ export function ExportPanel({
               <strong>{fadeSeconds === 0 ? 'Off' : `${fadeSeconds.toFixed(2)} s`}</strong>
             </div>
             {copyMode ? (
-              <em className="fade-warning">Il fade richiede la modalità «Converti».</em>
+              <em className="fade-warning">Nota: il fade richiede la modalità «Converti».</em>
             ) : null}
             {fadeIneffective ? (
-              <em className="fade-warning">Fade disattivato sulle parti più corte di {(fadeSeconds * 2).toFixed(2)} s.</em>
+              <em className="fade-warning">Nota: fade non applicato alle parti più corte di {(fadeSeconds * 2).toFixed(2)} s.</em>
             ) : null}
           </label>
         </div>
@@ -279,7 +279,7 @@ export function ExportPanel({
           ))}
         </div>
       ) : (
-        <p className="empty-text">Definisci almeno 2 parti nella sezione 02 · Definisci i tagli: appariranno qui con stima del peso.</p>
+        <p className="empty-text">Definisci almeno 2 parti in «Definisci i tagli» qui sotto: appariranno qui con stima del peso.</p>
       )}
 
       {isExporting ? (

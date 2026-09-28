@@ -31,6 +31,7 @@ export function BookmarksPanel({
               onClick={() => onJump(bookmark.id)}
               disabled={disabled}
               title="Salta a questo punto"
+              aria-label={`Vai a ${formatClock(bookmark.position)}`}
             >
               {formatClock(bookmark.position)}
             </button>
@@ -39,6 +40,7 @@ export function BookmarksPanel({
               className="bookmark-note"
               value={bookmark.note}
               placeholder="Nota rapida…"
+              aria-label="Nota per segnalibro"
               onChange={(event) => onNoteChange(bookmark.id, event.target.value)}
               disabled={disabled}
             />
@@ -48,6 +50,7 @@ export function BookmarksPanel({
               onClick={() => onRemove(bookmark.id)}
               disabled={disabled}
               title="Rimuovi segnalibro"
+              aria-label="Rimuovi segnalibro"
             >
               ×
             </button>

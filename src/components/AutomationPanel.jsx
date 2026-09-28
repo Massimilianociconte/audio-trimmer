@@ -179,8 +179,7 @@ export function AutomationPanel({
           <p className="section-label">Pulizia audio professionale</p>
           <h3>Voce chiara, rumore giù, volume standard −16 LUFS</h3>
           <p className="helper-text">
-            Riduzione rumore adattiva, EQ per la voce, de-esser, livellamento tra voce vicina e lontana,
-            compressione e limiter: la stessa catena di un podcast professionale, tutta nel tuo browser.
+            Stessa catena di un podcast pro — rumore, EQ voce, livelli e limiter — tutto nel browser.
           </p>
         </header>
 

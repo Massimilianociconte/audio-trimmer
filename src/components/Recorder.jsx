@@ -74,7 +74,7 @@ export function Recorder({ onRecorded, disabled, onClose, onRecordingChange }) {
         </div>
       </div>
 
-      {recorder.error ? <p className="error-text">{recorder.error}</p> : null}
+      {recorder.error ? <p className="error-text" role="alert">{recorder.error}</p> : null}
 
       <div className="recorder-actions">
         {!recorder.isRecording ? (

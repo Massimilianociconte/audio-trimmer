@@ -139,8 +139,9 @@ export function describeEngine(engineInfo) {
 export function EngineChip({ engineInfo, onRetry }) {
   const phase = engineInfo?.phase ?? 'idle';
   const described = describeEngine(engineInfo);
+  const accessibleLabel = described.detail ? `${described.title}: ${described.detail}` : described.title;
   return (
-    <div className={`engine-chip engine-chip-${phase}`} title={described.detail || described.title}>
+    <div className={`engine-chip engine-chip-${phase}`} title={described.detail || described.title} aria-label={accessibleLabel}>
       <span className={`status-dot status-${phase === 'ready' ? 'ready' : phase === 'idle' || phase === 'error' ? 'idle' : 'loading'}`} />
       <strong>{described.short}</strong>
       {phase === 'downloading' ? (
@@ -305,7 +306,8 @@ export function ExportProgressBar({ detail, engineInfo, wakeHeld, onCancel }) {
               className={`part-chip part-chip-${state}`}
               title={`Parte ${index + 1}: ${PART_STATE_LABEL[state] ?? state}`}
             >
-              {state === 'done' || state === 'skipped' ? '✓' : index + 1}
+              <span aria-hidden="true">{state === 'done' || state === 'skipped' ? '✓' : index + 1}</span>
+              <span className="sr-only">Parte {index + 1}: {PART_STATE_LABEL[state] ?? state}</span>
             </li>
           ))}
         </ol>

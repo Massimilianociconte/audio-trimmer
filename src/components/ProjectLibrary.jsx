@@ -65,8 +65,8 @@ export function ProjectLibrary({
 
       {!isLoading && projects.length === 0 ? (
         <p className="empty-text">
-          Nessun progetto salvato. Usa il pulsante «Salva progetto» accanto all&apos;export per
-          conservare un file con i tagli e i segnalibri.
+          Nessun progetto salvato. Dopo aver caricato un audio, usa «Salva progetto»
+          (sezione Progetto, JSON e trascrizione AI) per conservare tagli e segnalibri.
         </p>
       ) : null}
 
