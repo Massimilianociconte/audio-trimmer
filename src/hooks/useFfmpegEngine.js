@@ -5,11 +5,11 @@ import ffmpegWasmUrl from '@ffmpeg/core/wasm?url';
 import { clamp } from '../lib/time.js';
 import { shouldPreloadEngine } from '../lib/device.js';
 
-// Cache dei Blob URL del core: scaricati una sola volta con progresso reale,
-// poi riusati per ogni load (niente re-download da 31MB ad ogni terminate).
-const coreBlobCache = {
-  coreUrl: '',
-  wasmUrl: '',
+// Il download del core serve SOLO a scaldare la cache del service worker
+// con progresso reale: il load usa poi gli URL statici, gli unici che il
+// worker ffmpeg riesce a importare (i Blob URL falliscono con
+// "Failed to fetch dynamically imported module" dentro il worker).
+const engineWarmCache = {
   promise: null,
 };
 
@@ -41,6 +41,8 @@ function sleep(ms) {
  * Download resiliente per reti mobili instabili:
  * - retry con backoff + resume via Range (niente restart da 0 a 29/31MB)
  * - watchdog anti-stallo (20s senza byte → tentativo successivo)
+ * - i byte vengono LETTI (per la % reale) ma SCARTATI: niente 31MB trattenuti
+ *   in heap JS, la persistenza spetta alla CacheFirst del service worker.
  * - il signal utente NON tocca il fetch condiviso: l'annullo sblocca subito
  *   la UI (stale-check) e il download completa in background scaldando la cache.
  */
@@ -57,7 +59,6 @@ async function fetchResilientChunks(url, { onChunk } = {}) {
     // HEAD opzionale: si prosegue senza totale né resume
   }
 
-  const chunks = [];
   let loaded = 0;
   let attempt = 0;
   for (;;) {
@@ -69,24 +70,45 @@ async function fetchResilientChunks(url, { onChunk } = {}) {
     }
     if (response.status === 200 && loaded > 0) {
       // Server senza resume: si ricomincia da 0
-      chunks.length = 0;
       loaded = 0;
     }
     const reader = response.body.getReader();
-    let lastByteAt = Date.now();
+    let attemptFailed = false;
+    // Il watchdog deve correre ANCHE mentre read() pende (TCP morto):
+    // race per-byte, non controllo a fine lettura.
+    const readWithStallGuard = async () => {
+      let timer = null;
+      try {
+        return await Promise.race([
+          reader.read(),
+          new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error('stall')), ENGINE_STALL_TIMEOUT_MS);
+          }),
+        ]);
+      } finally {
+        if (timer) {
+          clearTimeout(timer);
+        }
+      }
+    };
     try {
       for (;;) {
-        if (Date.now() - lastByteAt > ENGINE_STALL_TIMEOUT_MS) {
-          throw new Error('Connessione in stallo durante il download del motore');
+        // eslint-disable-next-line no-await-in-loop
+        const { done, value } = await readWithStallGuard().catch((stallError) => {
+          if (stallError?.message === 'stall') {
+            return { stalled: true };
+          }
+          throw stallError;
+        });
+        if (stalled) {
+          attemptFailed = true;
+          break;
         }
-        const { done, value } = await reader.read();
         if (done) {
           break;
         }
         if (value && value.byteLength) {
-          chunks.push(value);
           loaded += value.byteLength;
-          lastByteAt = Date.now();
           try {
             onChunk?.(loaded, total || loaded);
           } catch {
@@ -100,20 +122,29 @@ async function fetchResilientChunks(url, { onChunk } = {}) {
       } catch {
         // ignore
       }
+      try {
+        await response.body.cancel().catch(() => {});
+      } catch {
+        // ignore
+      }
     }
-    return { chunks, loaded, total: total || loaded };
+    if (!attemptFailed) {
+      return { loaded, total: total || loaded };
+    }
+    if (attempt >= ENGINE_FETCH_MAX_ATTEMPTS) {
+      throw new Error('Connessione in stallo durante il download del motore');
+    }
+    // eslint-disable-next-line no-await-in-loop
+    await sleep(1000 * attempt);
   }
 }
 
-async function fetchToBlobUrl(url, { onChunk } = {}) {
+async function warmUrlWithRetry(url, { onChunk } = {}) {
   let lastError = null;
   for (let attempt = 1; attempt <= ENGINE_FETCH_MAX_ATTEMPTS; attempt += 1) {
     try {
       // eslint-disable-next-line no-await-in-loop
-      const { chunks, loaded, total } = await fetchResilientChunks(url, { onChunk });
-      const blob = new Blob(chunks);
-      chunks.length = 0;
-      return { objectUrl: URL.createObjectURL(blob), bytes: loaded, total };
+      return await fetchResilientChunks(url, { onChunk });
     } catch (error) {
       lastError = error;
       if (attempt < ENGINE_FETCH_MAX_ATTEMPTS) {
@@ -123,16 +154,6 @@ async function fetchToBlobUrl(url, { onChunk } = {}) {
     }
   }
   throw lastError ?? new Error('Download motore non riuscito');
-}
-
-function isValidWasmBytes(bytes) {
-  // Header magico WebAssembly "\0asm" nei primi 4 byte
-  return bytes instanceof Uint8Array
-    && bytes.byteLength >= 4
-    && bytes[0] === 0x00
-    && bytes[1] === 0x61
-    && bytes[2] === 0x73
-    && bytes[3] === 0x6d;
 }
 
 /** Elimina le cache wasm potenzialmente avvelenate (tronche/opache). */
@@ -149,84 +170,61 @@ export async function purgeWasmCaches() {
   }
 }
 
-function ensureCoreBlobs({ onEngineProgress } = {}) {
-  if (coreBlobCache.coreUrl && coreBlobCache.wasmUrl) {
-    return Promise.resolve({ coreUrl: coreBlobCache.coreUrl, wasmUrl: coreBlobCache.wasmUrl });
-  }
-  if (!coreBlobCache.promise) {
-    coreBlobCache.promise = (async () => {
+function isCorruptEngineError(error) {
+  const message = String(error?.message ?? error ?? '').toLowerCase();
+  return /compileerror|failed to fetch dynamically|importscripts|networkerror|aborted/.test(message);
+}
+
+/**
+ * Scalda la cache del service worker per core+wasm con progresso reale.
+ * Ritorna gli URL STATICI (gli unici importabili dal worker ffmpeg).
+ */
+function warmEngineCache({ onEngineProgress } = {}) {
+  if (!engineWarmCache.promise) {
+    engineWarmCache.promise = (async () => {
       let coreLoaded = 0;
       let coreTotal = 0;
       let wasmLoaded = 0;
       let wasmTotal = 0;
-      const createdUrls = [];
       const report = () => reportEngineBytes(onEngineProgress, coreLoaded + wasmLoaded, coreTotal + wasmTotal);
-      try {
-        const [core, wasm] = await Promise.all([
-          fetchToBlobUrl(ffmpegCoreUrl, {
-            onChunk: (loaded, total) => {
-              coreLoaded = loaded;
-              coreTotal = total;
-              report();
-            },
-          }),
-          fetchToBlobUrl(ffmpegWasmUrl, {
-            onChunk: (loaded, total) => {
-              wasmLoaded = loaded;
-              wasmTotal = total;
-              report();
-            },
-          }),
-        ]);
-        createdUrls.push(core.objectUrl, wasm.objectUrl);
-        // Integrity gate: un wasm tronco in cache avvelenata deve fallire QUI,
-        // non con CompileError criptico dopo. Purga e riprova una volta da rete.
-        if (wasm.bytes < ENGINE_MIN_WASM_BYTES) {
-          await purgeWasmCaches();
-          for (const objectUrl of createdUrls.splice(0)) {
-            try {
-              URL.revokeObjectURL(objectUrl);
-            } catch {
-              // ignore
-            }
-          }
-          const fresh = await fetchToBlobUrl(ffmpegWasmUrl, {
-            onChunk: (loaded, total) => {
-              wasmLoaded = loaded;
-              wasmTotal = total;
-              report();
-            },
-          });
-          createdUrls.push(core.objectUrl, fresh.objectUrl);
-          if (fresh.bytes < ENGINE_MIN_WASM_BYTES) {
-            throw new Error('Motore scaricato incompleto. Controlla la connessione e riprova.');
-          }
-          coreBlobCache.coreUrl = core.objectUrl;
-          coreBlobCache.wasmUrl = fresh.objectUrl;
-          reportEngineBytes(onEngineProgress, core.bytes + fresh.bytes, core.total + fresh.total);
-          return { coreUrl: core.objectUrl, wasmUrl: fresh.objectUrl };
+      await Promise.all([
+        warmUrlWithRetry(ffmpegCoreUrl, {
+          onChunk: (loaded, total) => {
+            coreLoaded = loaded;
+            coreTotal = total;
+            report();
+          },
+        }),
+        warmUrlWithRetry(ffmpegWasmUrl, {
+          onChunk: (loaded, total) => {
+            wasmLoaded = loaded;
+            wasmTotal = total;
+            report();
+          },
+        }),
+      ]);
+      // Integrity gate: wasm tronco (cache avvelenata) deve fallire QUI con retry,
+      // non dopo con CompileError criptico a ogni avvio.
+      if (wasmLoaded > 0 && wasmLoaded < ENGINE_MIN_WASM_BYTES) {
+        await purgeWasmCaches();
+        const fresh = await warmUrlWithRetry(ffmpegWasmUrl, {
+          onChunk: (loaded, total) => {
+            wasmLoaded = loaded;
+            wasmTotal = total;
+            report();
+          },
+        });
+        if (fresh.loaded < ENGINE_MIN_WASM_BYTES) {
+          throw new Error('Motore scaricato incompleto. Controlla la connessione e riprova.');
         }
-        coreBlobCache.coreUrl = core.objectUrl;
-        coreBlobCache.wasmUrl = wasm.objectUrl;
-        reportEngineBytes(onEngineProgress, core.bytes + wasm.bytes, core.total + wasm.total);
-        return { coreUrl: core.objectUrl, wasmUrl: wasm.objectUrl };
-      } catch (error) {
-        // Niente Blob orfani: il retry successivo ripartirebbe comunque da rete.
-        for (const objectUrl of createdUrls.splice(0)) {
-          try {
-            URL.revokeObjectURL(objectUrl);
-          } catch {
-            // ignore
-          }
-        }
-        throw error;
       }
+      reportEngineBytes(onEngineProgress, coreLoaded + wasmLoaded, coreTotal + wasmTotal);
     })().catch((error) => {
-      coreBlobCache.promise = null;
+      engineWarmCache.promise = null;
       throw error;
     });
   }
-  return coreBlobCache.promise;
+  return engineWarmCache.promise;
 }
 
 export function useFfmpegEngine() {
@@ -273,22 +271,33 @@ export function useFfmpegEngine() {
           // il motore si scarica solo al primo uso effettivo (primo file / primo export).
           // Il signal utente NON interrompe il fetch condiviso: l'annullo sblocca
           // subito la UI e il download completa in background scaldando la cache.
-          let coreURL = ffmpegCoreUrl;
-          let wasmURL = ffmpegWasmUrl;
+          // Il load usa gli URL STATICI (gli unici importabili dal worker ffmpeg).
           try {
-            const blobs = await ensureCoreBlobs({ onEngineProgress });
-            coreURL = blobs.coreUrl;
-            wasmURL = blobs.wasmUrl;
-          } catch (fetchError) {
-            // Fallback agli URL statici (passano per la CacheFirst del SW):
-            // il load diretto resta possibile senza percentuale.
+            await warmEngineCache({ onEngineProgress });
+          } catch (warmError) {
+            // Warm fallito: il load diretto resta possibile (da SW o rete),
+            // senza percentuale ma senza bloccare l'utente.
             reportEngineBytes(onEngineProgress, 0, 0);
           }
           // La compilazione WASM su CPU lente dura secondi nel silenzio:
           // segnalala come fase esplicita prima del freeze percepito.
           reportEngineStage(onEngineStage, 'compiling');
           try {
-            return await ffmpeg.load({ coreURL, wasmURL });
+            return await ffmpeg.load({ coreURL: ffmpegCoreUrl, wasmURL: ffmpegWasmUrl });
+          } catch (loadError) {
+            // Cache avvelenata (wasm tronco): purga e riprova UNA volta da rete.
+            if (isCorruptEngineError(loadError)) {
+              await purgeWasmCaches();
+              engineWarmCache.promise = null;
+              try {
+                await warmEngineCache({ onEngineProgress });
+              } catch {
+                // ignore: il retry passa comunque da rete/SW
+              }
+              reportEngineStage(onEngineStage, 'compiling');
+              return await ffmpeg.load({ coreURL: ffmpegCoreUrl, wasmURL: ffmpegWasmUrl });
+            }
+            throw loadError;
           } finally {
             reportEngineStage(onEngineStage, 'ready');
           }

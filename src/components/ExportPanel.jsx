@@ -58,12 +58,14 @@ export function ExportPanel({
   return (
     <aside className="summary-column">
       <div className="summary-head">
-        <p className="section-label">Anteprima esportazione</p>
+        <p className="section-label">03 · Scarica le parti</p>
         <strong>
           {plan.segments.length > 0 ? `${plan.segments.length} file pronti` : 'In attesa'}
         </strong>
       </div>
 
+      <details className="advanced-disclosure">
+        <summary>Impostazioni export (formato, qualità, destinazione)</summary>
       <div className="export-settings">
         <label className="field">
           <span>Nome base dei file</span>
@@ -198,6 +200,7 @@ export function ExportPanel({
           <p className="preset-estimate">{resumeNotice}</p>
         ) : null}
       </div>
+      </details>
 
       {plan.segments.length > 0 ? (
         <div className="segment-stack">
@@ -234,7 +237,7 @@ export function ExportPanel({
           ))}
         </div>
       ) : (
-        <p className="empty-text">Le parti appariranno qui appena il piano è valido.</p>
+        <p className="empty-text">Definisci almeno 2 parti nella sezione 02 · Definisci i tagli: appariranno qui con stima del peso.</p>
       )}
 
       {isExporting ? (

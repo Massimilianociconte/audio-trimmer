@@ -35,7 +35,7 @@ import {
 } from './lib/time.js';
 import { WaveformEditor } from './components/WaveformEditor.jsx';
 import { NativeAudioPreview } from './components/NativeAudioPreview.jsx';
-import { LoadingBar } from './components/ProgressBars.jsx';
+import { LoadingBar, StepsBar, StickyExportBar } from './components/ProgressBars.jsx';
 import { PlayerControls, RATE_PRESETS } from './components/PlayerControls.jsx';
 import { BookmarksPanel } from './components/BookmarksPanel.jsx';
 import { AutomationPanel } from './components/AutomationPanel.jsx';
@@ -2732,6 +2732,8 @@ export default function App() {
   }
 
   const canExport = Boolean(audioFile) && !plan.error && plan.segments.length >= 2 && !isBusy;
+  const activeStep = !audioFile ? 0 : (plan.error || plan.segments.length < 2 ? 1 : (!lastResult ? 2 : 3));
+  const showStickyCta = Boolean(audioFile) && canExport && !isExporting && !isBusy;
   const helperChips = [
     'Locale nel browser',
     'Un solo upload',
@@ -2739,7 +2741,7 @@ export default function App() {
   ];
 
   return (
-    <div className="shell">
+    <div className={`shell${showStickyCta ? ' shell-has-cta' : ''}`}>
       <div className="aurora aurora-left" />
       <div className="aurora aurora-right" />
 
@@ -2927,13 +2929,15 @@ export default function App() {
                 }}
               onCancel={handleCancelAnalysis}
             />
-          ) : null}
+          ) : (
+            <StepsBar activeStep={activeStep} />
+          )}
 
           {audioFile ? (
             <div className="studio">
               <div className="studio-head">
                 <div>
-                  <p className="section-label">File caricato</p>
+                  <p className="section-label">01 · Ascolta e segna</p>
                   <h2>{audioFile.name}</h2>
                   <div className="meta-row">
                     <span>{formatClock(audioFile.duration)}</span>
@@ -3034,29 +3038,34 @@ export default function App() {
           ) : null}
 
           {audioFile ? (
-            <AutomationPanel
-              silenceThresholdDb={silenceThresholdDb}
-              silenceMinDuration={silenceMinDuration}
-              silenceMinSegment={silenceMinSegment}
-              onSilenceThresholdChange={setSilenceThresholdDb}
-              onSilenceDurationChange={setSilenceMinDuration}
-              onSilenceMinSegmentChange={setSilenceMinSegment}
-              onDetectSilences={handleDetectSilences}
-              cleanupPreset={cleanupPreset}
-              onCleanupPresetChange={setCleanupPreset}
-              onApplyCleanup={handleApplyCleanup}
-              onRestoreOriginal={handleRestoreOriginal}
-              hasOriginalBackup={Boolean(originalAudioBackup)}
-              hasCleanedAudio={Boolean(originalAudioBackup)}
-              disabled={isBusy}
-              lastDetectionSummary={lastDetectionSummary}
-              audioDurationSeconds={audioFile?.duration ?? 0}
-            />
+            <details className="advanced-disclosure">
+              <summary>Strumenti avanzati: rileva silenzi e pulisci audio</summary>
+              <AutomationPanel
+                silenceThresholdDb={silenceThresholdDb}
+                silenceMinDuration={silenceMinDuration}
+                silenceMinSegment={silenceMinSegment}
+                onSilenceThresholdChange={setSilenceThresholdDb}
+                onSilenceDurationChange={setSilenceMinDuration}
+                onSilenceMinSegmentChange={setSilenceMinSegment}
+                onDetectSilences={handleDetectSilences}
+                cleanupPreset={cleanupPreset}
+                onCleanupPresetChange={setCleanupPreset}
+                onApplyCleanup={handleApplyCleanup}
+                onRestoreOriginal={handleRestoreOriginal}
+                hasOriginalBackup={Boolean(originalAudioBackup)}
+                hasCleanedAudio={Boolean(originalAudioBackup)}
+                disabled={isBusy}
+                lastDetectionSummary={lastDetectionSummary}
+                audioDurationSeconds={audioFile?.duration ?? 0}
+              />
+            </details>
           ) : null}
 
-          <div className="editor-grid">
-            <div className="editor-column">
-              <div className="mode-switch">
+          {audioFile ? (
+            <div className="editor-grid">
+              <div className="editor-column">
+                <p className="section-label">02 · Definisci i tagli</p>
+                <div className="mode-switch">
                 <button
                   type="button"
                   className={mode === 'equal' ? 'mode-active' : ''}
@@ -3172,8 +3181,8 @@ export default function App() {
                   <div className="cut-list">
                     {customCuts.length === 0 ? (
                       <p className="empty-text">
-                        Nessun punto inserito. Premi un pulsante sopra oppure aggiungi un
-                        tempo manuale.
+                        Nessun punto inserito. Premi «Usa la posizione corrente»,
+                        doppio click sulla forma d’onda, oppure aggiungi un tempo manuale.
                       </p>
                     ) : null}
 
@@ -3275,6 +3284,9 @@ export default function App() {
             {errorText ? <p className="error-text" role="alert">{errorText}</p> : null}
 
             <div className="summary-column summary-sub">
+              <details className="advanced-disclosure">
+                <summary>Progetto, JSON e trascrizione AI</summary>
+                <div className="summary-sub-body">
               <div className="save-row">
                 <button
                   type="button"
@@ -3352,9 +3364,16 @@ export default function App() {
                 Il download crea un unico ZIP più i singoli già rinominati.
                 I progetti salvati restano in questo browser, offline.
               </p>
+                </div>
+              </details>
             </div>
             </div>
           </div>
+        ) : (
+          <p className="empty-text steps-hint">
+            Carica un file audio per sbloccare i passi 2 e 3: ascolto, tagli e scaricamento.
+          </p>
+        )}
         </section>
 
         <section className="details">
@@ -3370,7 +3389,7 @@ export default function App() {
 
           <div className="detail">
             <p className="section-label">Qualità</p>
-            <strong>M4A, MP3, OGG o WAV a tua scelta.</strong>
+            <strong>M4A, MP3, OGG, WAV o FLAC a tua scelta.</strong>
             <p>
               Predefinito AAC in M4A a 128 kbps per lezioni e parlato. Taglio veloce senza
               ricodifica quando possibile, fade in/out opzionale per giunte pulite.
@@ -3445,6 +3464,13 @@ export default function App() {
           </p>
         </footer>
       </main>
+      <StickyExportBar
+        visible={showStickyCta}
+        partsCount={plan.segments.length}
+        formatLabel={getExportFormat(exportFormat).label}
+        disabled={!canExport}
+        onExport={processAndDownload}
+      />
     </div>
   );
 }

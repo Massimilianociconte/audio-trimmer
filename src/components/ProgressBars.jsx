@@ -1,6 +1,42 @@
 import { LOAD_STAGES, clamp01, formatEtaClock, loadStageLabel } from '../lib/progress.js';
 import { formatBytes } from '../lib/time.js';
 
+const APP_STEPS = ['Carica', 'Ascolta e segna', 'Definisci i tagli', 'Scarica'];
+
+/** Indicatore dei 4 passi del flusso, con stato raggiunto/corrente. */
+export function StepsBar({ activeStep }) {
+  const active = Math.min(Math.max(Number(activeStep) || 0, 0), APP_STEPS.length - 1);
+  return (
+    <ol className="steps-bar" aria-label="Passi del flusso di lavoro">
+      {APP_STEPS.map((label, index) => (
+        <li
+          key={label}
+          className={`step ${index < active ? 'step-done' : ''} ${index === active ? 'step-current' : ''}`}
+          {...(index === active ? { 'aria-current': 'step' } : {})}
+        >
+          <span className="step-number" aria-hidden="true">{index < active ? '✓' : index + 1}</span>
+          <span className="step-label">{label}</span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/** CTA export sempre a portata di pollice su telefono/tablet. */
+export function StickyExportBar({ visible, partsCount, formatLabel, disabled, onExport }) {
+  if (!visible) {
+    return null;
+  }
+  return (
+    <div className="sticky-cta" role="region" aria-label="Scarica le parti">
+      <span className="sticky-cta-count">{partsCount} parti · {formatLabel}</span>
+      <button type="button" className="primary-button sticky-cta-button" onClick={onExport} disabled={disabled}>
+        Taglia e scarica
+      </button>
+    </div>
+  );
+}
+
 function percentText(frac) {
   if (frac === null || frac === undefined || !Number.isFinite(Number(frac))) {
     return null;
