@@ -1,4 +1,8 @@
+import { createActivityWatch } from './activityWatch.js';
+
 // Only the fixed-size engine is accumulated here, never user audio.
+// Lo stallo si misura in tempo ATTIVO: su iPad/telefono cambiare app sospende
+// la rete della pagina; al ritorno il download riprende invece di fallire.
 export async function downloadEngineWasm(url, {
   expectedBytes, onBytes = () => {}, signal, fetchImpl = globalThis.fetch,
   stallMs = 20000, maxAttempts = 3, retryDelayMs = 1000,
@@ -13,18 +17,21 @@ export async function downloadEngineWasm(url, {
     const cancel = () => controller.abort(abortError());
     signal?.addEventListener('abort', cancel, { once: true });
     let reader;
-    let timer;
+    let watch = null;
     const timed = async (operation) => {
       let rejectTimeout;
       const timeout = new Promise((_, reject) => { rejectTimeout = reject; });
       const onAbort = () => rejectTimeout(controller.signal.reason);
       controller.signal.addEventListener('abort', onAbort, { once: true });
-      timer = setTimeout(() => controller.abort(new Error('Connessione in stallo durante il download del motore.')), stallMs);
+      watch = createActivityWatch({
+        limitMs: stallMs,
+        onExpire: () => controller.abort(new Error('Connessione in stallo durante il download del motore.')),
+      });
       try {
         controller.signal.throwIfAborted();
         return await Promise.race([operation(), timeout]);
       } finally {
-        clearTimeout(timer);
+        watch.stop();
         controller.signal.removeEventListener('abort', onAbort);
       }
     };
@@ -68,7 +75,7 @@ export async function downloadEngineWasm(url, {
       if (error?.fatal || attempt === maxAttempts) throw error;
       if (!resumable) { chunks.length = 0; loaded = 0; }
     } finally {
-      clearTimeout(timer);
+      watch?.stop();
       controller.abort();
       if (reader) {
         reader.cancel().catch(() => {});

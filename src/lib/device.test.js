@@ -95,6 +95,12 @@ describe('device', () => {
     });
     assert.deepEqual(resolveExportModeForDevice('singles', desktop).mode, 'singles');
     assert.deepEqual(resolveExportModeForDevice('zip-classic', iPad).mode, 'zip-classic');
+    // Android in automatico: parti singole in «Download», niente ZIP da estrarre.
+    const androidPhone = { navigator: { userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8)' } };
+    assert.equal(resolveExportModeForDevice('zip-classic', androidPhone, { preference: 'auto' }).mode, 'singles');
+    // Scelta esplicita dell'utente: si rispetta.
+    assert.equal(resolveExportModeForDevice('zip-classic', androidPhone, { preference: 'zip-classic' }).mode, 'zip-classic');
+    assert.equal(resolveExportModeForDevice('zip-classic', desktop, { preference: 'auto' }).mode, 'zip-classic');
   });
 
   it('warm-up motore solo su desktop adeguati, senza risparmio dati / 2G', () => {

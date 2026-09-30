@@ -1,21 +1,21 @@
 import { isFfmpegProgressLine, parseFfmpegProgressSeconds } from './progress.js';
+import { createActivityWatch, withActiveTimeout } from './activityWatch.js';
 
 // Metadata probes do not emit periodic progress. A dead worker must still
 // release the UI; preserve the core's -1 exit code for successful probes.
+// La scadenza conta solo il tempo attivo: una scheda sospesa non è un worker morto.
 export async function runFfprobe(ffmpeg, args, { timeoutMs = 120000 } = {}) {
-  let timer;
   try {
-    return await Promise.race([
+    return await withActiveTimeout(
       ffmpeg.ffprobe(args),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => {
-          reject(new Error('Il motore non risponde durante la lettura dei metadati. Riprova il motore o usa un file più piccolo.'));
-          try { ffmpeg.terminate(); } catch { /* already terminated */ }
-        }, timeoutMs);
-      }),
-    ]);
-  } finally {
-    clearTimeout(timer);
+      timeoutMs,
+      'Il motore non risponde durante la lettura dei metadati. Riprova il motore o usa un file più piccolo.',
+    );
+  } catch (error) {
+    if (error?.isTimeout) {
+      try { ffmpeg.terminate(); } catch { /* already terminated */ }
+    }
+    throw error;
   }
 }
 
@@ -23,7 +23,7 @@ export async function runFfmpeg(ffmpeg, args, { durationSeconds = 0, onProgress 
   const logs = [];
   const tail = [];
   let lastSeconds = -1;
-  let lastActivityAt = Date.now();
+  let watch = null;
   let lastReportAt = -Infinity;
   let logBytes = 0;
   let logOverflow = false;
@@ -45,7 +45,7 @@ export async function runFfmpeg(ffmpeg, args, { durationSeconds = 0, onProgress 
     }
   };
   const onLog = ({ message }) => {
-    lastActivityAt = Date.now();
+    watch?.touch();
     if (typeof message !== 'string') {
       return;
     }
@@ -68,7 +68,7 @@ export async function runFfmpeg(ffmpeg, args, { durationSeconds = 0, onProgress 
     }
   };
   const onProgressEvent = ({ time }) => {
-    lastActivityAt = Date.now();
+    watch?.touch();
     const micros = Number(time);
     if (Number.isFinite(micros) && micros >= 0) {
       report(micros / 1e6);
@@ -89,21 +89,24 @@ export async function runFfmpeg(ffmpeg, args, { durationSeconds = 0, onProgress 
   }
   ffmpeg.on('log', onLog);
   ffmpeg.on('progress', onProgressEvent);
-  let watchdog;
+  // Inattività misurata solo in tempo ATTIVO: su telefono/iPad cambiare app o
+  // bloccare lo schermo sospende il worker, non lo uccide. Al ritorno l'export
+  // riprende invece di fallire.
   const stalled = new Promise((_, reject) => {
-    watchdog = setInterval(() => {
-      if (Date.now() - lastActivityAt < stallTimeoutMs) return;
-      const error = new Error('Il motore non risponde più (memoria insufficiente o scheda sospesa). Riprova con parti più corte.');
-      reject(error);
-      try { ffmpeg.terminate(); } catch { /* already terminated */ }
-    }, Math.min(5000, stallTimeoutMs));
+    watch = createActivityWatch({
+      limitMs: stallTimeoutMs,
+      onExpire: () => {
+        reject(new Error('Il motore si è bloccato (probabilmente memoria piena). Chiudi le altre app o schede e riprova, oppure dividi in parti più corte.'));
+        try { ffmpeg.terminate(); } catch { /* already terminated */ }
+      },
+    });
   });
   try {
     const exitCode = await Promise.race([ffmpeg.exec(fullArgs), stalled]);
     if (logOverflow) throw new Error('Il log di analisi ha raggiunto il limite di memoria: analizza un intervallo più breve.');
     return { exitCode, logText: logs.join('\n'), tailText: tail.join('\n') };
   } finally {
-    clearInterval(watchdog);
+    watch?.stop();
     ffmpeg.off('log', onLog);
     ffmpeg.off('progress', onProgressEvent);
   }

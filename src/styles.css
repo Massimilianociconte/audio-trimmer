@@ -71,6 +71,9 @@ button {
 .shell {
   position: relative;
   overflow: hidden;
+  /* clip: come hidden ma non scorrevole via codice (focus/scrollIntoView
+     spostavano di lato tutta l'app su telefono per colpa degli aloni). */
+  overflow: clip;
   min-height: 100vh;
   padding: 32px 20px 64px;
 }
@@ -164,6 +167,8 @@ button {
 
 .stage {
   display: grid;
+  /* minmax(0, …): una riga lunga non allarga la colonna oltre lo schermo (360 px). */
+  grid-template-columns: minmax(0, 1fr);
   gap: 22px;
 }
 
@@ -1425,7 +1430,7 @@ code {
   .stage-header,
   .status-strip,
   .loaded-file {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .lead,
@@ -1438,10 +1443,7 @@ code {
     position: static;
   }
 
-  /* Su telefono/tablet l'export (03) viene prima dei tagli: CTA raggiungibile */
-  .summary-stack {
-    order: -1;
-  }
+  /* Ordine naturale 01 → 02 → 03: la CTA resta raggiungibile dalla barra fissa. */
 
   .export-grid {
     grid-template-columns: 1fr;
@@ -3103,11 +3105,6 @@ input[type='range']::-moz-range-track {
   }
 }
 
-@media (max-width: 980px) {
-  .summary-stack {
-    order: -1;
-  }
-}
 
 /* --- Export grid: 2 colonne fino a 720px --- */
 @media (min-width: 721px) and (max-width: 980px) {
@@ -3354,4 +3351,371 @@ input[type='range']:disabled {
 
 .editor-column > .control-panel {
   padding-top: 0;
+}
+
+/* =====================================================================
+   Chiarezza su ogni schermo (v3): caricamento compatto, azioni principali
+   sopra la piega su telefono, niente elementi doppi.
+   ===================================================================== */
+
+.dropzone {
+  cursor: pointer;
+}
+
+.dropzone-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+/* File già aperto: il riquadro diventa una riga "Apri un altro audio". */
+.dropzone.dropzone-compact {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 14px;
+  min-height: 0;
+  padding: 12px 16px;
+  border-radius: var(--radius-md);
+  text-align: left;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.dropzone.dropzone-compact::after {
+  display: none;
+}
+
+.dropzone-compact-icon {
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 1.2rem;
+  font-weight: 700;
+}
+
+.dropzone-compact-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.dropzone.dropzone-compact strong {
+  font-size: 1rem;
+  letter-spacing: 0;
+}
+
+.dropzone-compact-text > span {
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.technical-log {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.78rem;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 720px) {
+  /* Schermo vuoto: titolo più contenuto, così "Scegli la registrazione" è
+     visibile senza scorrere anche su un telefono da 360×640. */
+  .topbar {
+    gap: 10px;
+    padding: 6px 2px 16px;
+  }
+
+  .topbar h1 {
+    font-size: clamp(2.1rem, 9.5vw, 2.8rem);
+    max-width: none;
+    line-height: 1;
+  }
+
+  .topbar .lead {
+    font-size: 0.95rem;
+    line-height: 1.5;
+  }
+
+  .topbar-compact .eyebrow {
+    display: none;
+  }
+
+  .topbar-compact h1 {
+    font-size: 1.35rem;
+    letter-spacing: -0.02em;
+  }
+
+  .topbar-compact {
+    padding: 0 2px 10px;
+  }
+
+  .dropzone:not(.dropzone-compact) {
+    min-height: 0;
+    padding: 22px 18px;
+    gap: 8px;
+  }
+
+  .dropzone:not(.dropzone-compact) strong {
+    font-size: 1.45rem;
+  }
+
+  .dropzone:not(.dropzone-compact) p {
+    font-size: 0.92rem;
+  }
+
+  .pill {
+    padding: 6px 10px;
+    font-size: 0.82rem;
+  }
+}
+
+/* --- Avvisi fissi in alto: conferme ed errori sempre visibili --- */
+.toaster {
+  position: fixed;
+  top: calc(12px + env(safe-area-inset-top, 0px));
+  left: 50%;
+  z-index: 60;
+  display: grid;
+  gap: 8px;
+  width: min(520px, calc(100vw - 24px));
+  transform: translateX(-50%);
+  pointer-events: none;
+}
+
+.toast {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+  padding: 12px 12px 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: #fffdf9;
+  color: var(--ink);
+  box-shadow: 0 14px 36px rgba(34, 23, 13, 0.18);
+  pointer-events: auto;
+  animation: toast-in 180ms ease-out both;
+}
+
+.toast-error {
+  border-color: rgba(182, 48, 47, 0.35);
+  background: #fff6f4;
+}
+
+.toast-success {
+  border-color: rgba(15, 140, 98, 0.3);
+}
+
+.toast-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--line);
+  color: var(--ink);
+  font-weight: 800;
+  font-size: 0.95rem;
+}
+
+.toast-error .toast-icon {
+  background: #b6302f;
+  color: #fff;
+}
+
+.toast-success .toast-icon {
+  background: var(--success);
+  color: #fff;
+}
+
+.toast-body {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding-top: 3px;
+}
+
+.toast-body strong {
+  font-size: 0.98rem;
+  line-height: 1.3;
+}
+
+.toast-body span {
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.45;
+}
+
+.toast-error .toast-body span {
+  color: #6f2a22;
+}
+
+.toast-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.toast-action {
+  min-height: 36px;
+  padding: 6px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--accent-text);
+  font-weight: 700;
+}
+
+.toast-close {
+  display: inline-grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted);
+  font-size: 1.4rem;
+  line-height: 1;
+}
+
+.toast-close:hover,
+.toast-action:hover {
+  background: rgba(34, 23, 13, 0.06);
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    animation: none;
+  }
+}
+
+/* --- Player: azioni principali in evidenza, avanzate richiudibili --- */
+.player-row-actions.player-cluster-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  min-width: 0;
+}
+
+.player-row-actions .action-button {
+  min-height: 48px;
+  font-size: 1rem;
+  font-weight: 700;
+}
+
+.player-row-actions .action-button:not(.action-secondary) {
+  border-color: rgba(239, 108, 47, 0.45);
+  color: var(--accent-text);
+  background: #fff;
+}
+
+.loop-disclosure {
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+}
+
+.loop-disclosure > summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+
+.loop-disclosure[open] > summary {
+  margin-bottom: 8px;
+}
+
+.loop-help {
+  margin: 10px 0 0;
+  font-size: 0.85rem;
+}
+
+@media (max-width: 720px) {
+  /* Velocità su una sola riga scorrevole invece di tre righe di pulsanti. */
+  .rate-presets {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scroll-snap-type: x proximity;
+    scrollbar-width: none;
+    margin-inline: -2px;
+    padding: 2px;
+  }
+
+  .rate-presets::-webkit-scrollbar {
+    display: none;
+  }
+
+  .rate-presets button {
+    flex: 0 0 auto;
+    scroll-snap-align: start;
+  }
+}
+
+/* Le griglie non devono mai allargarsi oltre lo schermo per una riga scorrevole. */
+.studio,
+.player-controls {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.studio > *,
+.player-controls > *,
+.player-row-secondary > .player-cluster {
+  min-width: 0;
+}
+
+/* Avanzamento della forma d'onda calcolata a blocchi */
+.native-progress {
+  display: block;
+  height: 6px;
+  margin: 2px 0 10px;
+  border-radius: 999px;
+  background: rgba(34, 23, 13, 0.08);
+  overflow: hidden;
+}
+
+.native-progress > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transform-origin: left center;
+  transition: transform 200ms ease-out;
+}
+
+@media (max-width: 720px) {
+  /* Velocità e zoom su righe separate: nessuno dei due viene schiacciato. */
+  .player-row-secondary {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+.where-files {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: rgba(15, 140, 98, 0.08);
+  color: #0b5e42;
 }

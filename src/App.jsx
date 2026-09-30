@@ -92,6 +92,9 @@ import {
 } from './lib/device.js';
 import { assertOutputBudget, outputMemoryPolicy, mountAudioInput, readAudioOutput } from './lib/memoryPolicy.js';
 import { hardResetApp } from './lib/cacheReset.js';
+import { splitMessage } from './lib/messages.js';
+import { computeWaveformPeaks } from './lib/peaks.js';
+import { Toaster } from './components/Toaster.jsx';
 import {
   FAST_LOAD_STAGES,
   LOAD_STAGES,
@@ -311,9 +314,56 @@ export default function App() {
   } = useFfmpegEngine();
 
   const [statusText, setStatusText] = useState(INITIAL_MESSAGE);
+  // Testi "tocca"/"clicca" e scorciatoie da tastiera secondo il dispositivo.
+  const touchUi = useMemo(() => isMobileDevice(), []);
+  const exportButtonRef = useRef(null);
+  const [exportButtonInView, setExportButtonInView] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
   const [errorText, setErrorText] = useState('');
+  // Avvisi fissi in alto (conferme ed errori sempre visibili, anche su telefono).
+  const [toasts, setToasts] = useState([]);
+  const toastSeqRef = useRef(0);
+  const toastTimersRef = useRef(new Map());
+  const dismissToast = useCallback((id) => {
+    const timer = toastTimersRef.current.get(id);
+    if (timer) {
+      window.clearTimeout(timer);
+      toastTimersRef.current.delete(id);
+    }
+    setToasts((previous) => previous.filter((toast) => toast.id !== id));
+  }, []);
+  const notify = useCallback(({ kind = 'info', title, detail = '', action = null, duration } = {}) => {
+    if (!title) {
+      return 0;
+    }
+    toastSeqRef.current += 1;
+    const id = toastSeqRef.current;
+    setToasts((previous) => {
+      // Un solo errore alla volta (il più recente) e al massimo tre avvisi.
+      const rest = kind === 'error' ? previous.filter((toast) => toast.kind !== 'error') : previous;
+      return [...rest, { id, kind, title, detail, action }].slice(-3);
+    });
+    const ms = duration ?? (kind === 'error' ? 0 : action ? 6000 : 3500);
+    if (ms > 0) {
+      toastTimersRef.current.set(id, window.setTimeout(() => dismissToast(id), ms));
+    }
+    return id;
+  }, [dismissToast]);
+  // Ogni errore compare anche come avviso fisso: su telefono il testo in pagina
+  // può essere fuori schermo. Quando l'errore si azzera, sparisce anche l'avviso.
+  useEffect(() => {
+    if (!errorText) {
+      setToasts((previous) => previous.filter((toast) => toast.kind !== 'error'));
+      return;
+    }
+    const { title, detail } = splitMessage(errorText);
+    notify({ kind: 'error', title, detail });
+  }, [errorText, notify]);
+
+  useEffect(() => () => {
+    for (const timer of toastTimersRef.current.values()) window.clearTimeout(timer);
+  }, []);
   const [mode, setMode] = useState('equal');
   const [equalParts, setEqualParts] = useState(2);
   const [customCuts, setCustomCuts] = useState([]);
@@ -433,6 +483,65 @@ export default function App() {
     }),
     [audioFile?.size, audioFile?.duration, waveformRate],
   );
+
+  // Forma d'onda anche per i file lunghi: picchi calcolati a blocchi da ~60 s
+  // (memoria costante). Intanto l'anteprima nativa permette già ascolto e tagli.
+  const [peaksState, setPeaksState] = useState(null);
+  const [peaksShownFor, setPeaksShownFor] = useState('');
+  const peaksStartAtRef = useRef(0);
+  useEffect(() => {
+    const file = audioFileRef.current;
+    if (!file?.objectUrl || !useNativePreview || file.browserPlayable === false) {
+      setPeaksState(null);
+      return undefined;
+    }
+    const source = file.objectUrl;
+    const controller = new AbortController();
+    let lastFrac = 0;
+    setPeaksState({ source, status: 'working', frac: 0, peaks: null });
+    computeWaveformPeaks(file.blob, {
+      durationSeconds: file.duration,
+      signal: controller.signal,
+      // Mai insieme a export/pulizia: i picchi di memoria non si sommano.
+      isPaused: () => isBusyRef.current,
+      onProgress: (frac) => {
+        if (frac < 1 && frac - lastFrac < 0.03) return;
+        lastFrac = frac;
+        setPeaksState((previous) => (previous?.source === source && previous.status === 'working'
+          ? { ...previous, frac }
+          : previous));
+      },
+    })
+      .then((result) => {
+        setPeaksState((previous) => (previous?.source !== source ? previous
+          : result ? { source, status: 'ready', frac: 1, peaks: result.peaks }
+            : { source, status: 'unsupported', frac: 0, peaks: null }));
+      })
+      .catch(() => {
+        if (controller.signal.aborted) return;
+        setPeaksState((previous) => (previous?.source === source
+          ? { source, status: 'unsupported', frac: 0, peaks: null }
+          : previous));
+      });
+    return () => controller.abort();
+  }, [audioFile?.objectUrl, audioFile?.browserPlayable, useNativePreview]);
+
+  // Passaggio automatico alla forma d'onda appena pronta, mai a metà ascolto:
+  // si aspetta la pausa e si riparte dallo stesso punto.
+  const peaksReady = Boolean(audioFile) && peaksState?.status === 'ready' && peaksState.source === audioFile.objectUrl;
+  useEffect(() => {
+    if (!peaksReady || isPlaying || peaksShownFor === peaksState.source) return;
+    peaksStartAtRef.current = waveformRef.current?.getCurrentTime?.() ?? 0;
+    setPeaksShownFor(peaksState.source);
+  }, [peaksReady, isPlaying, peaksShownFor, peaksState]);
+  const showPeaksWaveform = peaksReady && peaksShownFor === audioFile?.objectUrl;
+  const nativeNote = peaksState && audioFile && peaksState.source === audioFile.objectUrl
+    ? peaksState.status === 'working'
+      ? `Preparo la forma d’onda… ${Math.round((peaksState.frac || 0) * 100)}%. Intanto puoi già ascoltare, tagliare e scaricare.`
+      : peaksState.status === 'ready'
+        ? 'Forma d’onda pronta: compare appena metti in pausa.'
+        : 'Forma d’onda non disponibile per questo formato su questo dispositivo: ascolto, tagli ed export funzionano normalmente.'
+    : null;
 
   /**
    * Rende disponibile l'audio corrente al motore SENZA copiarlo: WORKERFS
@@ -920,22 +1029,36 @@ export default function App() {
           Math.abs(point.position - safeSeconds) < 0.1,
       );
       if (alreadyNear) {
+        notify({ kind: 'info', title: `C’è già un taglio a ${formatClock(safeSeconds)}` });
         return;
       }
+      const wasEqual = mode === 'equal';
       pushCutsHistory(customCuts);
       setMode('custom');
-      setCustomCuts(
-        [
-          ...customCuts,
-          {
-            id: createPointId(),
-            value: formatClock(safeSeconds),
-            position: safeSeconds,
+      const nextCuts = [
+        ...customCuts,
+        {
+          id: createPointId(),
+          value: formatClock(safeSeconds),
+          position: safeSeconds,
+        },
+      ].sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
+      setCustomCuts(nextCuts);
+      const parts = nextCuts.filter((point) => typeof point.position === 'number').length + 1;
+      notify({
+        kind: 'success',
+        title: `Taglio aggiunto a ${formatClock(safeSeconds)}`,
+        detail: `Ora ${parts} parti.${wasEqual ? ' Sei passato a «Punti personalizzati».' : ''}`,
+        action: {
+          label: 'Annulla',
+          onClick: () => {
+            undoCutsRef.current?.();
+            if (wasEqual) setMode('equal');
           },
-        ].sort((a, b) => (a.position ?? 0) - (b.position ?? 0)),
-      );
+        },
+      });
     },
-    [audioFile?.duration, customCuts, pushCutsHistory],
+    [audioFile?.duration, customCuts, pushCutsHistory, mode, notify],
   );
 
   const handleUndoCuts = useCallback(() => {
@@ -946,6 +1069,9 @@ export default function App() {
     setCutsHistory(cutsHistory.slice(0, -1));
     setCustomCuts(restored);
   }, [cutsHistory]);
+  // Il pulsante "Annulla" di un avviso deve usare la cronologia attuale, non quella del momento del taglio.
+  const undoCutsRef = useRef(null);
+  undoCutsRef.current = handleUndoCuts;
 
   const handleSortAndCleanCuts = useCallback(() => {
     if (customCuts.length < 2) {
@@ -1129,7 +1255,12 @@ export default function App() {
         { id: createPointId(), position, note: '' },
       ].sort((left, right) => left.position - right.position),
     );
-  }, [audioFile?.duration, getLivePosition]);
+    notify({
+      kind: 'success',
+      title: `Segnalibro a ${formatClock(position)}`,
+      detail: 'Puoi aggiungere una nota nella lista «Segnalibri».',
+    });
+  }, [audioFile?.duration, getLivePosition, notify]);
 
   const handleBookmarkJump = useCallback(
     (id) => {
@@ -1340,12 +1471,25 @@ export default function App() {
     const checkpoint = readCheckpoint();
     if (checkpoint && checkpoint.total >= 2) {
       const done = checkpoint.doneCount ?? checkpoint.doneNames?.length ?? 0;
+      // Il browser ha chiuso la pagina durante un export (quasi sempre memoria
+      // piena su telefono/tablet): lo si dice subito, con cosa fare.
+      const advice = checkpoint.destMode === 'folder'
+        ? 'Riapri lo stesso file e premi «Taglia e scarica»: le parti già salvate nella cartella vengono saltate.'
+        : 'Riapri lo stesso file e premi di nuovo «Taglia e scarica». Se succede ancora, chiudi le altre app e schede oppure dividi in più parti.';
       setResumeNotice(
-        `Ultimo export interrotto: ${done}/${checkpoint.total} parti "${checkpoint.baseName ?? ''}". ` +
-        'Ricarica lo stesso file e riesporta: in modalità cartella i file già presenti vengono saltati.',
+        `L’ultimo export di «${checkpoint.baseName ?? 'audio'}» si è interrotto (${done} di ${checkpoint.total} parti pronte). ${advice}`,
       );
+      notify({
+        kind: 'info',
+        title: 'L’ultimo export si è interrotto',
+        detail: `${done} di ${checkpoint.total} parti pronte, probabilmente per memoria piena. ${advice}`,
+        duration: 0,
+      });
+      if (checkpoint.destMode !== 'folder') {
+        clearCheckpoint();
+      }
     }
-  }, []);
+  }, [notify]);
 
   // Wake lock + avviso uscita durante QUALUNQUE elaborazione lunga (export,
   // pulizia, silenzi, download motore): lo schermo spento sospende la tab.
@@ -1396,6 +1540,19 @@ export default function App() {
     }, 600);
     return () => window.clearTimeout(handle);
   }, [audioFile, waveformPending, waveformDecodePending, engineInfo.phase, engineInfo.cached, prefetchEngine]);
+
+  useEffect(() => {
+    const target = exportButtonRef.current;
+    if (!target || typeof IntersectionObserver !== 'function') {
+      setExportButtonInView(false);
+      return undefined;
+    }
+    const observer = new IntersectionObserver(([entry]) => {
+      setExportButtonInView(Boolean(entry?.isIntersecting));
+    }, { threshold: 0.6 });
+    observer.observe(target);
+    return () => observer.disconnect();
+  }, [audioFile, isExporting]);
 
   const taskAbortRef = useRef(false);
   const taskGateRef = useRef(null);
@@ -2081,9 +2238,11 @@ export default function App() {
         setCurrentProjectId(null);
       }
       await refreshProjects();
+      notify({ kind: 'success', title: 'Progetto eliminato' });
     } catch (error) {
       console.error(error);
       setProjectsError(error.message || 'Eliminazione non riuscita.');
+      notify({ kind: 'error', title: 'Eliminazione non riuscita', detail: error.message || '' });
     }
   }
 
@@ -2681,7 +2840,7 @@ export default function App() {
       preference: exportDest,
     });
     // Su iPhone/iPad i download multipli sono bloccati (1 per gesto): un unico ZIP.
-    const deviceMode = resolveExportModeForDevice(advice.mode);
+    const deviceMode = resolveExportModeForDevice(advice.mode, globalThis, { preference: exportDest });
     const destMode = deviceMode.mode;
     setAdvisorNote([...advice.reasons, ...advice.warnings, ...(deviceMode.note ? [deviceMode.note] : [])].join(' '));
     // Trattiene i Blob per il re-download solo sotto soglia: sopra, solo metadati.
@@ -3050,6 +3209,11 @@ export default function App() {
         }
       }
       lastResultUrlsRef.current = [];
+      // Errore o annullo già mostrati: niente falso "export interrotto" al
+      // prossimo avvio. Resta solo in modalità cartella, dove serve a riprendere.
+      if (destMode !== 'folder') {
+        clearCheckpoint();
+      }
       if (cancelled) {
         setErrorText('');
         setFailedExportIndex(null);
@@ -3104,11 +3268,10 @@ export default function App() {
   const activeStep = !audioFile ? 0 : (plan.error || plan.segments.length < 2 ? 1 : (!lastResult ? 2 : 3));
   const effectiveFormat = getExportFormat(effectiveFormatId);
   const formatBadge = effectiveFastCopy ? `${effectiveFormat.label} originale` : effectiveFormat.label;
-  const helperChips = [
-    'Locale nel browser',
-    'Nessun upload',
-    effectiveFastCopy ? 'Taglio senza ricodifica' : `Export ${effectiveFormat.label}`,
-  ];
+  const helperChips = ['Nessun upload', 'Gratis, senza account', 'Qualità originale'];
+  // A schermo vuoto la barra di stato ripeteva il riquadro: compare solo quando dice qualcosa.
+  const showStatusStrip = Boolean(audioFile) || Boolean(loadJob?.active) || isBusy
+    || engineInfo.phase === 'downloading' || engineInfo.phase === 'compiling' || engineInfo.phase === 'error';
 
   // Stima PRIMA dell'export: secondi di audio / velocità (misurata su questo
   // dispositivo dopo il primo export, prudente prima) + motore se manca.
@@ -3196,7 +3359,8 @@ export default function App() {
     return null;
   })();
 
-  const showStickyCta = Boolean(audioFile) && canExport && !isExporting && !activity && !doneNote;
+  // La barra fissa sparisce quando il pulsante vero è già sullo schermo: mai due "Taglia e scarica" visibili.
+  const showStickyCta = Boolean(audioFile) && canExport && !isExporting && !activity && !doneNote && !exportButtonInView;
   const deviceLoadLimit = mobileLoadLimitBytes();
 
   return (
@@ -3223,7 +3387,7 @@ export default function App() {
 
       <header className={`topbar${audioFile ? ' topbar-compact' : ''}`}>
         <div>
-          <p className="eyebrow">Audio cutter pensato per GitHub Pages</p>
+          <p className="eyebrow">Per lezioni e registrazioni lunghe</p>
           <h1>
             Taglia una volta,
             <span> scarica tutto subito.</span>
@@ -3231,14 +3395,14 @@ export default function App() {
         </div>
         <p className="lead">
           Carichi un audio una sola volta, scegli il taglio e scarichi tutte le parti
-          già rinominate come <strong>parte 1</strong>, <strong>parte 2</strong>,
+          già rinominate come <strong>parte 1</strong>, <strong>parte 2</strong>,{' '}
           <strong>parte 3</strong>.
         </p>
       </header>
 
       <main className="workspace">
         <section className="stage">
-          <div className="stage-header">
+          {!audioFile ? (
             <div className="pill-group">
               {helperChips.map((chip) => (
                 <span className="pill" key={chip}>
@@ -3246,16 +3410,7 @@ export default function App() {
                 </span>
               ))}
             </div>
-
-            <button
-              className="ghost-button"
-              type="button"
-              onClick={() => inputRef.current?.click()}
-              disabled={isBusy}
-            >
-              Scegli un file
-            </button>
-          </div>
+          ) : null}
 
           <div className="capture-switcher" role="toolbar" aria-label="Sorgente audio">
             <button
@@ -3339,7 +3494,7 @@ export default function App() {
 
           {activeCapture === 'none' ? (
             <label
-              className={`dropzone ${dragActive ? 'dropzone-active' : ''} ${isBusy ? 'dropzone-busy' : ''}`}
+              className={`dropzone ${audioFile ? 'dropzone-compact' : ''} ${dragActive ? 'dropzone-active' : ''} ${isBusy ? 'dropzone-busy' : ''}`}
               onDragEnter={handleDragEnter}
               onDragLeave={handleDragLeave}
               onDragOver={handleDragOver}
@@ -3354,18 +3509,38 @@ export default function App() {
                 className="sr-only"
                 aria-label="Scegli un file audio"
               />
-              <span className="dropzone-kicker">{isBusy ? 'Attendi…' : 'Trascina qui oppure tocca'}</span>
-              <strong>{audioFile ? 'Carica un altro file audio' : 'Carica un file audio'}</strong>
-              <p>
-                MP3, M4A, WAV, OGG, FLAC, AAC, WMA, AIFF… Il file resta sul tuo dispositivo:
-                nessun upload.
-              </p>
-              {Number.isFinite(deviceLoadLimit) ? (
-                <span className="dropzone-limit">Su questo dispositivo fino a ~{Math.round(deviceLoadLimit / 1024 / 1024)} MB</span>
-              ) : null}
+              {audioFile ? (
+                <>
+                  <span className="dropzone-compact-icon" aria-hidden="true">↺</span>
+                  <span className="dropzone-compact-text">
+                    <strong>{isBusy ? 'Attendi la fine del lavoro…' : 'Apri un altro audio'}</strong>
+                    <span>{touchUi ? 'Tocca per scegliere' : 'Clicca o trascina qui un file'}</span>
+                  </span>
+                </>
+              ) : (
+                <>
+                  <span className="dropzone-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M9 18V5l12-2v13" />
+                      <circle cx="6" cy="18" r="3" />
+                      <circle cx="18" cy="16" r="3" />
+                    </svg>
+                  </span>
+                  <span className="dropzone-kicker">{isBusy ? 'Attendi…' : touchUi ? 'Tocca qui' : 'Trascina qui oppure clicca'}</span>
+                  <strong>Scegli la registrazione da tagliare</strong>
+                  <p>
+                    MP3, M4A, WAV, OGG, FLAC, AAC, WMA, AIFF… Il file resta sul tuo dispositivo:
+                    nessun upload.
+                  </p>
+                  {Number.isFinite(deviceLoadLimit) ? (
+                    <span className="dropzone-limit">Su questo dispositivo fino a ~{Math.round(deviceLoadLimit / 1024 / 1024)} MB</span>
+                  ) : null}
+                </>
+              )}
             </label>
           ) : null}
 
+          {showStatusStrip ? (
           <div className="status-strip">
             <EngineChip
               engineInfo={engineInfo}
@@ -3375,6 +3550,9 @@ export default function App() {
             />
             <p role="status" aria-live="polite">{statusText}</p>
           </div>
+          ) : (
+            <p className="sr-only" role="status" aria-live="polite">{statusText}</p>
+          )}
 
           {!audioFile && errorText ? <p className="error-text" role="alert">{errorText}</p> : null}
 
@@ -3400,14 +3578,16 @@ export default function App() {
                     <span>{audioFile.formatLabel}</span>
                   </div>
                 </div>
-                <button
-                  type="button"
-                  className="ghost-button"
-                  onClick={() => setShowShortcuts((value) => !value)}
-                  title="Mostra scorciatoie da tastiera"
-                >
-                  {showShortcuts ? 'Chiudi scorciatoie' : 'Scorciatoie tastiera'}
-                </button>
+                {!touchUi ? (
+                  <button
+                    type="button"
+                    className="ghost-button"
+                    onClick={() => setShowShortcuts((value) => !value)}
+                    title="Mostra scorciatoie da tastiera"
+                  >
+                    {showShortcuts ? 'Chiudi scorciatoie' : 'Scorciatoie tastiera'}
+                  </button>
+                ) : null}
               </div>
 
               {audioFile.browserPlayable === false ? (
@@ -3425,7 +3605,7 @@ export default function App() {
                     Crea anteprima ascoltabile
                   </button>
                 </div>
-              ) : useNativePreview || previewFallbackSource === audioFile.objectUrl ? (
+              ) : (useNativePreview && !showPeaksWaveform) || previewFallbackSource === audioFile.objectUrl ? (
                 <NativeAudioPreview
                   ref={waveformRef}
                   src={audioFile.objectUrl}
@@ -3434,6 +3614,8 @@ export default function App() {
                   onTimeUpdate={handleWaveformTimeUpdate}
                   onPlayStateChange={handleWaveformPlayStateChange}
                   onPreviewError={handleWaveformError}
+                  note={previewFallbackSource === audioFile.objectUrl ? null : nativeNote}
+                  progress={peaksState?.source === audioFile.objectUrl && peaksState.status === 'working' ? peaksState.frac : null}
                 />
               ) : (
                 <WaveformEditor
@@ -3456,6 +3638,8 @@ export default function App() {
                   onWaveformError={handleWaveformError}
                   onDecodePending={handleWaveformDecodePending}
                   sampleRate={waveformRate}
+                  peaks={showPeaksWaveform ? peaksState.peaks : null}
+                  startAt={showPeaksWaveform ? peaksStartAtRef.current : 0}
                 />
               )}
               {waveformError ? <p className="error-text" role="alert">{waveformError}</p> : null}
@@ -3481,7 +3665,7 @@ export default function App() {
                 onAddCutHere={handleAddCutHere}
                 onAddBookmarkHere={handleAddBookmarkHere}
                 disabled={isBusy}
-                nativeMode={useNativePreview}
+                nativeMode={useNativePreview && !showPeaksWaveform}
               />
 
               {showShortcuts ? (
@@ -3765,6 +3949,7 @@ export default function App() {
               chaptersStatus={chaptersStatus}
               resumeNotice={resumeNotice}
               disabled={isBusy}
+              primaryButtonRef={exportButtonRef}
             />
 
             {plan.error ? <p className="error-text" role="alert">{plan.error}</p> : null}
@@ -3848,9 +4033,13 @@ export default function App() {
               </div>
 
               <p className="helper-text">
-                Il download crea un unico ZIP più i singoli già rinominati.
-                I progetti salvati restano in questo browser, offline.
+                I progetti salvati restano in questo browser, anche offline.
               </p>
+              {technicalLog ? (
+                <p className="helper-text technical-log" title="Ultimo messaggio del motore di elaborazione">
+                  Dettaglio tecnico: {technicalLog}
+                </p>
+              ) : null}
                 </div>
               </details>
             </div>
@@ -3858,64 +4047,38 @@ export default function App() {
           </div>
         ) : (
           <p className="empty-text steps-hint">
-            Carica un file audio per sbloccare i passi 2 e 3: ascolto, tagli e scaricamento.
+            Scegli un audio: poi potrai ascoltarlo, decidere le parti e scaricarle già rinominate.
           </p>
         )}
         </section>
 
-        <section className="details">
-          <div className="detail">
-            <p className="section-label">Perché è più veloce</p>
-            <strong>Un solo file in ingresso, ZIP unico in uscita.</strong>
-            <p>
-              Il sito analizza il file una volta sola, applica tutti i punti di taglio in un
-              flusso guidato e scarica un unico ZIP con tutte le parti già rinominate.
-              Niente più popup multipli bloccati dal browser.
-            </p>
-          </div>
+        {!audioFile ? (
+          <section className="details">
+            <div className="detail">
+              <p className="section-label">Veloce</p>
+              <strong>Pochi secondi, anche per ore di audio.</strong>
+              <p>
+                Le parti MP3 e M4A si tagliano senza ricodifica: qualità identica all’originale
+                e nessuna attesa, anche da telefono o tablet.
+              </p>
+            </div>
 
-          <div className="detail">
-            <p className="section-label">Qualità</p>
-            <strong>M4A, MP3, OGG, WAV o FLAC a tua scelta.</strong>
-            <p>
-              Predefinito AAC in M4A a 128 kbps per lezioni e parlato. Taglio veloce senza
-              ricodifica quando possibile, fade in/out opzionale per giunte pulite.
-            </p>
-          </div>
+            <div className="detail">
+              <p className="section-label">Privato</p>
+              <strong>Il file non lascia il tuo dispositivo.</strong>
+              <p>
+                Tutto avviene nel browser: niente upload, niente account. Dopo la prima visita
+                funziona anche offline.
+              </p>
+            </div>
 
-          <div className="detail">
-            <p className="section-label">Stato tecnico</p>
-            <strong>{technicalLog || 'In attesa del prossimo passaggio.'}</strong>
-            <p>
-              {lastResult
-                ? `Ultimo export: ${lastResult.archiveName}`
-                : 'Qui comparirà l’ultimo messaggio utile del motore di elaborazione.'}
-            </p>
-          </div>
-        </section>
-
-        {lastResult ? (
-          <section className="result-banner">
-            <p className="section-label">Ultima esportazione</p>
-            <h3>{lastResult.archiveName}</h3>
-            <div className="result-list">
-              {lastResult.parts.map((part) => (
-                <span key={part.name}>
-                  {part.name} · {formatBytes(part.size)} · {formatClock(part.duration)}
-                  {part.url ? (
-                    <>
-                      {' · '}
-                      <button
-                        type="button"
-                        className="mini-button"
-                        onClick={() => handleDownloadSingle(part)}
-                      >
-                        Riscarica
-                      </button>
-                    </>
-                  ) : null}
-                </span>
-              ))}
+            <div className="detail">
+              <p className="section-label">Semplice</p>
+              <strong>Scegli, dividi, scarica.</strong>
+              <p>
+                Dividi in parti uguali o nei punti che preferisci e scarica ogni parte già
+                rinominata: «parte 1», «parte 2»…
+              </p>
             </div>
           </section>
         ) : null}
@@ -3960,6 +4123,15 @@ export default function App() {
         onExport={processAndDownload}
       />
       <ActivityDock activity={activity} done={activity ? null : doneNote} />
+      <Toaster
+        toasts={toasts}
+        onDismiss={(id) => {
+          if (toasts.some((toast) => toast.id === id && toast.kind === 'error')) {
+            setErrorText('');
+          }
+          dismissToast(id);
+        }}
+      />
     </div>
   );
 }

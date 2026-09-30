@@ -11,6 +11,18 @@ const BOOKMARK_COLOR = 'rgba(15, 140, 98, 0.85)';
 const BOOKMARK_COLOR_SOFT = 'rgba(15, 140, 98, 0.18)';
 const LOOP_COLOR = 'rgba(201, 73, 15, 0.18)';
 
+// Etichette della timeline sempre leggibili: almeno ~60 px tra una e l'altra
+// a qualunque larghezza/zoom (i default del plugin le sovrapponevano sugli
+// schermi stretti: "10:0020:0030:00…").
+const NICE_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200];
+export function timelineLabelStep(pxPerSec) {
+  return NICE_STEPS.find((step) => step * pxPerSec >= 60) ?? 7200;
+}
+export function timelineTickStep(pxPerSec) {
+  const label = timelineLabelStep(pxPerSec);
+  return [...NICE_STEPS].reverse().find((step) => step <= label && label % step === 0 && step * pxPerSec >= 10) ?? label;
+}
+
 export const WaveformEditor = forwardRef(function WaveformEditor(
   {
     src,
@@ -32,6 +44,10 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     onWaveformError,
     onDecodePending,
     sampleRate = 8000,
+    // Picchi calcolati a blocchi (lib/peaks.js): nessuna decodifica integrale.
+    peaks = null,
+    // Posizione da cui ripartire quando si passa dall'anteprima nativa alla forma d'onda.
+    startAt = 0,
   },
   ref,
 ) {
@@ -45,6 +61,8 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
   const isReadyRef = useRef(false);
   const latestRateRef = useRef(playbackRate);
   const latestZoomRef = useRef(zoom);
+  const startAtRef = useRef(startAt);
+  startAtRef.current = startAt;
   const [readyRevision, setReadyRevision] = useState(0);
   const [isDecoded, setIsDecoded] = useState(false);
   // Se il browser rifiuta la frequenza ridotta si ripiega a 8 kHz (una volta).
@@ -134,6 +152,9 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
         color: '#715742',
       },
     });
+    timelinePlugin.defaultTimeInterval = timelineTickStep;
+    timelinePlugin.defaultPrimaryLabelInterval = timelineLabelStep;
+    timelinePlugin.defaultSecondaryLabelInterval = timelineLabelStep;
     const hoverPlugin = HoverPlugin.create({
       lineColor: '#ef6c2f',
       lineWidth: 1,
@@ -190,6 +211,14 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
         }
       } catch (error) {
         // ignore: zoom will re-apply when the user moves the slider
+      }
+      const resumeAt = Number(startAtRef.current);
+      if (resumeAt > 0 && resumeAt < instance.getDuration()) {
+        try {
+          instance.setTime(resumeAt);
+        } catch {
+          // posizione non ancora applicabile: si riparte dall'inizio
+        }
       }
       setIsDecoded(true);
       callbacksRef.current.onReady?.(instance.getDuration());
@@ -275,9 +304,10 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     Promise.resolve().then(() => {
       if (disposed) return;
       reportPending?.(true);
+      const channelData = peaks ? [peaks] : undefined;
       return (blob
-        ? instance.loadBlob(blob, undefined, duration)
-        : instance.load(src, undefined, duration))
+        ? instance.loadBlob(blob, channelData, duration)
+        : instance.load(src, channelData, duration))
         .catch(handleDecodeError)
         .finally(() => reportPending?.(false));
     });
@@ -305,7 +335,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       bookmarkRegionsRef.current = new Map();
       loopRegionRef.current = null;
     };
-  }, [src, blob, decodeRate]);
+  }, [src, blob, decodeRate, peaks]);
 
   useEffect(() => {
     const ws = wsRef.current;

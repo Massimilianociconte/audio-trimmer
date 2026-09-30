@@ -37,6 +37,17 @@ Web app statica per tagliare file audio direttamente nel browser, senza ri-uploa
   dato di memoria, es. iPhone/iPad; 512 MiB con 8 GB dichiarati). Il limite dipende solo dalla
   RAM dichiarata dal browser, non da telefono/tablet/desktop: una registrazione da 160–180 MB
   divisa in due si esporta anche da tablet. Se una parte non ci sta, l’errore indica quante parti servono
+- **forma d'onda anche per lezioni lunghe su telefono e tablet**: se decodificare tutto il file in
+  memoria è rischioso, i picchi si calcolano a blocchi di ~60 s (memoria costante, ~50 MB).
+  WAV letto direttamente; MP3/AAC tagliati sui fotogrammi; M4A riconvertito in ADTS in JavaScript.
+  Ritardi di codifica compensati (tag LAME, edit list MP4): 0 ms di scarto rispetto alla
+  decodifica integrale su Chromium. Intanto l'anteprima nativa permette già ascolto e tagli;
+  il passaggio alla forma d'onda avviene alla prima pausa, dalla stessa posizione
+- **niente falsi "motore bloccato"**: le scadenze di export, analisi e download del motore contano
+  solo il tempo in cui la pagina è attiva (cambiare app o bloccare lo schermo non fa fallire nulla)
+- **ogni azione ha un riscontro**: avvisi fissi in alto per errori (restano finché non li chiudi) e
+  conferme (tagli e segnalibri con «Annulla»); dopo l'export l'app dice dove trovare i file
+  sul tuo dispositivo; su Android le parti arrivano come file separati, su iPhone/iPad in uno ZIP
 - **avanzamento reale** su export, silenzi, pulizia e copia per AI (`-progress pipe:1`): percentuale,
   velocità "× tempo reale", ETA, stato di ogni parte, pannello fisso sempre visibile, annulla immediato
 - AAC con coder `fast` (2-9× più veloce del `twoloop` nel core single-thread), stima dei tempi

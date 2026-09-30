@@ -221,12 +221,18 @@ export function shouldUseNativePreview({ sizeBytes = 0, durationSeconds = 0, sam
  * iOS consente un solo download per gesto utente: la modalità "singles"
  * (N click programmatici) arriva a 1 parte e sembra "export rotto".
  */
-export function resolveExportModeForDevice(mode, env = globalThis) {
+export function resolveExportModeForDevice(mode, env = globalThis, { preference = 'auto' } = {}) {
   if (mode === 'singles' && isIOS(env)) {
     return {
       mode: 'zip-classic',
       note: 'Su iPhone/iPad uso un unico ZIP (iOS blocca i download multipli).',
     };
+  }
+  // Android: le parti singole finiscono subito in «Download», pronte da
+  // ascoltare o condividere; uno ZIP va estratto (passo in più per chi è poco
+  // pratico). Se Chrome blocca il secondo download restano i pulsanti «Scarica».
+  if (mode === 'zip-classic' && preference === 'auto' && isAndroid(env) && !isIOS(env)) {
+    return { mode: 'singles', note: 'Su Android scarico le parti come file separati nella cartella Download.' };
   }
   return { mode, note: '' };
 }

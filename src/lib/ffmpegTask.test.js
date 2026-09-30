@@ -24,7 +24,7 @@ test('capture filtering preserves useful silence lines only',async()=>{
 
 test('a silent dead worker is terminated after the activity deadline',async()=>{
  const ffmpeg=engine(()=>new Promise(()=>{}));let terminated=0;ffmpeg.terminate=()=>terminated++;
- await assert.rejects(runFfmpeg(ffmpeg,[],{stallTimeoutMs:10}),/risponde|memoria/i);assert.equal(terminated,1);assert.equal(ffmpeg.callbacks.size,0);
+ await assert.rejects(runFfmpeg(ffmpeg,[],{stallTimeoutMs:10}),/risponde|memoria|bloccato/i);assert.equal(terminated,1);assert.equal(ffmpeg.callbacks.size,0);
 });
 
 test('a metadata probe with a dead worker has a bounded wait', async () => {

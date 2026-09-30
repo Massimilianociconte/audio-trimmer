@@ -53,7 +53,7 @@ export function PlayerControls({
           disabled={disabled}
           title={isPlaying ? 'Pausa (Spazio)' : 'Play (Spazio)'}
         >
-          {isPlaying ? 'Pausa' : 'Play'}
+          <span aria-hidden="true">{isPlaying ? '❚❚' : '▶'}</span> {isPlaying ? 'Pausa' : 'Ascolta'}
         </button>
         <button
           type="button"
@@ -78,6 +78,27 @@ export function PlayerControls({
           <strong>{formatClock(currentTime)}</strong>
           <span> / {formatClock(duration)}</span>
         </div>
+      </div>
+
+      <div className="player-row player-row-actions player-cluster-actions">
+        <button
+          type="button"
+          className="action-button"
+          onClick={onAddCutHere}
+          disabled={disabled}
+          title="Aggiungi un taglio nel punto che stai ascoltando (C)"
+        >
+          <span aria-hidden="true">✂</span> Taglia qui
+        </button>
+        <button
+          type="button"
+          className="action-button action-secondary"
+          onClick={onAddBookmarkHere}
+          disabled={disabled}
+          title="Segna questo punto per ritrovarlo (B)"
+        >
+          <span aria-hidden="true">★</span> Segnalibro
+        </button>
       </div>
 
       <div className="player-row player-row-secondary">
@@ -121,65 +142,48 @@ export function PlayerControls({
         )}
       </div>
 
-      <div className="player-row player-row-tertiary">
-        <div className="player-cluster">
-          <label className="cluster-label">Loop A-B</label>
-          <div className="loop-controls">
-            <button
-              type="button"
-              onClick={onSetLoopStart}
-              disabled={disabled}
-              title="Imposta inizio loop (A)"
-              className={waitingForEnd ? 'loop-waiting' : ''}
-            >
-              {waitingForEnd ? `A: ${formatClock(loopDraft)}` : 'Punto A'}
-            </button>
-            <button
-              type="button"
-              onClick={onSetLoopEnd}
-              disabled={disabled || (!waitingForEnd && !isLooping)}
-              title="Imposta fine loop (B)"
-            >
-              Punto B
-            </button>
-            <button
-              type="button"
-              onClick={onClearLoop}
-              disabled={disabled || (!isLooping && !waitingForEnd)}
-              className="loop-clear"
-              title="Disattiva loop"
-            >
-              Reset
-            </button>
-            {isLooping ? (
-              <span className="loop-indicator">
-                {formatClock(loopRegion.start)} → {formatClock(loopRegion.end)}
-              </span>
-            ) : null}
-          </div>
-        </div>
-
-        <div className="player-cluster player-cluster-actions">
+      <details className="loop-disclosure" open={isLooping || waitingForEnd || undefined}>
+        <summary>
+          Ripeti un tratto (A-B)
+          {isLooping ? (
+            <span className="loop-indicator">
+              {formatClock(loopRegion.start)} → {formatClock(loopRegion.end)}
+            </span>
+          ) : null}
+        </summary>
+        <div className="loop-controls">
           <button
             type="button"
-            className="action-button"
-            onClick={onAddCutHere}
+            onClick={onSetLoopStart}
             disabled={disabled}
-            title="Aggiungi un taglio qui (C)"
+            title="Imposta inizio del tratto (A)"
+            className={waitingForEnd ? 'loop-waiting' : ''}
           >
-            Taglia qui
+            {waitingForEnd ? `A: ${formatClock(loopDraft)}` : 'Inizio (A)'}
           </button>
           <button
             type="button"
-            className="action-button action-secondary"
-            onClick={onAddBookmarkHere}
-            disabled={disabled}
-            title="Aggiungi segnalibro (B)"
+            onClick={onSetLoopEnd}
+            disabled={disabled || (!waitingForEnd && !isLooping)}
+            title="Imposta fine del tratto (B)"
           >
-            Segnalibro
+            Fine (B)
+          </button>
+          <button
+            type="button"
+            onClick={onClearLoop}
+            disabled={disabled || (!isLooping && !waitingForEnd)}
+            className="loop-clear"
+            title="Smetti di ripetere"
+          >
+            Stop ripetizione
           </button>
         </div>
-      </div>
+        <p className="helper-text loop-help">
+          Premi «Inizio» e «Fine» mentre ascolti: il tratto si ripete finché non premi «Stop».
+          Puoi anche scaricarlo da solo nel passo 03.
+        </p>
+      </details>
     </div>
   );
 }

@@ -14,6 +14,8 @@ export const NativeAudioPreview = forwardRef(function NativeAudioPreview(
     onTimeUpdate,
     onPlayStateChange,
     onPreviewError,
+    note = null,
+    progress = null,
   },
   ref,
 ) {
@@ -109,9 +111,20 @@ export const NativeAudioPreview = forwardRef(function NativeAudioPreview(
   return (
     <div className="native-preview">
       <p className="helper-text native-note">
-        Anteprima leggera per questo dispositivo (niente forma d’onda sui file molto grandi):
-        ascolto e export restano completi.
+        {note ?? 'Anteprima leggera: ascolto, tagli ed export funzionano normalmente.'}
       </p>
+      {Number.isFinite(progress) ? (
+        <span
+          className="native-progress"
+          role="progressbar"
+          aria-label="Preparazione della forma d’onda"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={Math.round(progress * 100)}
+        >
+          <span style={{ transform: `scaleX(${Math.min(1, Math.max(0, progress))})` }} />
+        </span>
+      ) : null}
       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
       <audio ref={audioRef} controls preload="metadata" playsInline className="native-audio" />
     </div>

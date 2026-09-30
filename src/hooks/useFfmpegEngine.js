@@ -5,6 +5,7 @@ import ffmpegWasmUrl from '@ffmpeg/core/wasm?url';
 import { shouldPreloadEngine } from '../lib/device.js';
 import { isFfmpegProgressLine } from '../lib/progress.js';
 import { downloadEngineWasm } from '../lib/engineDownload.js';
+import { withActiveTimeout } from '../lib/activityWatch.js';
 
 // Peso esatto del wasm, iniettato a build time (vite.config.js): serve per una %
 // corretta anche quando il server comprime la risposta (content-length ≠ bytes letti).
@@ -118,18 +119,10 @@ function isCorruptEngineError(error) {
   return /compileerror|failed to fetch dynamically|importscripts|networkerror|aborted|magic|wasm/.test(message);
 }
 
+// Scadenza in tempo ATTIVO: compilare mentre l'utente è in un'altra app
+// (iPad, telefono) non deve far fallire l'avvio del motore al ritorno.
 function withTimeout(promise, ms, message) {
-  let timer = null;
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      timer = setTimeout(() => {
-        const error = new Error(message);
-        error.isTimeout = true;
-        reject(error);
-      }, ms);
-    }),
-  ]).finally(() => clearTimeout(timer));
+  return withActiveTimeout(promise, ms, message);
 }
 
 const IDLE_ENGINE = { phase: 'idle', loaded: 0, total: 0, startedAt: 0, error: '' };

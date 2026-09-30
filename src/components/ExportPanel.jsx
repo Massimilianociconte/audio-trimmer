@@ -2,6 +2,21 @@ import { EXPORT_FORMAT_ORDER, EXPORT_FORMATS, estimateExportBytes } from '../lib
 import { EXPORT_DESTINATION_ORDER, EXPORT_DESTINATIONS, getExportCapabilities } from '../lib/streamExport.js';
 import { formatBytes, formatClock } from '../lib/time.js';
 import { ExportProgressBar } from './ProgressBars.jsx';
+import { isAndroid, isIOS } from '../lib/device.js';
+
+/** Dove sono finiti i file: la domanda n.1 di chi non è pratico, detta per il suo dispositivo. */
+function whereAreMyFiles(destMode) {
+  if (destMode === 'folder') return 'Le parti sono già nella cartella che hai scelto.';
+  if (destMode === 'zip-stream') return 'Lo ZIP è già salvato dove hai scelto: aprilo per vedere le parti.';
+  if (destMode === 'zip-classic') {
+    return isIOS()
+      ? 'Trovi lo ZIP nell’app «File», cartella «Download»: toccalo una volta per estrarre le parti.'
+      : 'Trovi lo ZIP nella cartella dei download: aprilo per vedere le parti.';
+  }
+  return isAndroid()
+    ? 'Trovi le parti nella cartella «Download». Se il telefono chiede di consentire più download, tocca «Consenti»; se una parte manca, riscaricala da qui.'
+    : 'Trovi le parti nella cartella dei download del browser.';
+}
 
 export function ExportPanel({
   plan,
@@ -46,6 +61,7 @@ export function ExportPanel({
   chaptersStatus,
   resumeNotice,
   disabled,
+  primaryButtonRef,
 }) {
   const convertFormat = EXPORT_FORMATS[exportFormat] ?? EXPORT_FORMATS.m4a;
   const format = EXPORT_FORMATS[effectiveFormatId] ?? convertFormat;
@@ -279,7 +295,7 @@ export function ExportPanel({
           ))}
         </div>
       ) : (
-        <p className="empty-text">Definisci almeno 2 parti in «Definisci i tagli» qui sotto: appariranno qui con stima del peso.</p>
+        <p className="empty-text">Scegli almeno 2 parti nel passo «02 · Definisci i tagli»: appariranno qui con il peso stimato.</p>
       )}
 
       {isExporting ? (
@@ -289,6 +305,7 @@ export function ExportPanel({
       ) : (
         <>
         <button
+          ref={primaryButtonRef}
           type="button"
           className="primary-button"
           onClick={onExport}
@@ -299,7 +316,7 @@ export function ExportPanel({
             : `Taglia e scarica ${plan.segments.length >= 2 ? `${plan.segments.length} parti ` : ''}${format.extension.replace('.', '').toUpperCase()}`}
         </button>
         {Number.isInteger(failedExportIndex) ? (
-          <p className="error-text">Ultimo errore alla parte {failedExportIndex + 1}: rilancia l’export per riprovare da lì.</p>
+          <p className="error-text">L’ultimo tentativo si è fermato alla parte {failedExportIndex + 1}. Premi di nuovo «Taglia e scarica» per riprovare.</p>
         ) : null}
         <div className="export-secondary-actions">
           <button
@@ -361,6 +378,7 @@ export function ExportPanel({
               Riscarica ZIP
             </button>
           ) : null}
+          <p className="helper-text where-files">{whereAreMyFiles(lastResult.destMode)}</p>
           {lastResult.elapsedLabel ? (
             <p className="helper-text">Completato in {lastResult.elapsedLabel}.</p>
           ) : null}

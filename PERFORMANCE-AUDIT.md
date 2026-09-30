@@ -89,6 +89,19 @@ Su mobile il wasm del motore viene scaricato in Cache Storage appena c’è un f
 (nessun worker/heap residente): all’export resta solo la compilazione. Il link di download resta
 valido 60 s (Safari e alcuni download manager leggono il Blob dopo il click).
 
+**Forma d’onda a memoria costante (30/09/2026, notte).** Il budget della waveform introdotto
+sopra escludeva di fatto i mobile per qualunque audio oltre ~3 minuti (lo staging a 48 kHz
+contava ~768 KB/s). Ora, quando la decodifica integrale è sconsigliata, `src/lib/peaks.js`
+calcola i picchi a blocchi di ~60 s: 180 MB di MP3 (75 min) → 5,5 s su Mac M-class, ~90 MB
+di heap JS di picco, contro ~1,6 GB di PCM della decodifica integrale. Allineamento verificato
+con segnali a gradino a 22,05/44,1/48 kHz, M4A FFmpeg e Apple (priming 1024/2112), MP3 LAME,
+AAC ADTS e WAV: 0 ms di scarto rispetto alla decodifica integrale del browser (Chromium).
+OGG/FLAC/WMA restano sull’anteprima nativa. Safari/WebKit non ancora verificato su dispositivo.
+
+**Scadenze in tempo attivo.** `createActivityWatch` (`src/lib/activityWatch.js`) sostituisce
+i timer a orologio di export (120 s di inattività), ffprobe, avvio e download del motore:
+pagina nascosta o salti di orologio (sospensione iOS/Android) non contano più.
+
 Tabella originale, superata:
 
 | Profilo | Singolo output | ZIP compatibile totale | Risultati conservati | Fallback input MEMFS |
