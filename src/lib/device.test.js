@@ -59,11 +59,11 @@ describe('device', () => {
     );
   });
 
-  it('limiti di caricamento differenziati per dispositivo', () => {
+  it('la selezione File non impone un limite arbitrario alla dimensione', () => {
     assert.equal(mobileLoadLimitBytes(desktop), Infinity);
-    assert.equal(mobileLoadLimitBytes(iPad), 100 * 1024 * 1024);
-    // Android: deviceMemory inaffidabile, sempre limite basso
-    assert.equal(mobileLoadLimitBytes(android), 100 * 1024 * 1024);
+    assert.equal(mobileLoadLimitBytes(iPad), Infinity);
+    // Le allocazioni effettive hanno guardie separate dalla selezione.
+    assert.equal(mobileLoadLimitBytes(android), Infinity);
   });
 
   it('stima PCM della waveform a 8kHz stereo', () => {
@@ -75,9 +75,9 @@ describe('device', () => {
 
   it('anteprima nativa su PCM stimato, non su byte compressi', () => {
     assert.equal(shouldUseNativePreview({ sizeBytes: 10 * 1024 * 1024, durationSeconds: 60 }, desktop), false);
-    // 14MB compressi ma 30min di PCM ≈ 115MB: su mobile è nativa, su desktop no
+    // 14MB compressi ma 30min di PCM ≈ 115MB: nativa anche su desktop per lo staging del decoder
     assert.equal(shouldUseNativePreview({ sizeBytes: 14 * 1024 * 1024, durationSeconds: 1800 }, iPad), true);
-    assert.equal(shouldUseNativePreview({ sizeBytes: 14 * 1024 * 1024, durationSeconds: 1800 }, desktop), false);
+    assert.equal(shouldUseNativePreview({ sizeBytes: 14 * 1024 * 1024, durationSeconds: 1800 }, desktop), true);
     // 20min stereo ≈ 77MB PCM > 60MB: nativa anche sotto gli 80MB compressi
     assert.equal(shouldUseNativePreview({ sizeBytes: 60 * 1024 * 1024, durationSeconds: 1200 }, android), true);
     assert.equal(shouldUseNativePreview({ sizeBytes: 10 * 1024 * 1024, durationSeconds: 60 }, iPad), false);
@@ -96,9 +96,12 @@ describe('device', () => {
     assert.deepEqual(resolveExportModeForDevice('zip-classic', iPad).mode, 'zip-classic');
   });
 
-  it('warm-up motore in background tranne risparmio dati / 2G', () => {
+  it('warm-up motore solo su desktop adeguati, senza risparmio dati / 2G', () => {
     assert.equal(shouldWarmEngineInBackground(desktop), true);
-    assert.equal(shouldWarmEngineInBackground(android), true);
+    assert.equal(shouldWarmEngineInBackground(android), false);
+    assert.equal(shouldWarmEngineInBackground(iPad), false);
+    assert.equal(shouldWarmEngineInBackground({ ...desktop, navigator: { ...desktop.navigator, deviceMemory: 2 } }), false);
+    assert.equal(shouldWarmEngineInBackground({ ...desktop, navigator: { ...desktop.navigator, hardwareConcurrency: 2 } }), false);
     assert.equal(shouldWarmEngineInBackground({ navigator: { connection: { saveData: true } } }), false);
     assert.equal(shouldWarmEngineInBackground({ navigator: { connection: { effectiveType: '2g' } } }), false);
     assert.equal(shouldWarmEngineInBackground({}), true);
@@ -109,10 +112,10 @@ describe('device', () => {
       navigator: { userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', deviceMemory: 4, hardwareConcurrency: 4 },
       matchMedia: () => ({ matches: false }),
     };
-    // 1h stereo ≈ 230MB di PCM a 8kHz: ok sul PC potente, troppo sul PC debole
-    assert.equal(shouldUseNativePreview({ sizeBytes: 60 * 1024 * 1024, durationSeconds: 3600 }, desktop), false);
+    // 1h stereo: lo staging del decoder eccede il budget anche sul PC potente.
+    assert.equal(shouldUseNativePreview({ sizeBytes: 60 * 1024 * 1024, durationSeconds: 3600 }, desktop), true);
     assert.equal(shouldUseNativePreview({ sizeBytes: 60 * 1024 * 1024, durationSeconds: 3600 }, lowEnd), true);
-    assert.equal(shouldUseNativePreview({ sizeBytes: 10 * 1024 * 1024, durationSeconds: 600 }, lowEnd), false);
+    assert.equal(shouldUseNativePreview({ sizeBytes: 10 * 1024 * 1024, durationSeconds: 60 }, lowEnd), false);
   });
 
   it('decodifica la forma d’onda a 3 kHz sui dispositivi deboli che lo supportano', () => {
@@ -135,9 +138,21 @@ describe('device', () => {
     assert.equal(waveformSampleRate({ ...desktop, OfflineAudioContext: OfflineOk }), 8000);
     assert.equal(waveformSampleRate(android), 8000);
     assert.equal(estimateWaveformBytes(3600, 3000), 3600 * 3000 * 2 * 4);
-    // 60 min stereo: anteprima nativa a 8 kHz, forma d'onda a 3 kHz
+    // Lo staging nativo protegge gli audio lunghi anche a 3 kHz
     const phone = { ...android, OfflineAudioContext: OfflineOk };
     assert.equal(shouldUseNativePreview({ sizeBytes: 50 * 1024 * 1024, durationSeconds: 3600, sampleRate: 8000 }, phone), true);
-    assert.equal(shouldUseNativePreview({ sizeBytes: 50 * 1024 * 1024, durationSeconds: 1800 }, phone), false);
+    assert.equal(shouldUseNativePreview({ sizeBytes: 10 * 1024 * 1024, durationSeconds: 1800 }, phone), true);
   });
+});
+
+it('waveform guards include compressed input copies in peak memory', () => {
+ assert.equal(shouldUseNativePreview({sizeBytes:250*1024*1024,durationSeconds:1486},desktop),true);
+ assert.equal(shouldUseNativePreview({sizeBytes:100*1024*1024,durationSeconds:594},iPad),true);
+});
+
+it('native decoder staging also counts toward the preview budget', () => {
+ // WAVs measured with Chromium RSS: the native decoder costs more than the
+ // final 3/8 kHz Float32 buffer retained by WaveSurfer.
+ assert.equal(shouldUseNativePreview({sizeBytes:100*1024*1024,durationSeconds:594},desktop),true);
+ assert.equal(shouldUseNativePreview({sizeBytes:25*1024*1024,durationSeconds:149},iPad),true);
 });

@@ -84,31 +84,37 @@ async function migrateLegacyIfNeeded(db) {
   if (!legacyCount) {
     return;
   }
-  const readTx = db.transaction(STORE_PROJECTS_LEGACY, 'readonly');
-  const records = await promisifyRequest(readTx.objectStore(STORE_PROJECTS_LEGACY).getAll());
-  if (!records || records.length === 0) {
-    return;
-  }
   const writeTx = db.transaction([STORE_META, STORE_AUDIO, STORE_PROJECTS_LEGACY], 'readwrite');
+  const completed = waitForTransaction(writeTx);
   const metaStore = writeTx.objectStore(STORE_META);
   const audioStore = writeTx.objectStore(STORE_AUDIO);
   const legacyStore = writeTx.objectStore(STORE_PROJECTS_LEGACY);
-  for (const record of records) {
-    const { audioBlob, ...rest } = record;
-    const meta = {
-      ...rest,
-      size: audioBlob?.size ?? rest.size ?? 0,
-      cutsCount: Array.isArray(rest.customCuts) ? rest.customCuts.length : 0,
-      bookmarksCount: Array.isArray(rest.bookmarks) ? rest.bookmarks.length : 0,
-    };
-    delete meta.audioBlob;
-    metaStore.put(meta);
-    if (audioBlob) {
-      audioStore.put({ id: record.id, blob: audioBlob });
+  const request = legacyStore.openCursor();
+  request.onsuccess = () => {
+    const cursor = request.result;
+    if (!cursor) {
+      return;
     }
-    legacyStore.delete(record.id);
-  }
-  await waitForTransaction(writeTx);
+    // Legge un solo audio per volta. Lettura, scrittura e cancellazione
+    // condividono la transazione: un errore quota conserva tutti i record v1.
+    try {
+      const { audioBlob, ...rest } = cursor.value;
+      metaStore.put({
+        ...rest,
+        size: audioBlob?.size ?? rest.size ?? 0,
+        cutsCount: Array.isArray(rest.customCuts) ? rest.customCuts.length : 0,
+        bookmarksCount: Array.isArray(rest.bookmarks) ? rest.bookmarks.length : 0,
+      });
+      if (audioBlob) {
+        audioStore.put({ id: rest.id, blob: audioBlob });
+      }
+      cursor.delete();
+      cursor.continue();
+    } catch {
+      writeTx.abort();
+    }
+  };
+  await completed;
 }
 
 export async function listProjects() {
@@ -161,24 +167,40 @@ export async function loadProject(id) {
     await migrateLegacyIfNeeded(db);
     const tx = db.transaction([STORE_META, STORE_AUDIO, STORE_PROJECTS_LEGACY], 'readonly');
     const stores = tx.objectStoreNames;
-    let meta = stores.contains(STORE_META)
-      ? await promisifyRequest(tx.objectStore(STORE_META).get(id))
-      : null;
-    let audioBlob = null;
-    if (meta && stores.contains(STORE_AUDIO)) {
-      const audioRec = await promisifyRequest(tx.objectStore(STORE_AUDIO).get(id));
-      audioBlob = audioRec?.blob ?? null;
-    }
-    if (!meta && stores.contains(STORE_PROJECTS_LEGACY)) {
-      const legacy = await promisifyRequest(tx.objectStore(STORE_PROJECTS_LEGACY).get(id));
-      if (legacy) {
-        return legacy;
-      }
-    }
+    // Accoda tutte le richieste prima di await: Safari può chiudere la
+    // transazione dopo il primo callback se non ci sono altre letture pendenti.
+    const [meta, audioRec, legacy] = await Promise.all([
+      stores.contains(STORE_META) ? promisifyRequest(tx.objectStore(STORE_META).get(id)) : null,
+      stores.contains(STORE_AUDIO) ? promisifyRequest(tx.objectStore(STORE_AUDIO).get(id)) : null,
+      stores.contains(STORE_PROJECTS_LEGACY) ? promisifyRequest(tx.objectStore(STORE_PROJECTS_LEGACY).get(id)) : null,
+    ]);
     if (!meta) {
-      return null;
+      return legacy ?? null;
     }
-    return { ...meta, audioBlob };
+    return { ...meta, audioBlob: audioRec?.blob ?? null };
+  } finally {
+    db.close();
+  }
+}
+
+export async function renameProject(id, name) {
+  const db = await openDatabase();
+  try {
+    await migrateLegacyIfNeeded(db);
+    const tx = db.transaction(STORE_META, 'readwrite');
+    const completed = waitForTransaction(tx);
+    const store = tx.objectStore(STORE_META);
+    let updated = null;
+    const request = store.get(id);
+    request.onsuccess = () => {
+      if (!request.result) {
+        return;
+      }
+      updated = { ...request.result, name, updatedAt: Date.now() };
+      store.put(updated);
+    };
+    await completed;
+    return updated;
   } finally {
     db.close();
   }

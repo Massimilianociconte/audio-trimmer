@@ -3,24 +3,18 @@ import { FFmpeg } from '@ffmpeg/ffmpeg';
 import ffmpegCoreUrl from '@ffmpeg/core?url';
 import ffmpegWasmUrl from '@ffmpeg/core/wasm?url';
 import { shouldPreloadEngine } from '../lib/device.js';
-import { isFfmpegProgressLine, parseFfmpegProgressSeconds } from '../lib/progress.js';
+import { isFfmpegProgressLine } from '../lib/progress.js';
+import { downloadEngineWasm } from '../lib/engineDownload.js';
 
 // Peso esatto del wasm, iniettato a build time (vite.config.js): serve per una %
 // corretta anche quando il server comprime la risposta (content-length ≠ bytes letti).
 // eslint-disable-next-line no-undef
 const ENGINE_WASM_BYTES = typeof __FFMPEG_WASM_BYTES__ === 'number' ? __FFMPEG_WASM_BYTES__ : 32 * 1024 * 1024;
-const ENGINE_MIN_WASM_BYTES = 20 * 1024 * 1024;
-const ENGINE_FETCH_MAX_ATTEMPTS = 3;
-const ENGINE_STALL_TIMEOUT_MS = 20000;
 // Download completato: compilare 32MB di wasm su un telefono lento richiede
 // secondi, mai minuti. Oltre questa soglia il worker è morto (es. OOM silenzioso).
 const ENGINE_LOAD_TIMEOUT_MS = 120000;
-const ENGINE_CACHE_NAME = 'ffmpeg-wasm-v2';
+const ENGINE_CACHE_NAME = 'audio-cutter-ffmpeg-wasm-v3';
 const PROGRESS_THROTTLE_MS = 120;
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 function absoluteUrl(url) {
   try {
@@ -59,116 +53,12 @@ async function isWasmServedFromCache() {
       return false;
     }
     const length = Number(cached.headers.get('content-length')) || 0;
+    const encoding = cached.headers.get('content-encoding');
     // Senza content-length (risposta in streaming) ci si fida: CacheFirst salva solo 200 pieni.
-    return length === 0 || length >= ENGINE_MIN_WASM_BYTES;
+    return length === 0 || Boolean(encoding && encoding !== 'identity') || length === ENGINE_WASM_BYTES;
   } catch {
     return false;
   }
-}
-
-/**
- * Download resiliente del wasm per reti mobili instabili, con progresso reale:
- * - resume via Range dopo uno stallo (niente ripartenza da 0 a 29/32MB)
- * - watchdog anti-stallo anche mentre read() pende (TCP morto)
- * - i byte finiscono in un Blob tipizzato application/wasm (il MIME è
- *   obbligatorio: senza tipo il browser rifiuta lo streaming/import).
- */
-async function downloadEngineWasm({ onBytes }) {
-  const chunks = [];
-  let loaded = 0;
-  let total = ENGINE_WASM_BYTES;
-  for (let attempt = 1; attempt <= ENGINE_FETCH_MAX_ATTEMPTS; attempt += 1) {
-    const headers = loaded > 0 ? { Range: `bytes=${loaded}-` } : {};
-    let response;
-    try {
-      // eslint-disable-next-line no-await-in-loop
-      response = await fetch(ffmpegWasmUrl, { headers });
-    } catch (networkError) {
-      if (attempt >= ENGINE_FETCH_MAX_ATTEMPTS) {
-        throw new Error('Rete assente o instabile: non riesco a scaricare il motore di taglio.');
-      }
-      // eslint-disable-next-line no-await-in-loop
-      await sleep(1000 * attempt);
-      continue;
-    }
-    if (!response.ok) {
-      throw new Error(`Download motore non riuscito (HTTP ${response.status}).`);
-    }
-    if (response.status === 200 && loaded > 0) {
-      // Server senza resume: si riparte da 0.
-      chunks.length = 0;
-      loaded = 0;
-    }
-    const encoding = String(response.headers.get('content-encoding') ?? '').toLowerCase();
-    const length = Number(response.headers.get('content-length')) || 0;
-    if (response.status === 200 && length > 0 && (!encoding || encoding === 'identity')) {
-      total = length;
-    }
-    if (!response.body) {
-      // Browser senza stream: niente % intermedia ma download comunque valido.
-      // eslint-disable-next-line no-await-in-loop
-      const blob = await response.blob();
-      loaded = blob.size;
-      chunks.length = 0;
-      chunks.push(blob);
-      onBytes(loaded, Math.max(total, loaded));
-      break;
-    }
-    const reader = response.body.getReader();
-    let stalled = false;
-    try {
-      for (;;) {
-        let timer = null;
-        // eslint-disable-next-line no-await-in-loop
-        const result = await Promise.race([
-          reader.read(),
-          new Promise((resolve) => {
-            timer = setTimeout(() => resolve({ stalled: true }), ENGINE_STALL_TIMEOUT_MS);
-          }),
-        ]).finally(() => clearTimeout(timer));
-        if (result.stalled) {
-          stalled = true;
-          break;
-        }
-        if (result.done) {
-          break;
-        }
-        if (result.value?.byteLength) {
-          chunks.push(result.value);
-          loaded += result.value.byteLength;
-          onBytes(loaded, Math.max(total, loaded));
-        }
-      }
-    } finally {
-      if (stalled) {
-        reader.cancel().catch(() => {});
-      }
-      try {
-        reader.releaseLock();
-      } catch {
-        // ignore
-      }
-    }
-    if (!stalled) {
-      break;
-    }
-    if (attempt >= ENGINE_FETCH_MAX_ATTEMPTS) {
-      throw new Error('Connessione in stallo durante il download del motore. Riprova con una rete più stabile.');
-    }
-    // eslint-disable-next-line no-await-in-loop
-    await sleep(1000 * attempt);
-  }
-
-  const blob = new Blob(chunks, { type: 'application/wasm' });
-  chunks.length = 0;
-  if (blob.size < ENGINE_MIN_WASM_BYTES) {
-    throw new Error('Motore scaricato incompleto. Controlla la connessione e riprova.');
-  }
-  const magic = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
-  if (magic[0] !== 0x00 || magic[1] !== 0x61 || magic[2] !== 0x73 || magic[3] !== 0x6d) {
-    throw new Error('Motore scaricato corrotto. Premi "Pulisci cache e ricarica" in fondo alla pagina.');
-  }
-  return blob;
 }
 
 /** Salva il wasm scaricato nella cache del SW: dalla visita successiva è istantaneo. */
@@ -227,6 +117,7 @@ export function useFfmpegEngine() {
   // Ogni resetAfterAbort invalida il load in corso: niente stato "ready"
   // pubblicato da un'istanza già terminata.
   const generationRef = useRef(0);
+  const downloadAbortRef = useRef(null);
 
   const createInstance = useCallback(() => {
     const ffmpeg = new FFmpeg();
@@ -259,6 +150,8 @@ export function useFfmpegEngine() {
     }
     if (!loadPromiseRef.current) {
       const instance = ffmpeg;
+      const downloadAbort = new AbortController();
+      downloadAbortRef.current = downloadAbort;
       const generation = generationRef.current;
       const assertCurrent = () => {
         if (generationRef.current !== generation) {
@@ -278,7 +171,9 @@ export function useFfmpegEngine() {
           publish({ phase: 'compiling', loaded: ENGINE_WASM_BYTES, total: ENGINE_WASM_BYTES, startedAt, error: '' });
         } else {
           publish({ phase: 'downloading', loaded: 0, total: ENGINE_WASM_BYTES, startedAt, error: '' });
-          const blob = await downloadEngineWasm({
+          const blob = await downloadEngineWasm(ffmpegWasmUrl, {
+            expectedBytes: ENGINE_WASM_BYTES,
+            signal: downloadAbort.signal,
             onBytes: (loaded, total) => {
               const now = Date.now();
               if (now - lastBytesReportRef.current < PROGRESS_THROTTLE_MS && loaded < total) {
@@ -330,7 +225,10 @@ export function useFfmpegEngine() {
         }
         assertCurrent();
         publish({ phase: 'ready', loaded: 0, total: 0, startedAt, error: '' });
-      })().catch((error) => {
+      })().catch(async (error) => {
+        if (generationRef.current === generation && /incompleto|corrotto|dimensione/i.test(String(error?.message ?? error))) {
+          await purgeWasmCaches();
+        }
         if (generationRef.current === generation) {
           setEngineInfo({ ...IDLE_ENGINE, phase: 'error', error: error?.message || 'Motore non disponibile.' });
           try {
@@ -350,12 +248,15 @@ export function useFfmpegEngine() {
       });
       const pending = loadPromiseRef.current;
       pending.catch(() => {}).finally(() => {
+        if (downloadAbortRef.current === downloadAbort) downloadAbortRef.current = null;
         if (loadPromiseRef.current === pending) {
           loadPromiseRef.current = null;
         }
       });
     }
+    const currentGeneration = generationRef.current;
     await loadPromiseRef.current;
+    if (currentGeneration !== generationRef.current) throw new Error('Caricamento motore annullato.');
     const ready = ffmpegRef.current;
     if (!ready?.loaded) {
       throw new Error('Motore non disponibile. Riprova.');
@@ -395,6 +296,10 @@ export function useFfmpegEngine() {
 
   useEffect(() => {
     return () => {
+      generationRef.current += 1;
+      downloadAbortRef.current?.abort();
+      downloadAbortRef.current = null;
+      loadPromiseRef.current = null;
       try {
         ffmpegRef.current?.terminate();
       } catch {
@@ -407,6 +312,8 @@ export function useFfmpegEngine() {
   const resetAfterAbort = useCallback(() => {
     // Terminate interrompe un exec in corso; il prossimo ensureReady ricrea il motore.
     generationRef.current += 1;
+    downloadAbortRef.current?.abort();
+    downloadAbortRef.current = null;
     try {
       ffmpegRef.current?.terminate();
     } catch {
@@ -433,70 +340,7 @@ export function useFfmpegEngine() {
  * buffer TTY di Emscripten le rilascia solo a fine job).
  * onProgress(frac, seconds) riceve i secondi di OUTPUT già scritti.
  */
-export async function runFfmpeg(ffmpeg, args, { durationSeconds = 0, onProgress = null, captureLog = false } = {}) {
-  const logs = [];
-  const tail = [];
-  let lastSeconds = -1;
-  const report = (seconds) => {
-    if (!Number.isFinite(seconds) || seconds < 0 || seconds <= lastSeconds) {
-      return;
-    }
-    lastSeconds = seconds;
-    if (typeof onProgress === 'function') {
-      const frac = durationSeconds > 0 ? Math.min(1, seconds / durationSeconds) : null;
-      try {
-        onProgress(frac, seconds);
-      } catch {
-        // il reporting non deve mai rompere l'esecuzione
-      }
-    }
-  };
-  const onLog = ({ message }) => {
-    if (typeof message !== 'string') {
-      return;
-    }
-    const seconds = parseFfmpegProgressSeconds(message);
-    if (seconds !== null) {
-      report(seconds);
-      return;
-    }
-    if (isFfmpegProgressLine(message)) {
-      return;
-    }
-    if (captureLog) {
-      logs.push(message);
-    }
-    tail.push(message);
-    if (tail.length > 30) {
-      tail.shift();
-    }
-  };
-  const onProgressEvent = ({ time }) => {
-    const micros = Number(time);
-    if (Number.isFinite(micros) && micros >= 0) {
-      report(micros / 1e6);
-    }
-  };
-  const fullArgs = args.includes('-progress') ? [...args] : ['-progress', 'pipe:1', ...args];
-  if (!fullArgs.includes('-nostats')) {
-    fullArgs.unshift('-nostats');
-  }
-  // Il livello di log è globale nel modulo wasm: un `ffprobe -v error`
-  // precedente lo lascia a "error" e sparirebbero i log info (silencedetect,
-  // Duration/Stream di `ffmpeg -i`). Va reimpostato a ogni esecuzione.
-  if (!fullArgs.includes('-loglevel') && !fullArgs.includes('-v')) {
-    fullArgs.unshift('-loglevel', 'info');
-  }
-  ffmpeg.on('log', onLog);
-  ffmpeg.on('progress', onProgressEvent);
-  try {
-    const exitCode = await ffmpeg.exec(fullArgs);
-    return { exitCode, logText: logs.join('\n'), tailText: tail.join('\n') };
-  } finally {
-    ffmpeg.off('log', onLog);
-    ffmpeg.off('progress', onProgressEvent);
-  }
-}
+export { runFfmpeg, runFfprobe } from '../lib/ffmpegTask.js';
 
 export async function safeDelete(ffmpeg, path) {
   try {

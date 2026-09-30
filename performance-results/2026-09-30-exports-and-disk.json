@@ -1,0 +1,197 @@
+{
+  "url": "http://127.0.0.1:4173",
+  "browser": "153.0.8010.48",
+  "results": [
+    {
+      "kind": "load",
+      "profile": "desktop",
+      "mib": 25,
+      "readyMs": 298,
+      "measured": {
+        "native": false,
+        "reads": [
+          26214400,
+          4
+        ],
+        "longTasks": [
+          109
+        ],
+        "audioWrites": 0,
+        "peakReportedHeap": 37897825
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "desktop",
+      "mib": 100,
+      "readyMs": 77,
+      "measured": {
+        "native": true,
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 0
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "desktop",
+      "mib": 250,
+      "readyMs": 80,
+      "measured": {
+        "native": true,
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 37518402
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "desktop",
+      "mib": 500,
+      "readyMs": 70,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 0
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "export",
+      "profile": "desktop",
+      "run": 1,
+      "elapsedMs": 15181,
+      "zipPath": "desktop-1.zip",
+      "peakRendererRSSBytes": 0,
+      "entries": [
+        {
+          "name": "500MiB-noise - parte 1.m4a",
+          "bytes": 24109052
+        },
+        {
+          "name": "500MiB-noise - parte 2.m4a",
+          "bytes": 24110285
+        }
+      ],
+      "errors": [],
+      "measured": {
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 39527316
+      }
+    },
+    {
+      "kind": "export",
+      "profile": "desktop",
+      "run": 2,
+      "elapsedMs": 14210,
+      "zipPath": "desktop-2.zip",
+      "peakRendererRSSBytes": 0,
+      "entries": [
+        {
+          "name": "500MiB-noise - parte 1.m4a",
+          "bytes": 24109052
+        },
+        {
+          "name": "500MiB-noise - parte 2.m4a",
+          "bytes": 24110285
+        }
+      ],
+      "errors": [],
+      "measured": {
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 57934428
+      }
+    },
+    {
+      "kind": "cancel-and-budget",
+      "profile": "desktop",
+      "passed": true
+    },
+    {
+      "kind": "disk-export",
+      "destination": "folder",
+      "elapsedMs": 14314,
+      "files": [
+        {
+          "name": "500MiB-noise - parte 2.m4a",
+          "bytes": 24110285,
+          "signature": [
+            0,
+            0,
+            0,
+            28,
+            102,
+            116,
+            121,
+            112
+          ]
+        },
+        {
+          "name": "500MiB-noise - parte 1.m4a",
+          "bytes": 24109052,
+          "signature": [
+            0,
+            0,
+            0,
+            28,
+            102,
+            116,
+            121,
+            112
+          ]
+        }
+      ],
+      "errors": []
+    },
+    {
+      "kind": "disk-export",
+      "destination": "zip-stream",
+      "elapsedMs": 15020,
+      "files": [
+        {
+          "name": "result.zip",
+          "bytes": 48219683,
+          "signature": [
+            80,
+            75,
+            3,
+            4,
+            10,
+            0,
+            8,
+            0
+          ]
+        }
+      ],
+      "errors": []
+    },
+    {
+      "kind": "metadata-save",
+      "audioWrites": 1,
+      "passed": true
+    }
+  ]
+}

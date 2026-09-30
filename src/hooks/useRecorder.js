@@ -78,6 +78,17 @@ export function useRecorder() {
   const analyserRef = useRef(null);
   const levelFrameRef = useRef(0);
   const resolveStopRef = useRef(null);
+  const startPendingRef = useRef(false);
+  const sessionRef = useRef(0);
+  const listenersRef = useRef(null);
+
+  const clearRecorder = useCallback(() => {
+    listenersRef.current?.();
+    listenersRef.current = null;
+    recorderRef.current = null;
+    chunksRef.current.length = 0;
+    chunksRef.current = [];
+  }, []);
 
   const stopMonitors = useCallback(() => {
     if (intervalRef.current) {
@@ -110,6 +121,9 @@ export function useRecorder() {
   }, []);
 
   const start = useCallback(async () => {
+    if (startPendingRef.current || recorderRef.current?.state === 'recording' || recorderRef.current?.state === 'paused') {
+      return;
+    }
     setError('');
     if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
       setError('Il browser non supporta l’accesso al microfono.');
@@ -120,6 +134,8 @@ export function useRecorder() {
       return;
     }
 
+    const session = ++sessionRef.current;
+    startPendingRef.current = true;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
@@ -128,6 +144,10 @@ export function useRecorder() {
           autoGainControl: true,
         },
       });
+      if (session !== sessionRef.current) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
       streamRef.current = stream;
 
       const mimeType = pickSupportedMimeType();
@@ -136,24 +156,30 @@ export function useRecorder() {
         : new MediaRecorder(stream);
       mimeRef.current = recorder.mimeType || mimeType;
       recorderRef.current = recorder;
-      chunksRef.current = [];
+      const chunks = [];
+      chunksRef.current = chunks;
 
-      recorder.addEventListener('dataavailable', (event) => {
-        if (event.data && event.data.size > 0) {
-          chunksRef.current.push(event.data);
+      const handleData = (event) => {
+        if (session === sessionRef.current && event.data && event.data.size > 0) {
+          chunks.push(event.data);
         }
-      });
+      };
 
-      recorder.addEventListener('stop', () => {
+      const handleStop = () => {
+        if (session !== sessionRef.current) {
+          return;
+        }
         const finalMime = recorder.mimeType || mimeType || 'audio/webm';
-        const blob = new Blob(chunksRef.current, { type: finalMime });
+        const resolver = resolveStopRef.current;
+        const blob = resolver ? new Blob(chunks, { type: finalMime }) : null;
+        chunks.length = 0;
+        clearRecorder();
         stopMonitors();
         releaseStream();
         setIsRecording(false);
         setIsPaused(false);
         const durationSeconds = pausedElapsedRef.current;
         pausedElapsedRef.current = 0;
-        const resolver = resolveStopRef.current;
         resolveStopRef.current = null;
         if (resolver) {
           resolver({
@@ -163,15 +189,32 @@ export function useRecorder() {
             durationSeconds,
           });
         }
-      });
+      };
 
-      recorder.addEventListener('error', (event) => {
+      const handleError = (event) => {
+        if (session !== sessionRef.current) {
+          return;
+        }
         const err = event?.error ?? event;
         setError(err?.message || 'Errore di registrazione.');
         // microfono/loop fermi: niente interval, rAF, AudioContext o mic aperti.
         stopMonitors();
         releaseStream();
-      });
+        resolveStopRef.current?.(null);
+        resolveStopRef.current = null;
+        chunks.length = 0;
+        clearRecorder();
+        setIsRecording(false);
+        setIsPaused(false);
+      };
+      recorder.addEventListener('dataavailable', handleData);
+      recorder.addEventListener('stop', handleStop);
+      recorder.addEventListener('error', handleError);
+      listenersRef.current = () => {
+        recorder.removeEventListener('dataavailable', handleData);
+        recorder.removeEventListener('stop', handleStop);
+        recorder.removeEventListener('error', handleError);
+      };
 
       startTimestampRef.current = Date.now();
       pausedElapsedRef.current = 0;
@@ -189,17 +232,20 @@ export function useRecorder() {
         const AudioContextClass = window.AudioContext || window.webkitAudioContext;
         if (AudioContextClass) {
           const audioContext = new AudioContextClass();
+          audioContextRef.current = audioContext;
           // Su iOS resta suspended senza resume esplicito dopo il gesto utente.
           try {
             await audioContext.resume?.()?.catch?.(() => {});
           } catch {
             // ignore
           }
+          if (session !== sessionRef.current) {
+            return;
+          }
           const source = audioContext.createMediaStreamSource(stream);
           const analyser = audioContext.createAnalyser();
           analyser.fftSize = 512;
           source.connect(analyser);
-          audioContextRef.current = audioContext;
           analyserRef.current = analyser;
 
           const buffer = new Uint8Array(analyser.frequencyBinCount);
@@ -238,6 +284,9 @@ export function useRecorder() {
       setIsRecording(true);
       setIsPaused(false);
     } catch (startError) {
+      if (session !== sessionRef.current) {
+        return;
+      }
       setError(
         startError?.name === 'NotAllowedError'
           ? 'Permesso microfono negato. Abilita il microfono per registrare.'
@@ -247,8 +296,13 @@ export function useRecorder() {
       stopMonitors();
       setIsRecording(false);
       setIsPaused(false);
+      clearRecorder();
+    } finally {
+      if (session === sessionRef.current) {
+        startPendingRef.current = false;
+      }
     }
-  }, [releaseStream, stopMonitors]);
+  }, [clearRecorder, releaseStream, stopMonitors]);
 
   const stop = useCallback(() => {
     return new Promise((resolve) => {
@@ -267,10 +321,11 @@ export function useRecorder() {
         releaseStream();
         setIsRecording(false);
         setIsPaused(false);
+        clearRecorder();
         resolve(null);
       }
     });
-  }, [releaseStream, stopMonitors]);
+  }, [clearRecorder, releaseStream, stopMonitors]);
 
   const pause = useCallback(() => {
     const recorder = recorderRef.current;
@@ -290,7 +345,10 @@ export function useRecorder() {
   }, []);
 
   const cancel = useCallback(() => {
+    sessionRef.current += 1;
+    startPendingRef.current = false;
     const recorder = recorderRef.current;
+    clearRecorder();
     if (recorder && recorder.state !== 'inactive') {
       try {
         recorder.stop();
@@ -298,6 +356,7 @@ export function useRecorder() {
         // ignore
       }
     }
+    resolveStopRef.current?.(null);
     resolveStopRef.current = null;
     chunksRef.current = [];
     stopMonitors();
@@ -306,7 +365,7 @@ export function useRecorder() {
     setIsPaused(false);
     setElapsedSeconds(0);
     pausedElapsedRef.current = 0;
-  }, [releaseStream, stopMonitors]);
+  }, [clearRecorder, releaseStream, stopMonitors]);
 
   useEffect(() => {
     return () => {

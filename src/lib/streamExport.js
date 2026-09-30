@@ -22,8 +22,8 @@ export const EXPORT_DESTINATIONS = {
 
 export const EXPORT_DESTINATION_ORDER = ['auto', 'folder', 'zip-stream', 'zip-classic', 'singles'];
 
-// Soglie (byte) per l'advisor. Conservative: MEMFS FFmpeg tiene già l'intero
-// input in RAM, quindi il budget per l'output deve restare stretto.
+// Soglie (byte) per l'advisor. WORKERFS evita la copia dell'input;
+// MEMFS conserva comunque l'intero segmento di output fino alla lettura.
 export const HEAVY_INPUT_BYTES = 350 * 1024 * 1024;
 export const HEAVY_OUTPUT_BYTES = 250 * 1024 * 1024;
 export const RETAIN_BLOBS_BYTES = 150 * 1024 * 1024;
@@ -139,18 +139,36 @@ export function clearCheckpoint() {
 }
 
 /** Scrive su un FileSystemFileHandle. Accetta Blob o Uint8Array (niente Blob intermedio). */
-export async function writeBlobToFileHandle(fileHandle, data) {
+export async function writeBlobToFileHandle(fileHandle, data, { signal } = {}) {
+  signal?.throwIfAborted();
   const writable = await fileHandle.createWritable();
+  const sink = writable.getWriter?.() ?? writable;
+  let aborted = false;
+  let completed = false;
+  let rejectAbort;
+  const cancellation = new Promise((_, reject) => { rejectAbort = reject; });
+  cancellation.catch(() => {});
+  const cancel = (reason = signal?.reason) => {
+    if (aborted) return;
+    aborted = true;
+    rejectAbort(reason ?? new DOMException('Scrittura annullata', 'AbortError'));
+    Promise.resolve(sink.abort(reason)).catch(() => {}).finally(() => sink.releaseLock?.());
+  };
+  const onAbort = () => cancel();
+  signal?.addEventListener('abort', onAbort, { once: true });
   try {
-    await writable.write(data);
-    await writable.close();
+    signal?.throwIfAborted();
+    await Promise.race([sink.write(data), cancellation]);
+    signal?.throwIfAborted();
+    await Promise.race([sink.close(), cancellation]);
+    signal?.throwIfAborted();
+    completed = true;
   } catch (error) {
-    try {
-      await writable.abort();
-    } catch {
-      // ignore
-    }
+    cancel(error);
     throw error;
+  } finally {
+    signal?.removeEventListener('abort', onAbort);
+    if (completed) sink.releaseLock?.();
   }
 }
 
@@ -162,77 +180,78 @@ function sanitizeEntryName(name) {
  * Crea uno ZipWriter di @zip.js/zip.js sopra un WritableStream
  * (es. da showSaveFilePicker().createWritable()).
  * Ritorna { add(name, uint8Data), close() }.
- * L'audio è già compresso: usa STORE (level 0) con fallback a default.
+ * L'audio è già compresso: usa STORE (level 0), nessun retry dopo errori.
  */
-export async function createZipStreamWriter(writable) {
+export async function createZipStreamWriter(writable, { signal } = {}) {
   const { ZipWriter, Uint8ArrayReader } = await import('@zip.js/zip.js');
-  const writer = new ZipWriter(writable);
-  let storeOk = true;
+  const controller = new AbortController();
+  const sink = writable.getWriter();
   let settled = false;
+  let released = false;
+  let rejectAbort;
+  const aborted = new Promise((_, reject) => { rejectAbort = reject; });
+  aborted.catch(() => {});
+  const release = () => {
+    if (!released) { released = true; sink.releaseLock(); }
+  };
+  const cancel = () => {
+    if (controller.signal.aborted) return;
+    controller.abort();
+    rejectAbort(controller.signal.reason);
+    // An owned writer can be aborted while zip.js holds its relay stream lock.
+    // Native writes may finish asynchronously; do not commit after cancellation.
+    sink.abort(controller.signal.reason).catch(() => {}).finally(release);
+  };
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
+  const relay = new WritableStream({
+    write(data) {
+      controller.signal.throwIfAborted();
+      return Promise.race([sink.write(data), aborted]);
+    },
+  });
+  const writer = new ZipWriter(relay, { level: 0, bufferedWrite: false, signal: controller.signal });
+  const detach = () => signal?.removeEventListener('abort', cancel);
   return {
     async add(name, uint8Data) {
-      const entryName = sanitizeEntryName(name);
-      if (storeOk) {
-        try {
-          await writer.add(entryName, new Uint8ArrayReader(uint8Data), { level: 0 });
-          return;
-        } catch {
-          storeOk = false;
-        }
-      }
-      await writer.add(entryName, new Uint8ArrayReader(uint8Data));
+      controller.signal.throwIfAborted();
+      await writer.add(sanitizeEntryName(name), new Uint8ArrayReader(uint8Data));
+      controller.signal.throwIfAborted();
     },
     async close() {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      return writer.close();
+      if (settled) return;
+      controller.signal.throwIfAborted();
+      try {
+        await writer.close();
+        controller.signal.throwIfAborted();
+        // zip.js closes only its relay. Commit the destination after its final
+        // directory was written successfully and cancellation was checked.
+        await Promise.race([sink.close(), aborted]);
+        controller.signal.throwIfAborted();
+        settled = true;
+        release();
+      } finally { detach(); }
     },
     async abort() {
-      if (settled) {
-        return;
-      }
+      if (settled) return;
       settled = true;
-      try {
-        await writable.abort();
-      } catch {
-        // ignore
-      }
+      cancel();
+      detach();
     },
   };
 }
 
-/** ZipWriter in memoria (Blob finale). Picco ≈ ZIP compresso, spillabile dal browser. */
-export async function createZipBlobWriter() {
-  const { ZipWriter, BlobWriter, Uint8ArrayReader } = await import('@zip.js/zip.js');
+/** Compatible ZIP output. Only use within the device's total archive budget. */
+export async function createZipBlobWriter(options = {}) {
+  const { BlobWriter } = await import('@zip.js/zip.js');
   const blobWriter = new BlobWriter('application/zip');
-  const writer = new ZipWriter(blobWriter);
-  let storeOk = true;
-  let settled = false;
+  const writer = await createZipStreamWriter(blobWriter.writable, options);
   return {
-    async add(name, uint8Data) {
-      const entryName = sanitizeEntryName(name);
-      if (storeOk) {
-        try {
-          await writer.add(entryName, new Uint8ArrayReader(uint8Data), { level: 0 });
-          return;
-        } catch {
-          storeOk = false;
-        }
-      }
-      await writer.add(entryName, new Uint8ArrayReader(uint8Data));
-    },
+    add: writer.add,
+    abort: writer.abort,
     async close() {
-      if (settled) {
-        return null;
-      }
-      settled = true;
       await writer.close();
       return blobWriter.getData();
-    },
-    async abort() {
-      settled = true;
     },
   };
 }

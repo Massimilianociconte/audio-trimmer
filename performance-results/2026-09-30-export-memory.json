@@ -1,0 +1,87 @@
+{
+  "url": "http://127.0.0.1:4173",
+  "browser": "153.0.8010.48",
+  "results": [
+    {
+      "kind": "load",
+      "profile": "desktop",
+      "mib": 500,
+      "readyMs": 82,
+      "measured": {
+        "native": true,
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 37522084
+      },
+      "peakRendererRSSBytes": 549568512,
+      "errors": []
+    },
+    {
+      "kind": "export",
+      "profile": "desktop",
+      "run": 1,
+      "elapsedMs": 14291,
+      "zipPath": "desktop-1.zip",
+      "peakRendererRSSBytes": 929775616,
+      "entries": [
+        {
+          "name": "500MiB-noise - parte 1.m4a",
+          "bytes": 24109052
+        },
+        {
+          "name": "500MiB-noise - parte 2.m4a",
+          "bytes": 24110285
+        }
+      ],
+      "errors": [],
+      "measured": {
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 39586118
+      }
+    },
+    {
+      "kind": "export",
+      "profile": "desktop",
+      "run": 2,
+      "elapsedMs": 14407,
+      "zipPath": "desktop-2.zip",
+      "peakRendererRSSBytes": 951844864,
+      "entries": [
+        {
+          "name": "500MiB-noise - parte 1.m4a",
+          "bytes": 24109052
+        },
+        {
+          "name": "500MiB-noise - parte 2.m4a",
+          "bytes": 24110285
+        }
+      ],
+      "errors": [],
+      "measured": {
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 40106720
+      }
+    },
+    {
+      "kind": "cancel-and-budget",
+      "profile": "desktop",
+      "passed": true
+    },
+    {
+      "kind": "metadata-save",
+      "audioWrites": 1,
+      "passed": true
+    }
+  ]
+}

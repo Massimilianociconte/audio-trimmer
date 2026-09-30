@@ -62,6 +62,7 @@ export default defineConfig({
       injectRegister: false,
       includeAssets: ['favicon.svg'],
       workbox: {
+        importScripts: ['./cache-migration.js'],
         globPatterns: ['**/*.{js,css,html,svg,woff,woff2}'],
         maximumFileSizeToCacheInBytes: 12 * 1024 * 1024,
         navigateFallback: 'index.html',
@@ -71,9 +72,9 @@ export default defineConfig({
             urlPattern: ({ url }) => url.pathname.endsWith('.wasm'),
             handler: 'CacheFirst',
             options: {
-              // Nome versionato: un wasm tronco in cache non deve sopravvivere
-              // ai deploy (bump v2→v3 quando cambia @ffmpeg/core).
-              cacheName: 'ffmpeg-wasm-v2',
+              // New namespace invalidates the legacy engine cache on devices
+              // when this PWA activates; migration preserves other apps/data.
+              cacheName: 'audio-cutter-ffmpeg-wasm-v3',
               expiration: {
                 maxEntries: 4,
                 maxAgeSeconds: 7 * 24 * 60 * 60,

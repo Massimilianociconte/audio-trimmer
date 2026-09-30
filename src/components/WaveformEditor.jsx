@@ -3,6 +3,7 @@ import WaveSurfer from 'wavesurfer.js';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.esm.js';
 import TimelinePlugin from 'wavesurfer.js/dist/plugins/timeline.esm.js';
 import HoverPlugin from 'wavesurfer.js/dist/plugins/hover.esm.js';
+import { shouldUseNativePreview } from '../lib/device.js';
 
 const CUT_COLOR = 'rgba(239, 108, 47, 0.85)';
 const CUT_COLOR_SOFT = 'rgba(239, 108, 47, 0.25)';
@@ -13,6 +14,8 @@ const LOOP_COLOR = 'rgba(201, 73, 15, 0.18)';
 export const WaveformEditor = forwardRef(function WaveformEditor(
   {
     src,
+    blob,
+    duration,
     cuts,
     bookmarks,
     loopRegion,
@@ -27,6 +30,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     onWaveformClick,
     onLoadingProgress,
     onWaveformError,
+    onDecodePending,
     sampleRate = 8000,
   },
   ref,
@@ -57,6 +61,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     onWaveformClick,
     onLoadingProgress,
     onWaveformError,
+    onDecodePending,
   };
   latestRateRef.current = playbackRate;
   latestZoomRef.current = zoom;
@@ -112,6 +117,10 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
 
     isReadyRef.current = false;
     setIsDecoded(false);
+    let disposed = false;
+    let errorHandled = false;
+    let lastProgress = -1;
+    let lastProgressAt = 0;
 
     const regionsPlugin = RegionsPlugin.create();
     // Intervalli adattivi (default del plugin in base ai px/secondo): con un
@@ -135,7 +144,6 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
 
     const instance = WaveSurfer.create({
       container: containerRef.current,
-      url: src,
       waveColor: '#c9967a',
       progressColor: '#ef6c2f',
       cursorColor: '#22170d',
@@ -152,6 +160,12 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       plugins: [regionsPlugin, timelinePlugin, hoverPlugin],
     });
 
+    // WaveSurfer 7's non-abortable decode can finish after destroy() and call
+    // render() on a detached renderer. Suppress that late canvas allocation.
+    const renderer = instance.getRenderer();
+    const renderWaveform = renderer.render.bind(renderer);
+    renderer.render = (...args) => disposed ? Promise.resolve() : renderWaveform(...args);
+
     wsRef.current = instance;
     regionsPluginRef.current = regionsPlugin;
     cutRegionsRef.current = new Map();
@@ -159,6 +173,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     loopRegionRef.current = null;
 
     const handleReady = () => {
+      if (disposed) return;
       isReadyRef.current = true;
       try {
         const rate = latestRateRef.current;
@@ -185,17 +200,26 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     const handleFinish = () => callbacksRef.current.onPlayStateChange?.(false);
     const handleTime = (time) => callbacksRef.current.onTimeUpdate?.(time);
     const handleLoading = (percent) => {
+      if (disposed) return;
       const numeric = Number(percent);
       if (!Number.isFinite(numeric)) {
         return;
       }
       // wavesurfer v7 emette 0..100 sul fetch + 'decode' prima di 'ready'
-      const frac = numeric > 1 ? numeric / 100 : numeric;
+      const frac = numeric / 100;
+      const now = performance.now();
+      if (frac < 1 && (frac - lastProgress < 0.02 || now - lastProgressAt < 100)) return;
+      lastProgress = frac;
+      lastProgressAt = now;
       callbacksRef.current.onLoadingProgress?.(Math.min(1, Math.max(0, frac)));
     };
-    const handleDecode = () => callbacksRef.current.onLoadingProgress?.(0.95);
+    const handleDecode = () => {
+      if (!disposed) callbacksRef.current.onLoadingProgress?.(0.95);
+    };
     const handleDecodeError = (error) => {
-      if (decodeRate < 8000) {
+      if (disposed || errorHandled || error?.name === 'AbortError') return;
+      errorHandled = true;
+      if (decodeRate < 8000 && !shouldUseNativePreview({ sizeBytes: blob?.size ?? 0, durationSeconds: duration, sampleRate: 8000 })) {
         // Frequenza ridotta non accettata da questo browser: riprova a 8 kHz.
         setFallbackRate(8000);
         return;
@@ -243,7 +267,23 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       }
     });
 
+    // Reuse the File/Blob and metadata already read by App: fetching its blob URL
+    // otherwise creates another full response Blob plus a progress stream clone.
+    const reportPending = callbacksRef.current.onDecodePending;
+    // StrictMode tears down its first effect synchronously: avoid starting a
+    // decode for that abandoned instance before the replayed effect mounts.
+    Promise.resolve().then(() => {
+      if (disposed) return;
+      reportPending?.(true);
+      return (blob
+        ? instance.loadBlob(blob, undefined, duration)
+        : instance.load(src, undefined, duration))
+        .catch(handleDecodeError)
+        .finally(() => reportPending?.(false));
+    });
+
     return () => {
+      disposed = true;
       isReadyRef.current = false;
       instance.un('ready', handleReady);
       instance.un('loading', handleLoading);
@@ -265,7 +305,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       bookmarkRegionsRef.current = new Map();
       loopRegionRef.current = null;
     };
-  }, [src, decodeRate]);
+  }, [src, blob, decodeRate]);
 
   useEffect(() => {
     const ws = wsRef.current;

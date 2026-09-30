@@ -257,7 +257,7 @@ export function describeFfmpegFailure(logText) {
     return 'Il file non contiene una traccia audio utilizzabile.';
   }
   if (/Cannot enlarge memory|out of memory|memory access out of bounds|Cannot allocate memory|OOM/i.test(text)) {
-    return 'Memoria del browser esaurita: chiudi altre schede, riduci il numero di parti o usa un file più leggero.';
+    return 'Memoria del browser esaurita: chiudi altre schede, aumenta il numero di parti o usa un file più leggero.';
   }
   if (/Invalid data found when processing input|moov atom not found|could not find codec parameters/i.test(text)) {
     return 'Il file sembra danneggiato o in un formato non supportato.';

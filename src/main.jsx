@@ -21,7 +21,12 @@ if ('serviceWorker' in navigator && import.meta.env.PROD) {
       }
     });
     window.addEventListener('app-sw-skip', () => {
-      wb.messageSkipWaiting().catch(() => window.location.reload());
+      // Workbox messageSkipWaiting() returns void, not a Promise.
+      try {
+        wb.messageSkipWaiting();
+      } catch {
+        window.location.reload();
+      }
     }, { once: true });
     wb.register().catch(() => {});
   }).catch(() => {});

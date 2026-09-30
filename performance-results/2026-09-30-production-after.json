@@ -1,0 +1,81 @@
+{
+  "url": "http://127.0.0.1:4173",
+  "browser": "153.0.8010.48",
+  "results": [
+    {
+      "kind": "load",
+      "profile": "desktop",
+      "mib": 25,
+      "readyMs": 282,
+      "idleMs": 0,
+      "measured": {
+        "native": false,
+        "reads": [
+          26214400,
+          4
+        ],
+        "longTasks": [
+          116
+        ],
+        "audioWrites": 0,
+        "peakReportedHeap": 37817778
+      },
+      "peakRendererRSSBytes": 840335360,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "desktop",
+      "mib": 100,
+      "readyMs": 76,
+      "idleMs": 0,
+      "measured": {
+        "native": true,
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 0
+      },
+      "peakRendererRSSBytes": 556498944,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "desktop",
+      "mib": 250,
+      "readyMs": 77,
+      "idleMs": 0,
+      "measured": {
+        "native": true,
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 0
+      },
+      "peakRendererRSSBytes": 558137344,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "desktop",
+      "mib": 500,
+      "readyMs": 75,
+      "idleMs": 0,
+      "measured": {
+        "native": true,
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 0
+      },
+      "peakRendererRSSBytes": 554844160,
+      "errors": []
+    }
+  ]
+}

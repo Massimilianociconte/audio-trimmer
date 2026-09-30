@@ -9,34 +9,43 @@ Web app statica per tagliare file audio direttamente nel browser, senza ri-uploa
 - esporta in M4A / MP3 / OGG / WAV / FLAC con bitrate a scelta, fade in/out e taglio veloce senza ricodifica (predefinito quando possibile)
 - scarica un unico ZIP con tutte le parti + riscarica i singoli senza ri-encoding
 - nomi parti personalizzabili, anteprima ascolto per segmento, undo tagli (Ctrl+Z), ordinamento e pulizia duplicati
-- mantiene il workflow locale nel browser, PWA leggera (WASM in runtime cache, precache ~0.5 MB)
+- mantiene il workflow locale nel browser, PWA leggera (WASM in runtime cache, precache ~0,7 MiB)
 - pulizia audio professionale (lezione, podcast, memo da telefono, rumore forte, solo volume) con
   anteprima A/B di 20 s, opzione "accorcia pause", loop A-B, segnalibri, export leggero per AI Studio
 - export selezione A-B come file unico, copia scaletta capitoli mm:ss per YouTube, import tagli da scaletta incollata o da segnalibri
 - progetto esportabile/importabile in JSON leggero (senza audio), libreria con rinomina e duplicazione
 - undo tagli (Ctrl+Z), preferenze export persistenti, retry dopo errore, guardie su file enormi e quota IndexedDB
 - architettura anti-OOM: export streaming su cartella (File System Access) o ZIP su disco (@zip.js/zip.js),
-  mai più di un segmento in RAM, advisor automatico della destinazione, Wake Lock + checkpoint di ripresa
-  per progetti pesanti in background, libreria IndexedDB con metadati separati dai blob audio
+  un segmento alla volta nel motore, budget per output/ZIP, advisor automatico della destinazione,
+  Wake Lock a pagina visibile + checkpoint per export in cartella,
+  libreria IndexedDB con metadati separati dai blob audio
 
 ## Prestazioni (telefoni, tablet, PC di fascia bassa)
 
 - **file pronto subito**: se il browser legge il formato (MP3, M4A, WAV, OGG…) ascolto, forma d'onda
   e tagli sono disponibili in meno di un secondo, senza aspettare il motore
-- **motore in background**: il wasm FFmpeg (32 MB) si scarica mentre si ascolta e si segnano i tagli,
-  con percentuale, MB, velocità e tempo rimanente reali; dalla seconda visita arriva dalla cache
+- **motore adattivo**: sui desktop adeguati il wasm FFmpeg (32 MB) si prepara in background;
+  su mobile e PC deboli parte solo per un’elaborazione esplicita. Download con avanzamento,
+  timeout e retry con Range quando possibile; la cache evita trasferimenti ripetuti
 - **taglio senza ricodifica di default** per sorgenti MP3/M4A/AAC: qualità identica, decine di volte
   più veloce della conversione (precisione al frame, ~0,03 s); «Converti» resta a un clic
-- **zero copie in memoria**: l'audio viene montato nel motore via WORKERFS invece di essere letto
-  per intero in RAM e ricopiato nella memoria wasm
+- **input senza copia integrale**: l'audio viene montato nel motore via WORKERFS.
+  Il fallback MEMFS è consentito soltanto per piccoli file; l’output conserva comunque
+  un segmento in memoria e una copia durante `readFile`, con limiti distinti per dispositivo
 - **avanzamento reale** su export, silenzi, pulizia e copia per AI (`-progress pipe:1`): percentuale,
   velocità "× tempo reale", ETA, stato di ogni parte, pannello fisso sempre visibile, annulla immediato
 - AAC con coder `fast` (2-9× più veloce del `twoloop` nel core single-thread), stima dei tempi
   imparata dalle esportazioni precedenti sul dispositivo
 - UI leggera: niente blur animati/`backdrop-filter`, aggiornamenti del tempo di riproduzione
   limitati a 4/s, timeline della forma d'onda adattiva e vista iniziale "adatta alla larghezza"
-- forma d'onda decodificata a 3 kHz su telefoni/tablet/PC deboli (PCM −62%): disegnata su lezioni
-  ~2,7× più lunghe prima di ripiegare sull'anteprima nativa; ricaduta automatica a 8 kHz dove non supportato
+- forma d'onda a 3 kHz sui dispositivi deboli compatibili (PCM finale −62%): il budget include
+  anche le copie dell’input e lo staging del decoder. Gli audio grandi/lunghi usano l’anteprima
+  nativa; la ricaduta a 8 kHz è ammessa solo se rientra nel budget
+
+Audit, misure prima/dopo, limiti e istruzioni per ripetere le prove:
+[PERFORMANCE-AUDIT.md](PERFORMANCE-AUDIT.md). I budget sono guardie prudenziali,
+non una garanzia di assenza di crash su ogni dispositivo. La registrazione microfono
+conserva ancora i chunk compressi fino allo stop.
 
 ## Pulizia audio: come è tarata
 
@@ -84,3 +93,10 @@ Il build di produzione viene generato nella cartella `docs/`, pensata apposta pe
 3. in GitHub vai su `Settings > Pages`
 4. come source seleziona `Deploy from a branch`
 5. imposta branch `main` e cartella `/docs`
+
+La PWA elimina gli asset precache superati quando si attiva la nuova versione.
+La migrazione della cache motore passa a `audio-cutter-ffmpeg-wasm-v3` e rimuove
+le vecchie entry di questa app dalle cache legacy, preservando dati IndexedDB,
+preferenze e contenuti di altre app sullo stesso dominio. Le schede già aperte
+mostrano «Ricarica ora»: aggiornare a lavoro finito. I dispositivi offline si
+aggiorneranno quando tornano online e attivano la nuova versione.

@@ -2,4 +2,8 @@ node_modules
 dist
 .DS_Store
 .vscode
-
+.claude/
+.ai-harness/manifest.yaml
+.env
+.env.*
+!.env.example

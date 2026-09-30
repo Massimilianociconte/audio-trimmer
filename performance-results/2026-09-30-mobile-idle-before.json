@@ -1,0 +1,42 @@
+{
+  "url": "http://127.0.0.1:4173",
+  "browser": "153.0.8010.48",
+  "results": [
+    {
+      "kind": "load",
+      "profile": "Pixel 5",
+      "mib": 500,
+      "readyMs": 247,
+      "idleMs": 3000,
+      "measured": {
+        "native": true,
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 38005031
+      },
+      "peakRendererRSSBytes": 676986880,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "iPhone 13",
+      "mib": 500,
+      "readyMs": 241,
+      "idleMs": 3000,
+      "measured": {
+        "native": true,
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 38007912
+      },
+      "peakRendererRSSBytes": 677888000,
+      "errors": []
+    }
+  ]
+}

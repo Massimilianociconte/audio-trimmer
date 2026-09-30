@@ -13,13 +13,14 @@ export const NativeAudioPreview = forwardRef(function NativeAudioPreview(
     onReady,
     onTimeUpdate,
     onPlayStateChange,
+    onPreviewError,
   },
   ref,
 ) {
   const audioRef = useRef(null);
   const callbacksRef = useRef({});
 
-  callbacksRef.current = { onReady, onTimeUpdate, onPlayStateChange };
+  callbacksRef.current = { onReady, onTimeUpdate, onPlayStateChange, onPreviewError };
 
   useImperativeHandle(
     ref,
@@ -72,17 +73,24 @@ export const NativeAudioPreview = forwardRef(function NativeAudioPreview(
     const handlePlay = () => callbacksRef.current.onPlayStateChange?.(true);
     const handlePause = () => callbacksRef.current.onPlayStateChange?.(false);
     const handleEnded = () => callbacksRef.current.onPlayStateChange?.(false);
+    const handleError = () => callbacksRef.current.onPreviewError?.('Il browser non riesce a leggere l’anteprima audio.');
     el.addEventListener('loadedmetadata', handleLoaded);
     el.addEventListener('timeupdate', handleTime);
     el.addEventListener('play', handlePlay);
     el.addEventListener('pause', handlePause);
     el.addEventListener('ended', handleEnded);
+    el.addEventListener('error', handleError);
+    el.src = src;
     return () => {
       el.removeEventListener('loadedmetadata', handleLoaded);
       el.removeEventListener('timeupdate', handleTime);
       el.removeEventListener('play', handlePlay);
       el.removeEventListener('pause', handlePause);
       el.removeEventListener('ended', handleEnded);
+      el.removeEventListener('error', handleError);
+      el.pause();
+      el.removeAttribute('src');
+      el.load();
     };
   }, [src]);
 
@@ -105,7 +113,7 @@ export const NativeAudioPreview = forwardRef(function NativeAudioPreview(
         ascolto e export restano completi.
       </p>
       {/* eslint-disable-next-line jsx-a11y/media-has-caption */}
-      <audio ref={audioRef} src={src} controls preload="metadata" playsInline className="native-audio" />
+      <audio ref={audioRef} controls preload="metadata" playsInline className="native-audio" />
     </div>
   );
 });

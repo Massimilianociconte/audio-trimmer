@@ -82,12 +82,12 @@ export function isSlowConnection(env = globalThis) {
 }
 
 /**
- * Dopo il caricamento di un file il motore (32MB) serve quasi sempre per
- * l'export: scaricarlo in background mentre l'utente ascolta e segna i tagli
- * nasconde l'attesa. Mai su Risparmio dati o reti 2G.
+ * Su desktop adeguati anticipa il motore mentre si impostano i tagli.
+ * Su mobile/PC deboli la compilazione e il worker hanno un costo residente
+ * molto superiore ai 32 MB del download: attendi un'elaborazione esplicita.
  */
 export function shouldWarmEngineInBackground(env = globalThis) {
-  return !isSaveData(env) && !isSlowConnection(env);
+  return !isMobileDevice(env) && !isLowMemoryDevice(env) && !isSaveData(env) && !isSlowConnection(env);
 }
 
 export function isLowMemoryDevice(env = globalThis) {
@@ -103,8 +103,8 @@ export function isLowMemoryDevice(env = globalThis) {
 }
 
 /**
- * Il preload del wasm (31MB + compilazione) al boot è la causa n.1 dei crash
- * "dopo pochi secondi" su mobile: va fatto solo su desktop con rete normale.
+ * Il preload del wasm e della compilazione aumenta il picco residente:
+ * al boot va fatto solo su desktop adeguati con rete normale.
  */
 export function shouldPreloadEngine(env = globalThis) {
   if (isSaveData(env)) {
@@ -120,8 +120,8 @@ export function shouldPreloadEngine(env = globalThis) {
 }
 
 /**
- * Limite oltre il quale rifiutiamo il caricamento PRIMA di copiare in RAM/wasm,
- * con messaggio azionabile. Desktop resta senza limite rigido (warning 350MB in App).
+ * Soglie storiche e guardie della forma d’onda. La selezione del File non
+ * legge i byte; la copia di compatibilità ha un budget separato in memoryPolicy.
  */
 export const MOBILE_LOAD_LIMIT_LOW_BYTES = 100 * 1024 * 1024;
 export const MOBILE_LOAD_LIMIT_BYTES = 150 * 1024 * 1024;
@@ -135,15 +135,10 @@ export const DESKTOP_NATIVE_PREVIEW_PCM_BYTES = 400 * 1024 * 1024;
 // PC di fascia bassa (≤4GB o ≤4 core): 400MB di PCM + canvas li mandano in swap.
 export const LOW_END_DESKTOP_PREVIEW_PCM_BYTES = 160 * 1024 * 1024;
 
-export function mobileLoadLimitBytes(env = globalThis) {
-  if (!isMobileDevice(env)) {
-    return Infinity;
-  }
-  // Su Samsung/Android deviceMemory è spesso arrotondato: mai fidarsi per ALZARE i limiti.
-  if (isLowMemoryDevice(env) || isIOS(env) || isAndroid(env)) {
-    return MOBILE_LOAD_LIMIT_LOW_BYTES;
-  }
-  return MOBILE_LOAD_LIMIT_BYTES;
+// File-backed input is safe to select; protect actual allocations instead.
+// WORKERFS compatibility fallback has a separate hard copy budget.
+export function mobileLoadLimitBytes() {
+  return Infinity;
 }
 
 export const DEFAULT_WAVEFORM_SAMPLE_RATE = 8000;
@@ -166,8 +161,8 @@ function supportsAudioSampleRate(rate, env = globalThis) {
 /**
  * Frequenza a cui decodificare l'audio SOLO per disegnare la forma d'onda.
  * Su telefoni/tablet/PC deboli 3 kHz bastano per il disegno e tagliano il
- * PCM del 62%: forma d'onda disponibile su lezioni ~2,7 volte più lunghe
- * prima di ripiegare sull'anteprima nativa. Browser che non accettano 3 kHz
+ * PCM finale del 62%. Lo staging del decoder ha una guardia separata e può
+ * richiedere l'anteprima nativa prima. Browser che non accettano 3 kHz
  * (es. Firefox) restano a 8 kHz; il WaveformEditor ripiega da solo se la
  * decodifica fallisse comunque.
  */
@@ -196,6 +191,15 @@ export function estimateWaveformBytes(durationSeconds, sampleRate = DEFAULT_WAVE
 export function shouldUseNativePreview({ sizeBytes = 0, durationSeconds = 0, sampleRate } = {}, env = globalThis) {
   const size = Number(sizeBytes) || 0;
   const pcm = estimateWaveformBytes(durationSeconds, sampleRate ?? waveformSampleRate(env));
+  // Compressed ArrayBuffer, decoder working copy and PCM can coexist.
+  // This is a conservative allocation estimate, not measured free RAM.
+  // Chromium RSS profiling shows that decoder staging can exceed the final
+  // resampled PCM by several times. Count two native-rate stereo workspaces
+  // as well: lowering the WaveSurfer sample rate alone cannot bound this peak.
+  const decoderPCM = estimateWaveformBytes(durationSeconds, 48000);
+  const peak = 2 * size + 2 * pcm + 2 * decoderPCM;
+  const peakLimit = (isMobileDevice(env) ? 128 : isLowMemoryDevice(env) ? 256 : 512) * 1024 * 1024;
+  if (peak > peakLimit) return true;
   if (isMobileDevice(env)) {
     return size > NATIVE_PREVIEW_SIZE_BYTES || pcm > NATIVE_PREVIEW_PCM_BYTES;
   }

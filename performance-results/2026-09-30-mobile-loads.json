@@ -1,0 +1,128 @@
+{
+  "url": "http://127.0.0.1:4173",
+  "browser": "153.0.8010.48",
+  "results": [
+    {
+      "kind": "load",
+      "profile": "Pixel 5",
+      "mib": 25,
+      "readyMs": 351,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [
+          97
+        ],
+        "audioWrites": 0,
+        "peakReportedHeap": 5001557
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "Pixel 5",
+      "mib": 100,
+      "readyMs": 243,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 4131478
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "Pixel 5",
+      "mib": 250,
+      "readyMs": 242,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 4131646
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "Pixel 5",
+      "mib": 500,
+      "readyMs": 242,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 4107085
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "iPhone 13",
+      "mib": 25,
+      "readyMs": 249,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 4112917
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "iPhone 13",
+      "mib": 100,
+      "readyMs": 258,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 4114190
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "iPhone 13",
+      "mib": 250,
+      "readyMs": 248,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 4120594
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "iPhone 13",
+      "mib": 500,
+      "readyMs": 258,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 4233310
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    }
+  ]
+}

@@ -1,0 +1,107 @@
+{
+  "url": "http://127.0.0.1:4173",
+  "browser": "153.0.8010.48",
+  "results": [
+    {
+      "kind": "load",
+      "profile": "Pixel 5",
+      "mib": 500,
+      "readyMs": 260,
+      "idleMs": 3000,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 4878163
+      },
+      "peakRendererRSSBytes": 526761984,
+      "errors": []
+    },
+    {
+      "kind": "load",
+      "profile": "iPhone 13",
+      "mib": 500,
+      "readyMs": 252,
+      "idleMs": 3000,
+      "measured": {
+        "native": true,
+        "reads": [],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 4864576
+      },
+      "peakRendererRSSBytes": 524550144,
+      "errors": []
+    },
+    {
+      "kind": "export",
+      "profile": "Pixel 5",
+      "run": 1,
+      "elapsedMs": 15060,
+      "zipPath": "Pixel-5-1.zip",
+      "peakRendererRSSBytes": 903004160,
+      "entries": [
+        {
+          "name": "500MiB-noise - parte 1.m4a",
+          "bytes": 24109052
+        },
+        {
+          "name": "500MiB-noise - parte 2.m4a",
+          "bytes": 24110285
+        }
+      ],
+      "errors": [],
+      "measured": {
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 48091576
+      }
+    },
+    {
+      "kind": "cancel-and-budget",
+      "profile": "Pixel 5",
+      "passed": true
+    },
+    {
+      "kind": "export",
+      "profile": "iPhone 13",
+      "run": 1,
+      "elapsedMs": 15113,
+      "zipPath": "iPhone-13-1.zip",
+      "peakRendererRSSBytes": 929169408,
+      "entries": [
+        {
+          "name": "500MiB-noise - parte 1.m4a",
+          "bytes": 24109052
+        },
+        {
+          "name": "500MiB-noise - parte 2.m4a",
+          "bytes": 24110285
+        }
+      ],
+      "errors": [],
+      "measured": {
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 59046845
+      }
+    },
+    {
+      "kind": "cancel-and-budget",
+      "profile": "iPhone 13",
+      "passed": true
+    },
+    {
+      "kind": "metadata-save",
+      "audioWrites": 1,
+      "passed": true
+    }
+  ]
+}

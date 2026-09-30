@@ -1,0 +1,122 @@
+{
+  "unitTests": 162,
+  "unitTestsPassed": 162,
+  "dependencyVulnerabilities": {
+    "info": 0,
+    "low": 0,
+    "moderate": 0,
+    "high": 0,
+    "critical": 0,
+    "total": 0
+  },
+  "pwa": {
+    "kind": "real-pwa-cache-migration",
+    "passed": true,
+    "currentClientUpdatePassed": true,
+    "legacyErrors": [
+      "Cannot read properties of undefined (reading 'catch')"
+    ],
+    "names": [
+      "workbox-precache-v2-http://127.0.0.1:54325/audio-trimmer/",
+      "ffmpeg-wasm-v2"
+    ],
+    "oldAudio": false,
+    "other": "other-app",
+    "savedAudio": "saved-audio",
+    "setting": "preserved",
+    "obsoleteAssets": [],
+    "errors": []
+  },
+  "smoke": {
+    "url": "http://127.0.0.1:4173",
+    "browser": "153.0.8010.48",
+    "results": [
+      {
+        "kind": "load",
+        "profile": "desktop",
+        "mib": 500,
+        "readyMs": 157,
+        "idleMs": 0,
+        "measured": {
+          "native": true,
+          "reads": [
+            4
+          ],
+          "longTasks": [],
+          "audioWrites": 0,
+          "peakReportedHeap": 15017583
+        },
+        "peakRendererRSSBytes": 0,
+        "errors": []
+      },
+      {
+        "kind": "export",
+        "profile": "desktop",
+        "run": 1,
+        "elapsedMs": 16023,
+        "zipPath": "desktop-1.zip",
+        "peakRendererRSSBytes": 0,
+        "entries": [
+          {
+            "name": "500MiB-noise - parte 1.m4a",
+            "bytes": 24109052
+          },
+          {
+            "name": "500MiB-noise - parte 2.m4a",
+            "bytes": 24110285
+          }
+        ],
+        "errors": [],
+        "measured": {
+          "reads": [
+            4
+          ],
+          "longTasks": [],
+          "audioWrites": 0,
+          "peakReportedHeap": 49507764
+        }
+      },
+      {
+        "kind": "export",
+        "profile": "desktop",
+        "run": 2,
+        "elapsedMs": 15041,
+        "zipPath": "desktop-2.zip",
+        "peakRendererRSSBytes": 0,
+        "entries": [
+          {
+            "name": "500MiB-noise - parte 1.m4a",
+            "bytes": 24109052
+          },
+          {
+            "name": "500MiB-noise - parte 2.m4a",
+            "bytes": 24110285
+          }
+        ],
+        "errors": [],
+        "measured": {
+          "reads": [
+            4
+          ],
+          "longTasks": [],
+          "audioWrites": 0,
+          "peakReportedHeap": 52357562
+        }
+      },
+      {
+        "kind": "cancel-and-budget",
+        "profile": "desktop",
+        "passed": true
+      },
+      {
+        "kind": "metadata-save",
+        "audioWrites": 1,
+        "passed": true
+      },
+      {
+        "kind": "cleanup-finalization-lock",
+        "passed": true
+      }
+    ]
+  }
+}

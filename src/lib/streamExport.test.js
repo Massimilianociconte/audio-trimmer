@@ -161,3 +161,61 @@ test('checkpoint round-trips through stubbed localStorage', () => {
     }
   }
 });
+
+test('ZIP STORE roundtrip and errors do not retry a failed entry', async () => {
+ const { createZipStreamWriter } = await import('./streamExport.js');
+ let writes = 0;
+ const writable = new WritableStream({ write() { writes++; throw new Error('disk full'); } });
+ const writer = await createZipStreamWriter(writable);
+ await assert.rejects(writer.add('audio.mp3', new Uint8Array(1024)), /disk full/);
+ await writer.abort();
+ assert.equal(writes, 1);
+});
+
+test('abort cancels an active ZIP add rather than finalizing partial output', async () => {
+ const { createZipStreamWriter } = await import('./streamExport.js');
+ const controller = new AbortController();
+ let cancelled = false;
+ const writer = await createZipStreamWriter(new WritableStream({
+   write() { controller.abort(); }, abort() { cancelled = true; },
+ }), { signal: controller.signal });
+ await assert.rejects(writer.add('audio.wav', new Uint8Array(1024 * 1024)), /abort/i);
+ await writer.abort();
+ assert.ok(cancelled);
+});
+
+test('file write cancellation aborts the writable and prevents success', async () => {
+ const { writeBlobToFileHandle } = await import('./streamExport.js');
+ const controller=new AbortController();let aborted=false;let closed=false;
+ const file={createWritable:async()=>({write:async()=>controller.abort(),abort:async()=>{aborted=true;},close:async()=>{closed=true;}})};
+ await assert.rejects(writeBlobToFileHandle(file,new Uint8Array(10),{signal:controller.signal}),/abort/i);
+ assert.ok(aborted);assert.equal(closed,false);
+});
+
+test('ZIP blob output roundtrips stored bytes without compression', async()=>{
+ const { createZipBlobWriter }=await import('./streamExport.js');
+ const { ZipReader, BlobReader, Uint8ArrayWriter }=await import('@zip.js/zip.js');
+ const writer=await createZipBlobWriter();const data=new Uint8Array([1,2,3]);await writer.add('clip.mp3',data);const blob=await writer.close();
+ const reader=new ZipReader(new BlobReader(blob));const [entry]=await reader.getEntries();assert.equal(entry.compressionMethod,0);assert.deepEqual(await entry.getData(new Uint8ArrayWriter()),data);await reader.close();
+});
+
+test('ZIP cancellation interrupts a stalled central directory and never commits', async()=>{
+ const {createZipStreamWriter}=await import('./streamExport.js');
+ const controller=new AbortController();let releaseWrite;let stall=false;let committed=false;
+ const sink=new WritableStream({write(){if(stall)return new Promise(r=>{releaseWrite=r;});},close(){committed=true;}});
+ const writer=await createZipStreamWriter(sink,{signal:controller.signal});await writer.add('clip.mp3',new Uint8Array([1,2,3]));stall=true;
+ const closing=writer.close();await new Promise(r=>setTimeout(r,10));controller.abort();
+ const outcome=await Promise.race([closing.then(()=> 'success',()=> 'aborted'),new Promise(r=>setTimeout(()=>r('pending'),50))]);
+ releaseWrite?.();await writer.abort();assert.equal(outcome,'aborted');assert.equal(committed,false);
+});
+
+test('folder cancellation rejects a stalled write before the sink completes',async()=>{
+ const {writeBlobToFileHandle}=await import('./streamExport.js');const controller=new AbortController();let releaseWrite;let committed=false;
+ const writable=new WritableStream({write(){return new Promise(r=>{releaseWrite=r;});},close(){committed=true;}});
+ writable.write = (data) => { const w=writable.getWriter(); return w.write(data).finally(()=>w.releaseLock()); };
+ const pending=writeBlobToFileHandle({createWritable:async()=>writable},new Uint8Array(10),{signal:controller.signal});
+ pending.catch(()=>{});
+ await new Promise(r=>setTimeout(r,10));controller.abort();
+ const outcome=await Promise.race([pending.then(()=> 'success',()=> 'aborted'),new Promise(r=>setTimeout(()=>r('pending'),50))]);
+ releaseWrite?.();assert.equal(outcome,'aborted');assert.equal(committed,false);
+});

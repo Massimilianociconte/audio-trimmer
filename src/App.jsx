@@ -15,7 +15,6 @@ import {
 } from './lib/export.js';
 import {
   HEAVY_INPUT_BYTES,
-  RETAIN_BLOBS_BYTES,
   adviseExportStrategy,
   clearCheckpoint,
   createZipBlobWriter,
@@ -35,6 +34,7 @@ import {
   parseTimeInput,
   stripExtension,
 } from './lib/time.js';
+import { readAudioDurationFromBrowser } from './lib/audioMetadata.js';
 import { WaveformEditor } from './components/WaveformEditor.jsx';
 import { NativeAudioPreview } from './components/NativeAudioPreview.jsx';
 import {
@@ -51,7 +51,7 @@ import { AutomationPanel } from './components/AutomationPanel.jsx';
 import { ExportPanel } from './components/ExportPanel.jsx';
 import { Recorder } from './components/Recorder.jsx';
 import { ProjectLibrary } from './components/ProjectLibrary.jsx';
-import { runFfmpeg, safeDelete, useFfmpegEngine } from './hooks/useFfmpegEngine.js';
+import { runFfmpeg, runFfprobe, safeDelete, useFfmpegEngine } from './hooks/useFfmpegEngine.js';
 import {
   KEYBOARD_HINTS,
   useKeyboardShortcuts,
@@ -73,6 +73,7 @@ import {
   deleteProject as deleteStoredProject,
   listProjects,
   loadProject as loadStoredProject,
+  renameProject as renameStoredProject,
   saveProject as saveStoredProject,
 } from './lib/storage.js';
 import {
@@ -88,6 +89,7 @@ import {
   shouldWarmEngineInBackground,
   waveformSampleRate,
 } from './lib/device.js';
+import { assertOutputBudget, outputMemoryPolicy, mountAudioInput, readAudioOutput } from './lib/memoryPolicy.js';
 import { hardResetApp } from './lib/cacheReset.js';
 import {
   FAST_LOAD_STAGES,
@@ -182,68 +184,6 @@ function getFormatLabel(file, extension) {
   return 'audio';
 }
 
-function readAudioDurationFromBrowser(objectUrl, mimeType = '') {
-  return new Promise((resolve, reject) => {
-    // Skip immediato se il browser dichiara di non saper riprodurre il tipo:
-    // evita 15s di timeout muto su Safari/iOS (opus/webm, wma, amr...).
-    if (mimeType) {
-      try {
-        const probe = document.createElement('audio');
-        const support = probe.canPlayType(mimeType);
-        if (support === '') {
-          reject(new Error('Formato non riproducibile dal browser, uso il motore locale'));
-          return;
-        }
-      } catch (earlyError) {
-        if (earlyError?.message?.includes('non riproducibile')) {
-          reject(earlyError);
-          return;
-        }
-        // canPlayType non disponibile: prosegui col tentativo normale
-      }
-    }
-
-    const audio = document.createElement('audio');
-    let settled = false;
-
-    const timeoutId = window.setTimeout(() => {
-      finalize(() => reject(new Error('Timeout metadata browser')));
-    }, 15000);
-
-    function finalize(callback) {
-      if (settled) {
-        return;
-      }
-
-      settled = true;
-      window.clearTimeout(timeoutId);
-      audio.pause();
-      audio.removeAttribute('src');
-      audio.load();
-      audio.onloadedmetadata = null;
-      audio.onerror = null;
-      callback();
-    }
-
-    audio.preload = 'metadata';
-    audio.onloadedmetadata = () => {
-      const duration = audio.duration;
-
-      if (Number.isFinite(duration) && duration > 0) {
-        finalize(() => resolve(duration));
-        return;
-      }
-
-      finalize(() => reject(new Error('Durata browser non valida')));
-    };
-
-    audio.onerror = () => {
-      finalize(() => reject(new Error('Metadata browser non disponibili')));
-    };
-
-    audio.src = objectUrl;
-  });
-}
 
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
@@ -345,12 +285,14 @@ export default function App() {
   const exportAbortRef = useRef(false);
   const exportGateRef = useRef(null);
   const exportStageRef = useRef('');
+  const exportIOAbortRef = useRef(null);
   const previewTimeoutRef = useRef(null);
   const lastResultUrlsRef = useRef([]);
   const analysisIdRef = useRef(0);
   const isBusyRef = useRef(false);
   const isRecorderBusyRef = useRef(false);
   const sourceFileRef = useRef(null);
+  const savedAudioRef = useRef({ id: null, blob: null });
   // Input montato nel motore via WORKERFS (zero copie in RAM/wasm):
   // { ffmpeg, blob, dir, path, memfs }.
   const mountRef = useRef({ ffmpeg: null, blob: null, dir: '', path: '', memfs: false });
@@ -436,6 +378,15 @@ export default function App() {
   const audioFileRef = useRef(null);
   const loadJobRef = useRef(null);
   const timeUpdateRef = useRef({ lastAt: 0, value: 0 });
+  const waveformDecodePendingRef = useRef(false);
+  const waveformDecodeCountRef = useRef(0);
+  const [waveformDecodePending, setWaveformDecodePending] = useState(false);
+  const [previewFallbackSource, setPreviewFallbackSource] = useState('');
+  const handleWaveformDecodePending = useCallback((pending) => {
+    waveformDecodeCountRef.current = Math.max(0, waveformDecodeCountRef.current + (pending ? 1 : -1));
+    waveformDecodePendingRef.current = waveformDecodeCountRef.current > 0;
+    setWaveformDecodePending(waveformDecodePendingRef.current);
+  }, []);
 
   const plan = useMemo(() => buildPlan({
     duration: audioFile?.duration ?? 0,
@@ -498,31 +449,9 @@ export default function App() {
       await releaseMount(ffmpeg);
     }
     mountSequence += 1;
-    const extension = String(source.extension || getExtension(source.name || '') || '.audio').replace(/[^.a-z0-9]/gi, '') || '.audio';
-    const fileName = `input${extension}`;
-    const dir = `/in${mountSequence}`;
-    let path = '';
-    let memfs = false;
-    try {
-      await ffmpeg.createDir(dir);
-      const mounted = await ffmpeg.mount('WORKERFS', { blobs: [{ name: fileName, data: blob }] }, dir);
-      if (mounted === false) {
-        throw new Error('WORKERFS non disponibile');
-      }
-      path = `${dir}/${fileName}`;
-    } catch {
-      try {
-        await ffmpeg.deleteDir(dir);
-      } catch {
-        // ignore
-      }
-      const bytes = new Uint8Array(await blob.arrayBuffer());
-      path = `/input-${mountSequence}${extension}`;
-      await ffmpeg.writeFile(path, bytes);
-      memfs = true;
-    }
-    mountRef.current = { ffmpeg, blob, dir: memfs ? '' : dir, path, memfs };
-    return path;
+    const mounted = await mountAudioInput(ffmpeg, source, mountSequence);
+    mountRef.current = mounted;
+    return mounted.path;
   }
 
   async function releaseMount(ffmpeg = ffmpegRef.current) {
@@ -544,7 +473,14 @@ export default function App() {
   }
 
   function handleCancelAnalysis() {
+    if (waveformDecodePendingRef.current && audioFileRef.current) {
+      setPreviewFallbackSource(audioFileRef.current.objectUrl);
+    }
     analysisIdRef.current += 1;
+    if (loadJobRef.current?.stage === 'analysis') {
+      resetAfterAbort();
+      mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
+    }
     try {
       loadAbortRef.current?.abort();
     } catch {
@@ -595,6 +531,14 @@ export default function App() {
         window.clearTimeout(previewTimeoutRef.current);
       }
 
+      loadAbortRef.current?.abort();
+      exportIOAbortRef.current?.abort();
+      analysisIdRef.current += 1;
+      const preview = cleanupPreviewRef.current;
+      if (preview) { URL.revokeObjectURL(preview.originalUrl); URL.revokeObjectURL(preview.cleanedUrl); }
+      sourceFileRef.current = null;
+      savedAudioRef.current = { id: null, blob: null };
+      audioFileRef.current = null;
       mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
     };
   }, []);
@@ -603,7 +547,7 @@ export default function App() {
     if (!file) {
       return false;
     }
-    if (isBusyRef.current) {
+    if (isBusyRef.current || waveformDecodePendingRef.current) {
       setErrorText('Attendi il completamento dell’operazione in corso prima di caricare un altro file.');
       return false;
     }
@@ -671,7 +615,7 @@ export default function App() {
       // e intanto si scarica in background.
       let browserDurationOk = false;
       try {
-        duration = await readAudioDurationFromBrowser(objectUrl, mimeType);
+        duration = await readAudioDurationFromBrowser(objectUrl, mimeType, { signal: abortController.signal });
         browserDurationOk = Number.isFinite(duration) && duration > 0;
         technicalMessage = 'Durata letta direttamente dal browser (nessun download necessario).';
       } catch {
@@ -711,6 +655,10 @@ export default function App() {
         throw new Error('Durata non valida. Prova con un file audio differente.');
       }
 
+      if (mountRef.current.blob && mountRef.current.blob !== file) {
+        await releaseMount();
+      }
+      if (isStale()) return false;
       if (objectUrlRef.current) {
         URL.revokeObjectURL(objectUrlRef.current);
       }
@@ -735,6 +683,8 @@ export default function App() {
       };
       audioFileRef.current = nextAudio;
       setAudioFile(nextAudio);
+      savedAudioRef.current = { id: null, blob: null };
+      setPreviewFallbackSource('');
       sourceFileRef.current = file instanceof File ? file : null;
       setMode('equal');
       setEqualParts(2);
@@ -800,6 +750,10 @@ export default function App() {
       if (isStale()) {
         return false;
       }
+      if (ffmpegRef.current?.loaded === false) {
+        resetAfterAbort();
+        mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
+      }
       setErrorText(error.message || 'Non sono riuscito ad analizzare il file.');
       setStatusText('Qualcosa è andato storto durante l’analisi del file.');
       setLoadJob(null);
@@ -828,7 +782,7 @@ export default function App() {
     const probeOutputName = `probe-${Date.now()}-${analysisId}.json`;
     let probe = parseProbeJson('');
     try {
-      await ffmpeg.ffprobe([
+      await runFfprobe(ffmpeg, [
         '-v', 'error',
         '-show_entries', 'format=duration:stream=codec_type',
         '-of', 'json',
@@ -836,7 +790,8 @@ export default function App() {
         '-o', probeOutputName,
       ]);
       probe = parseProbeJson(await ffmpeg.readFile(probeOutputName, 'utf8'));
-    } catch {
+    } catch (error) {
+      if (ffmpeg.loaded === false) throw error;
       // probe inconclusiva: decide il log di ffmpeg -i
     } finally {
       await safeDelete(ffmpeg, probeOutputName);
@@ -887,10 +842,10 @@ export default function App() {
     setPreviewIndex(null);
   }
 
-  function handleRecordingChange(recording) {
+  const handleRecordingChange = useCallback((recording) => {
     isRecorderBusyRef.current = recording;
     setIsRecorderBusy(recording);
-  }
+  }, []);
 
   async function handleInputChange(event) {
     const file = event.target.files?.[0];
@@ -1250,6 +1205,7 @@ export default function App() {
       return;
     }
     setLoadJob(null);
+    if (current) setPreviewFallbackSource(current.objectUrl);
     setWaveformError(
       'Anteprima grafica non disponibile per questo file su questo browser, ma taglio ed export restano attivi. ' +
       `Dettaglio: ${message || 'decodifica non riuscita'}`,
@@ -1406,10 +1362,11 @@ export default function App() {
 
   // Motore in background appena il file è pronto (e la forma d'onda ha finito
   // di decodificare, per non sommare i picchi di memoria): quando l'utente
-  // preme "Taglia e scarica" il motore è già lì. Mai su Risparmio dati / 2G.
+  // preme "Taglia e scarica" il motore è già lì. Su mobile/PC deboli viene
+  // caricato solo quando serve; evita il costo residente del warm-up.
   const waveformPending = Boolean(loadJob?.active);
   useEffect(() => {
-    if (!audioFile || waveformPending || engineInfo.phase !== 'idle' || !shouldWarmEngineInBackground()) {
+    if (!audioFile || waveformPending || waveformDecodePending || engineInfo.phase !== 'idle' || !shouldWarmEngineInBackground()) {
       return undefined;
     }
     const handle = window.setTimeout(() => {
@@ -1418,7 +1375,7 @@ export default function App() {
       });
     }, 600);
     return () => window.clearTimeout(handle);
-  }, [audioFile, waveformPending, engineInfo.phase, ensureEngineReady]);
+  }, [audioFile, waveformPending, waveformDecodePending, engineInfo.phase, ensureEngineReady]);
 
   const taskAbortRef = useRef(false);
   const taskGateRef = useRef(null);
@@ -1429,7 +1386,8 @@ export default function App() {
    * (download/compilazione reali), poi avanzamento misurato sui secondi di
    * audio elaborati, velocità ed ETA. Annullabile.
    */
-  async function runEngineTask({ kind, title, durationSeconds }, work) {
+  async function runEngineTask({ kind, title, durationSeconds, keepBusy = false }, work) {
+    if (waveformDecodePendingRef.current) throw new Error('Attendi il completamento della forma d’onda prima di elaborare l’audio.');
     const startedAt = Date.now();
     const gate = createAbortGate();
     taskGateRef.current = gate;
@@ -1446,7 +1404,9 @@ export default function App() {
       if (taskAbortRef.current) {
         throw new Error('Operazione annullata.');
       }
+      taskStageRef.current = 'running';
       const inputPath = await ensureInputMounted(ffmpeg);
+      if (taskAbortRef.current) throw new Error('Operazione annullata.');
       const runStartedAt = performance.now();
       taskStageRef.current = 'running';
       setTask((previous) => previous ? { ...previous, stage: 'running', frac: 0 } : previous);
@@ -1464,14 +1424,20 @@ export default function App() {
         cancelled.cancelled = true;
         throw cancelled;
       }
+      if (ffmpegRef.current?.loaded === false) {
+        resetAfterAbort();
+        mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
+      }
       throw error;
     } finally {
       taskAbortRef.current = false;
       taskGateRef.current = null;
       taskStageRef.current = '';
       setTask(null);
-      isBusyRef.current = false;
-      setIsBusy(false);
+      if (!keepBusy) {
+        isBusyRef.current = false;
+        setIsBusy(false);
+      }
     }
   }
 
@@ -1482,6 +1448,7 @@ export default function App() {
     if (taskStageRef.current === 'running') {
       // Terminate interrompe l'exec in corso; il motore si ricrea al prossimo uso.
       resetAfterAbort();
+      mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
     }
   }
 
@@ -1512,7 +1479,7 @@ export default function App() {
             '-f',
             'null',
             '-',
-          ], { durationSeconds: duration, onProgress, captureLog: true });
+          ], { durationSeconds: duration, onProgress, captureLog: (line) => line.includes('silence_') });
           if (result.exitCode !== 0) {
             throw new Error(describeFfmpegFailure(result.tailText) || 'Analisi dei silenzi non riuscita.');
           }
@@ -1599,16 +1566,18 @@ export default function App() {
     const cleanedVirtualName = `cleaned-${Date.now()}.m4a`;
     let cleanedObjectUrl = '';
     let measuredSpeed = 0;
+    const metadataAbort = new AbortController();
     setCleanupPreview(null);
     waveformRef.current?.pause?.();
     setStatusText(`Applico "${preset.label}" su ${formatClock(audioDuration)} di audio…`);
 
     try {
       const cleanedBlob = await runEngineTask(
-        { kind: 'cleanup', title: `Pulizia audio: ${preset.label}`, durationSeconds: audioDuration },
+        { kind: 'cleanup', title: `Pulizia audio: ${preset.label}`, durationSeconds: audioDuration, keepBusy: true },
         async ({ ffmpeg, inputPath, onProgress }) => {
           try {
             const startedAt = performance.now();
+            assertOutputBudget(audioDuration * preset.bitrateKbps * 1000 / 8);
             const result = await runFfmpeg(ffmpeg, [
               '-hide_banner',
               '-i',
@@ -1620,12 +1589,12 @@ export default function App() {
               buildCleanupFilter(cleanupPreset, { shortenPauses }),
               ...buildCleanupOutputArgs(cleanupPreset),
               cleanedVirtualName,
-            ], { durationSeconds: audioDuration, onProgress });
+            ], { durationSeconds: audioDuration, onProgress, maxOutputBytes: outputMemoryPolicy().segmentBytes });
             if (result.exitCode !== 0) {
               throw new Error(describeFfmpegFailure(result.tailText) || 'Pulizia audio non riuscita: FFmpeg ha restituito un errore.');
             }
             measuredSpeed = speedFactor(audioDuration, performance.now() - startedAt);
-            const cleanedData = await ffmpeg.readFile(cleanedVirtualName);
+            const cleanedData = await readAudioOutput(ffmpeg, cleanedVirtualName);
             return new Blob([cleanedData], { type: 'audio/mp4' });
           } finally {
             // Il risultato vive nel Blob (montato via WORKERFS al prossimo uso):
@@ -1634,14 +1603,20 @@ export default function App() {
           }
         },
       );
+      if (audioFileRef.current?.blob !== sourceAudio.blob) return;
       rememberSpeed(cleanupSpeedKey(cleanupPreset), measuredSpeed);
       cleanedObjectUrl = URL.createObjectURL(cleanedBlob);
+      loadAbortRef.current = metadataAbort;
 
       let probedDuration = NaN;
       try {
-        probedDuration = await readAudioDurationFromBrowser(cleanedObjectUrl, 'audio/mp4');
+        probedDuration = await readAudioDurationFromBrowser(cleanedObjectUrl, 'audio/mp4', { signal: metadataAbort.signal });
       } catch {
         probedDuration = NaN;
+      }
+      if (metadataAbort.signal.aborted || audioFileRef.current?.blob !== sourceAudio.blob) {
+        URL.revokeObjectURL(cleanedObjectUrl);
+        return;
       }
       const newDuration = changesTimeline && Number.isFinite(probedDuration) && probedDuration > 0
         ? probedDuration
@@ -1664,6 +1639,7 @@ export default function App() {
           lastModified: sourceAudio.lastModified ?? null,
           browserPlayable: sourceAudio.browserPlayable,
           previewOnly: sourceAudio.previewOnly,
+          previewBlob: sourceAudio.previewBlob ?? null,
         };
       });
 
@@ -1686,8 +1662,10 @@ export default function App() {
         blob: cleanedBlob,
         browserPlayable: true,
         previewOnly: false,
+        previewBlob: null,
       };
       audioFileRef.current = nextAudio;
+      savedAudioRef.current = { id: null, blob: null };
       setAudioFile(nextAudio);
       if (changesTimeline) {
         // Le pause accorciate spostano i tempi: i vecchi punti non corrispondono più.
@@ -1718,6 +1696,11 @@ export default function App() {
       console.error(error);
       setErrorText(failureMessage(error, 'Pulizia dell’audio non completata.'));
       setStatusText('Pulizia non completata.');
+    } finally {
+      metadataAbort.abort();
+      if (loadAbortRef.current === metadataAbort) loadAbortRef.current = null;
+      isBusyRef.current = false;
+      setIsBusy(false);
     }
   }
 
@@ -1780,8 +1763,8 @@ export default function App() {
             if (cleaned.exitCode !== 0) {
               throw new Error(describeFfmpegFailure(cleaned.tailText) || 'Anteprima non riuscita.');
             }
-            const originalData = await ffmpeg.readFile(originalName);
-            const cleanedData = await ffmpeg.readFile(cleanedName);
+            const originalData = await readAudioOutput(ffmpeg, originalName);
+            const cleanedData = await readAudioOutput(ffmpeg, cleanedName);
             return {
               original: new Blob([originalData], { type: 'audio/mp4' }),
               cleaned: new Blob([cleanedData], { type: 'audio/mp4' }),
@@ -1889,7 +1872,9 @@ export default function App() {
       ?? (sameAsSource
         ? sourceFileRef.current
         : await (await fetch(audioFile.objectUrl)).blob());
-    await assertStorageFor(audioBlob.size);
+    const audioUnchanged = currentProjectId && savedAudioRef.current.id === currentProjectId
+      && savedAudioRef.current.blob === audioBlob;
+    if (!audioUnchanged) await assertStorageFor(audioBlob.size);
     const now = Date.now();
     const record = await saveStoredProject({
       id: currentProjectId ?? undefined,
@@ -1899,7 +1884,8 @@ export default function App() {
       audioMimeType: audioFile.mimeType,
       formatLabel: audioFile.formatLabel,
       duration: audioFile.duration,
-      audioBlob,
+      audioBlob: audioUnchanged ? undefined : audioBlob,
+      size: audioBlob.size,
       mode,
       equalParts,
       exportFormat,
@@ -1921,6 +1907,7 @@ export default function App() {
       segmentNames,
       createdAt: currentProjectId ? undefined : now,
     });
+    savedAudioRef.current = { id: record.id, blob: audioBlob };
     setCurrentProjectId(record.id);
     setSaveStatus('Progetto salvato.');
     flashDone('Progetto salvato', 'Lo ritrovi in «Progetti salvati», anche offline.');
@@ -1928,7 +1915,7 @@ export default function App() {
   }
 
   async function handleOpenProject(projectId) {
-    if (!projectId || isBusy) {
+    if (!projectId || isBusyRef.current) {
       return;
     }
     try {
@@ -1950,6 +1937,7 @@ export default function App() {
         setCurrentProjectId(null);
         return;
       }
+      savedAudioRef.current = { id: record.id, blob: file };
       setCurrentProjectId(record.id);
       if (record.mode === 'equal' || record.mode === 'custom') {
         setMode(record.mode);
@@ -1999,7 +1987,7 @@ export default function App() {
   }
 
   async function handleRenameProject(projectId, currentName) {
-    if (!projectId) {
+    if (!projectId || isBusyRef.current) {
       return;
     }
     const next = window.prompt('Rinomina progetto:', currentName || '');
@@ -2011,12 +1999,14 @@ export default function App() {
       return;
     }
     try {
-      const record = await loadStoredProject(projectId);
+      const record = await runStorageTask(
+        { title: 'Rinomino il progetto', detail: 'Aggiorno il nome salvato…' },
+        () => renameStoredProject(projectId, name),
+      );
       if (!record) {
         setProjectsError('Progetto non trovato.');
         return;
       }
-      await saveStoredProject({ ...record, name });
       await refreshProjects();
     } catch (error) {
       console.error(error);
@@ -2025,21 +2015,22 @@ export default function App() {
   }
 
   async function handleDuplicateProject(projectId) {
-    if (!projectId) {
+    if (!projectId || isBusyRef.current) {
       return;
     }
     try {
-      const record = await loadStoredProject(projectId);
-      if (!record) {
-        setProjectsError('Progetto non trovato.');
-        return;
-      }
-      // La copia ricopia l'intero blob: stesso pre-check quota del salvataggio.
-      await assertStorageFor(record.size ?? record.audioBlob?.size ?? 0);
-      const { id: _dropped, ...rest } = record;
       await runStorageTask(
-        { title: 'Duplico il progetto', detail: formatBytes(record.audioBlob?.size ?? record.size ?? 0) },
-        () => saveStoredProject({ ...rest, id: undefined, name: `${record.name || 'Progetto'} (copia)`, createdAt: Date.now() }),
+        { title: 'Duplico il progetto', detail: 'Leggo e copio audio e tagli…' },
+        async () => {
+          const record = await loadStoredProject(projectId);
+          if (!record) {
+            throw new Error('Progetto non trovato.');
+          }
+          // La copia ricopia l'intero blob: stesso pre-check quota del salvataggio.
+          await assertStorageFor(record.size ?? record.audioBlob?.size ?? 0);
+          const { id: _dropped, ...rest } = record;
+          return saveStoredProject({ ...rest, id: undefined, name: `${record.name || 'Progetto'} (copia)`, createdAt: Date.now() });
+        },
       );
       await refreshProjects();
     } catch (error) {
@@ -2054,7 +2045,7 @@ export default function App() {
   }
 
   async function handleDeleteProject(projectId) {
-    if (!projectId) {
+    if (!projectId || isBusyRef.current) {
       return;
     }
     const confirmed = window.confirm('Eliminare definitivamente questo progetto?');
@@ -2062,7 +2053,10 @@ export default function App() {
       return;
     }
     try {
-      await deleteStoredProject(projectId);
+      await runStorageTask(
+        { title: 'Elimino il progetto', detail: 'Rimuovo audio e tagli salvati…' },
+        () => deleteStoredProject(projectId),
+      );
       if (currentProjectId === projectId) {
         setCurrentProjectId(null);
       }
@@ -2097,6 +2091,7 @@ export default function App() {
         { kind: 'preview', title: 'Creo l’anteprima ascoltabile', durationSeconds: duration },
         async ({ ffmpeg, inputPath, onProgress }) => {
           try {
+            assertOutputBudget(duration * 48000 / 8);
             // Mono 22kHz 48k: leggera da generare e da decodificare per la forma d'onda.
             const result = await runFfmpeg(ffmpeg, [
               '-hide_banner',
@@ -2110,11 +2105,11 @@ export default function App() {
               '-b:a', '48k',
               '-movflags', '+faststart',
               outputName,
-            ], { durationSeconds: duration, onProgress });
+            ], { durationSeconds: duration, onProgress, maxOutputBytes: outputMemoryPolicy().segmentBytes });
             if (result.exitCode !== 0) {
               throw new Error(describeFfmpegFailure(result.tailText) || 'Anteprima non riuscita.');
             }
-            const data = await ffmpeg.readFile(outputName);
+            const data = await readAudioOutput(ffmpeg, outputName);
             return new Blob([data], { type: 'audio/mp4' });
           } finally {
             await safeDelete(ffmpeg, outputName);
@@ -2130,7 +2125,7 @@ export default function App() {
         URL.revokeObjectURL(current.objectUrl);
       }
       objectUrlRef.current = previewUrl;
-      const nextAudio = { ...current, objectUrl: previewUrl, browserPlayable: true, previewOnly: true };
+      const nextAudio = { ...current, objectUrl: previewUrl, previewBlob, browserPlayable: true, previewOnly: true };
       audioFileRef.current = nextAudio;
       setAudioFile(nextAudio);
       setLoadJob({
@@ -2165,6 +2160,7 @@ export default function App() {
         { kind: 'ai', title: 'Copia leggera per AI Studio', durationSeconds: duration },
         async ({ ffmpeg, inputPath, onProgress }) => {
           try {
+            assertOutputBudget(duration * 32000 / 8);
             const result = await runFfmpeg(ffmpeg, [
               '-hide_banner',
               '-i',
@@ -2186,11 +2182,11 @@ export default function App() {
               '-movflags',
               '+faststart',
               outputName,
-            ], { durationSeconds: duration, onProgress });
+            ], { durationSeconds: duration, onProgress, maxOutputBytes: outputMemoryPolicy().segmentBytes });
             if (result.exitCode !== 0) {
               throw new Error(describeFfmpegFailure(result.tailText) || 'Export per AI Studio non riuscito: FFmpeg ha restituito un errore.');
             }
-            const data = await ffmpeg.readFile(outputName);
+            const data = await readAudioOutput(ffmpeg, outputName);
             return new Blob([data], { type: 'audio/mp4' });
           } finally {
             await safeDelete(ffmpeg, outputName);
@@ -2215,7 +2211,7 @@ export default function App() {
   }
 
   function handleRestoreOriginal() {
-    if (!originalAudioBackup || isBusyRef.current) {
+    if (!originalAudioBackup || isBusyRef.current || waveformDecodePendingRef.current) {
       return;
     }
     // L'originale vive nel suo Blob: nessuna operazione del motore necessaria,
@@ -2239,9 +2235,11 @@ export default function App() {
           blob: originalAudioBackup.blob ?? null,
           browserPlayable: originalAudioBackup.browserPlayable ?? true,
           previewOnly: originalAudioBackup.previewOnly ?? false,
+          previewBlob: originalAudioBackup.previewBlob ?? null,
         }
       : null;
     audioFileRef.current = restored;
+    savedAudioRef.current = { id: null, blob: null };
     setAudioFile(restored);
     // Senza accorciare le pause la durata è la stessa: tagli e segnalibri restano validi.
     if (appliedCleanup?.shortenPauses !== false) {
@@ -2292,6 +2290,7 @@ export default function App() {
 
   function handleCancelExport() {
     exportAbortRef.current = true;
+    exportIOAbortRef.current?.abort();
     setStatusText('Annullamento export in corso…');
     exportGateRef.current?.abort();
     if (exportStageRef.current !== 'engine') {
@@ -2299,6 +2298,7 @@ export default function App() {
       // e l'audio rimontato (zero copie) da ensureInputMounted. Durante il download
       // del motore invece si abbandona solo l'attesa: il download prosegue.
       resetAfterAbort();
+      mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
     }
   }
 
@@ -2567,11 +2567,12 @@ export default function App() {
               // Micro-fade anti-click sui confini A-B (20ms, inudibile come dissolvenza).
               fadeSeconds: copy ? 0 : 0.02,
             });
-            const result = await runFfmpeg(ffmpeg, args, { durationSeconds: selectionSeconds, onProgress });
+            assertOutputBudget(copy ? audioFile.size * selectionSeconds / audioFile.duration : estimateExportBytes({ durationSeconds: selectionSeconds, bitrateKbps: exportBitrate, formatId: format.id }));
+            const result = await runFfmpeg(ffmpeg, args, { durationSeconds: selectionSeconds, onProgress, maxOutputBytes: outputMemoryPolicy().segmentBytes });
             if (result.exitCode !== 0) {
               throw new Error(describeFfmpegFailure(result.tailText) || 'Export selezione non riuscito.');
             }
-            const data = await ffmpeg.readFile(virtualName);
+            const data = await readAudioOutput(ffmpeg, virtualName);
             return new Blob([data], { type: format.mime });
           } finally {
             await safeDelete(ffmpeg, virtualName);
@@ -2592,7 +2593,7 @@ export default function App() {
   }
 
   async function processAndDownload() {
-    if (isBusyRef.current) {
+    if (isBusyRef.current || waveformDecodePendingRef.current) {
       return;
     }
     if (!audioFile || plan.error || plan.segments.length < 2) {
@@ -2665,7 +2666,22 @@ export default function App() {
     setAdvisorNote([...advice.reasons, ...advice.warnings, ...(deviceMode.note ? [deviceMode.note] : [])].join(' '));
     // Trattiene i Blob per il re-download solo sotto soglia: sopra, solo metadati.
     // Su mobile la soglia è molto più bassa (i Blob trattengono RAM per l'intera sessione).
-    const retainBlobs = totalEstimate <= (isMobileDevice() ? 30 * 1024 * 1024 : RETAIN_BLOBS_BYTES);
+    const memoryBudget = outputMemoryPolicy();
+    const retainBlobs = totalEstimate <= memoryBudget.retainBytes;
+    try {
+      for (const segment of jobSegments) {
+        assertOutputBudget(jobFastCopy
+          ? jobAudio.size * segment.duration / jobAudio.duration
+          : estimateExportBytes({ durationSeconds: segment.duration, bitrateKbps: jobBitrate, formatId: jobFormatId }));
+      }
+      if (destMode === 'zip-classic' && totalEstimate * 1.15 > memoryBudget.archiveBytes) {
+        throw new Error('ZIP troppo grande per il budget di memoria di questo dispositivo. Usa cartella/ZIP su disco se disponibili, oppure esporta una selezione più corta in M4A/MP3.');
+      }
+    } catch (error) {
+      isBusyRef.current = false;
+      setErrorText(error.message);
+      return;
+    }
 
     // Gli handle disco vanno chiesti NEL gesto utente, prima del lavoro pesante.
     let dirHandle = null;
@@ -2704,6 +2720,8 @@ export default function App() {
     setIsBusy(true);
     setIsExporting(true);
     exportAbortRef.current = false;
+    const ioAbort = new AbortController();
+    exportIOAbortRef.current = ioAbort;
     setExportDetail({
       active: true,
       stage: 'engine',
@@ -2746,13 +2764,15 @@ export default function App() {
       }
       exportStageRef.current = 'segments';
       const inputPath = await ensureInputMounted(ffmpeg, jobAudio);
+      if (exportAbortRef.current) throw new Error('Export annullato.');
       if (destMode === 'zip-stream') {
         zipWritable = await zipFileHandle.createWritable();
-        zipWriter = await createZipStreamWriter(zipWritable);
+        zipWriter = await createZipStreamWriter(zipWritable, { signal: ioAbort.signal });
       } else if (destMode === 'zip-classic') {
-        zipWriter = await createZipBlobWriter();
+        zipWriter = await createZipBlobWriter({ signal: ioAbort.signal });
       }
       const exportedParts = [];
+      let retainedBytes = 0;
       writeCheckpoint({
         baseName: jobBaseName,
         formatId: jobFormatId,
@@ -2839,10 +2859,12 @@ export default function App() {
 
         // Avanzamento intra-segmento reale (secondi di output scritti da ffmpeg).
         let result;
+        createdVirtualNames.push(virtualName);
         try {
           result = await runFfmpeg(ffmpeg, args, {
             durationSeconds: segment.duration,
             onProgress: (frac) => publish(index, frac ?? 0, segment.duration),
+            maxOutputBytes: memoryBudget.segmentBytes,
           });
         } catch (execError) {
           if (!exportAbortRef.current) {
@@ -2873,17 +2895,19 @@ export default function App() {
           throw failed;
         }
 
-        createdVirtualNames.push(virtualName);
-
-        let outputData = await ffmpeg.readFile(virtualName);
+        let outputData = await readAudioOutput(ffmpeg, virtualName);
         // Libera SUBITO il segmento dalla memoria wasm: mai più di uno in RAM.
         await safeDelete(ffmpeg, virtualName);
         createdVirtualNames.pop();
 
+        if (exportAbortRef.current) throw new Error('Export annullato.');
+        if (destMode === 'zip-classic' && bytesDone + outputData.length > memoryBudget.archiveBytes) {
+          throw new Error('Il risultato supera il budget dello ZIP in memoria. Usa cartella/ZIP su disco o riduci la durata/il bitrate.');
+        }
         if (destMode === 'folder') {
           const fileHandle = await dirHandle.getFileHandle(downloadName, { create: true });
           // Scrittura diretta dei byte: niente Blob intermedio da ~1 segmento.
-          await writeBlobToFileHandle(fileHandle, outputData);
+          await writeBlobToFileHandle(fileHandle, outputData, { signal: ioAbort.signal });
           exportedParts.push({ name: downloadName, size: outputData.length, duration: segment.duration });
         } else if (destMode === 'zip-stream' || destMode === 'zip-classic') {
           await zipWriter.add(downloadName, outputData);
@@ -2891,7 +2915,8 @@ export default function App() {
         } else {
           const blob = new Blob([outputData], { type: format.mime });
           let url = null;
-          if (retainBlobs) {
+          if (retainBlobs && retainedBytes + blob.size <= memoryBudget.retainBytes) {
+            retainedBytes += blob.size;
             url = URL.createObjectURL(blob);
             lastResultUrlsRef.current.push(url);
           }
@@ -2922,6 +2947,7 @@ export default function App() {
         });
       }
 
+      if (exportAbortRef.current) throw new Error('Export annullato.');
       const workMs = performance.now() - workStartedAt;
       if (workedSeconds > 0) {
         rememberSpeed(speedKey, speedFactor(workedSeconds, workMs));
@@ -2948,12 +2974,14 @@ export default function App() {
         const zipBlob = await zipWriter.close();
         zipWriter = null;
         zipName = `${sanitizeFileName(jobBaseName)} - ${exportedParts.length} parti.zip`;
-        const url = URL.createObjectURL(zipBlob);
-        lastResultUrlsRef.current.push(url);
-        zipUrl = url;
+        if (zipBlob.size <= memoryBudget.retainBytes) {
+          zipUrl = URL.createObjectURL(zipBlob);
+          lastResultUrlsRef.current.push(zipUrl);
+        }
         downloadBlob(zipBlob, zipName);
       }
 
+      if (exportAbortRef.current) throw new Error('Export annullato.');
       clearCheckpoint();
       const elapsedLabel = formatDurationShort((Date.now() - startedAt) / 1000);
       setLastResult({
@@ -3014,10 +3042,7 @@ export default function App() {
       // il file parziale resta bloccato su disco.
       if (zipWriter) {
         try {
-          if (exportAbortRef.current || destMode === 'zip-stream') {
-            await zipWriter.abort?.();
-          }
-          await zipWriter.close()?.catch?.(() => {});
+          await zipWriter.abort?.();
         } catch {
           // ignore: il file parziale resta eliminabile dall'utente
         }
@@ -3037,10 +3062,12 @@ export default function App() {
       }
       if (engineCrashed) {
         resetAfterAbort();
+        mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
       }
 
       exportAbortRef.current = false;
       exportGateRef.current = null;
+      exportIOAbortRef.current = null;
       exportStageRef.current = '';
       setExportDetail(null);
       isBusyRef.current = false;
@@ -3049,7 +3076,7 @@ export default function App() {
     }
   }
 
-  const canExport = Boolean(audioFile) && !plan.error && plan.segments.length >= 2 && !isBusy;
+  const canExport = Boolean(audioFile) && !plan.error && plan.segments.length >= 2 && !isBusy && !waveformDecodePending;
   const activeStep = !audioFile ? 0 : (plan.error || plan.segments.length < 2 ? 1 : (!lastResult ? 2 : 3));
   const effectiveFormat = getExportFormat(effectiveFormatId);
   const formatBadge = effectiveFastCopy ? `${effectiveFormat.label} originale` : effectiveFormat.label;
@@ -3372,7 +3399,7 @@ export default function App() {
                     Crea anteprima ascoltabile
                   </button>
                 </div>
-              ) : useNativePreview ? (
+              ) : useNativePreview || previewFallbackSource === audioFile.objectUrl ? (
                 <NativeAudioPreview
                   ref={waveformRef}
                   src={audioFile.objectUrl}
@@ -3380,11 +3407,14 @@ export default function App() {
                   onReady={handleWaveformReady}
                   onTimeUpdate={handleWaveformTimeUpdate}
                   onPlayStateChange={handleWaveformPlayStateChange}
+                  onPreviewError={handleWaveformError}
                 />
               ) : (
                 <WaveformEditor
                   ref={waveformRef}
                   src={audioFile.objectUrl}
+                  blob={audioFile.previewBlob ?? audioFile.blob}
+                  duration={audioFile.duration}
                   cuts={waveformCuts}
                   bookmarks={bookmarks}
                   loopRegion={loopRegion}
@@ -3398,6 +3428,7 @@ export default function App() {
                   onBookmarkJump={handleBookmarkJump}
                   onLoadingProgress={handleWaveformProgress}
                   onWaveformError={handleWaveformError}
+                  onDecodePending={handleWaveformDecodePending}
                   sampleRate={waveformRate}
                 />
               )}

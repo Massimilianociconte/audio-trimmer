@@ -1,0 +1,110 @@
+{
+  "url": "http://127.0.0.1:4173",
+  "browser": "153.0.8010.48",
+  "results": [
+    {
+      "kind": "load",
+      "profile": "desktop",
+      "mib": 1,
+      "readyMs": 215,
+      "idleMs": 0,
+      "measured": {
+        "native": false,
+        "reads": [
+          1048576,
+          4
+        ],
+        "longTasks": [
+          107
+        ],
+        "audioWrites": 0,
+        "peakReportedHeap": 27739568
+      },
+      "peakRendererRSSBytes": 0,
+      "errors": []
+    },
+    {
+      "kind": "export",
+      "profile": "desktop",
+      "run": 1,
+      "elapsedMs": 14238,
+      "zipPath": "desktop-1.zip",
+      "peakRendererRSSBytes": 0,
+      "entries": [
+        {
+          "name": "500MiB-noise - parte 1.m4a",
+          "bytes": 24109052
+        },
+        {
+          "name": "500MiB-noise - parte 2.m4a",
+          "bytes": 24110285
+        }
+      ],
+      "errors": [],
+      "measured": {
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 39517550
+      }
+    },
+    {
+      "kind": "export",
+      "profile": "desktop",
+      "run": 2,
+      "elapsedMs": 14464,
+      "zipPath": "desktop-2.zip",
+      "peakRendererRSSBytes": 0,
+      "entries": [
+        {
+          "name": "500MiB-noise - parte 1.m4a",
+          "bytes": 24109052
+        },
+        {
+          "name": "500MiB-noise - parte 2.m4a",
+          "bytes": 24110285
+        }
+      ],
+      "errors": [],
+      "measured": {
+        "reads": [
+          4
+        ],
+        "longTasks": [],
+        "audioWrites": 0,
+        "peakReportedHeap": 39517550
+      }
+    },
+    {
+      "kind": "cancel-and-budget",
+      "profile": "desktop",
+      "passed": true
+    },
+    {
+      "kind": "metadata-save",
+      "audioWrites": 1,
+      "passed": true
+    },
+    {
+      "kind": "cleanup-finalization-lock",
+      "passed": true
+    },
+    {
+      "kind": "ffprobe-real-worker",
+      "format": "WMA",
+      "ready": true,
+      "errors": []
+    }
+  ],
+  "explicitCrcVerification": {
+    "passed": true,
+    "archives": [
+      "desktop-1.zip",
+      "desktop-2.zip",
+      "Pixel-5-1.zip",
+      "iPhone-13-1.zip"
+    ]
+  }
+}
