@@ -70,6 +70,27 @@ eliminati i riferimenti non necessari a vecchi mount, risultati e audio salvati 
 
 I valori sono in MiB; la UI usa l’etichetta MB per continuità. Non rappresentano RAM libera.
 
+> **Aggiornamento 30/09/2026 (sera).** I budget iniziali (32 MiB per parte su mobile/tablet)
+> bloccavano l’uso reale: una lezione da 160–180 MB divisa in due non si esportava più da tablet,
+> mentre prima funzionava in ~3 minuti. Requisito di prodotto: **≥ 100 MB per parte su ogni
+> dispositivo**. I budget ora dipendono solo dalla memoria dichiarata (`navigator.deviceMemory`),
+> identici per telefono, tablet e desktop; il fallback MEMFS usa lo stesso budget di una parte.
+
+| Memoria dichiarata | Singolo output | ZIP compatibile totale | Risultati conservati | Fallback input MEMFS |
+|---|---:|---:|---:|---:|
+| ≤ 2 GB (3 GB reali arrotondati a 2) | 160 | 256 | 256 | 160 |
+| 4 GB oppure non dichiarata (Safari iPhone/iPad, Firefox) | 256 | 384 | 256 | 256 |
+| ≥ 8 GB | 512 | 1024 | 512 | 512 |
+
+Picco stimato di una parte ≈ 2,1× la sua dimensione (crescita MEMFS del 12,5% + copia di
+`readFile`): 100 MB → ~210 MB transitori, 160 MiB → ~340 MiB. Lo ZIP compatibile resta sotto
+384 MiB senza dato dichiarato perché WebKit può tenerne due copie durante `Response.blob()`.
+Su mobile il wasm del motore viene scaricato in Cache Storage appena c’è un file, senza compilarlo
+(nessun worker/heap residente): all’export resta solo la compilazione. Il link di download resta
+valido 60 s (Safari e alcuni download manager leggono il Blob dopo il click).
+
+Tabella originale, superata:
+
 | Profilo | Singolo output | ZIP compatibile totale | Risultati conservati | Fallback input MEMFS |
 |---|---:|---:|---:|---:|
 | Mobile/tablet | 32 | 64 | 16 | 8 |

@@ -331,7 +331,11 @@ export function ExportPanel({
             Ultima esportazione
             {lastResult.destMode === 'folder' || lastResult.destMode === 'zip-stream'
               ? ' · file già su disco'
-              : ' · riscarica singoli'}
+              : lastResult.zipUrl
+                ? ' · ZIP riscaricabile'
+                : lastResult.parts.some((part) => part.url)
+                  ? ' · riscarica singoli'
+                  : ''}
           </p>
           <ul className="exported-list">
             {lastResult.parts.map((part) => (
@@ -360,7 +364,8 @@ export function ExportPanel({
           {lastResult.elapsedLabel ? (
             <p className="helper-text">Completato in {lastResult.elapsedLabel}.</p>
           ) : null}
-          {lastResult.retainBlobs === false ? (
+          {lastResult.destMode !== 'folder' && lastResult.destMode !== 'zip-stream'
+            && !lastResult.zipUrl && !lastResult.parts.some((part) => part.url) ? (
             <p className="helper-text">Re-download disattivato per risparmiare memoria su questo job pesante.</p>
           ) : null}
         </div>

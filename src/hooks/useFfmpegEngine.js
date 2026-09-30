@@ -38,33 +38,66 @@ export async function purgeWasmCaches() {
   }
 }
 
+/** Risposta valida del wasm nella Cache Storage, con o senza service worker attivo. */
+async function findCachedWasm() {
+  try {
+    if (typeof caches === 'undefined') {
+      return null;
+    }
+    const cached = await caches.match(absoluteUrl(ffmpegWasmUrl), { cacheName: ENGINE_CACHE_NAME })
+      ?? await caches.match(absoluteUrl(ffmpegWasmUrl));
+    if (!cached || !cached.ok) {
+      return null;
+    }
+    const length = Number(cached.headers.get('content-length')) || 0;
+    const encoding = cached.headers.get('content-encoding');
+    // Senza content-length (risposta in streaming) ci si fida: CacheFirst salva solo 200 pieni.
+    const valid = length === 0 || Boolean(encoding && encoding !== 'identity') || length === ENGINE_WASM_BYTES;
+    return valid ? cached : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Wasm già in cache E servibile dal service worker che controlla la pagina:
  * in quel caso il load dagli URL statici è istantaneo, niente download.
  */
 async function isWasmServedFromCache() {
-  try {
-    if (!globalThis.navigator?.serviceWorker?.controller || typeof caches === 'undefined') {
-      return false;
-    }
-    const cached = await caches.match(absoluteUrl(ffmpegWasmUrl), { cacheName: ENGINE_CACHE_NAME })
-      ?? await caches.match(absoluteUrl(ffmpegWasmUrl));
-    if (!cached || !cached.ok) {
-      return false;
-    }
-    const length = Number(cached.headers.get('content-length')) || 0;
-    const encoding = cached.headers.get('content-encoding');
-    // Senza content-length (risposta in streaming) ci si fida: CacheFirst salva solo 200 pieni.
-    return length === 0 || Boolean(encoding && encoding !== 'identity') || length === ENGINE_WASM_BYTES;
-  } catch {
+  if (!globalThis.navigator?.serviceWorker?.controller) {
     return false;
+  }
+  return Boolean(await findCachedWasm());
+}
+
+/**
+ * Wasm in cache ma pagina non ancora controllata dal SW (prima visita,
+ * aggiornamento in attesa): lo si legge dalla cache invece di riscaricarlo.
+ */
+async function readCachedWasmBlob() {
+  try {
+    const cached = await findCachedWasm();
+    if (!cached) {
+      return null;
+    }
+    const blob = await cached.blob();
+    const magic = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+    if (blob.size < 1024 * 1024 || magic[0] !== 0 || magic[1] !== 97 || magic[2] !== 115 || magic[3] !== 109) {
+      return null;
+    }
+    return new Blob([blob], { type: 'application/wasm' });
+  } catch {
+    return null;
   }
 }
 
 /** Salva il wasm scaricato nella cache del SW: dalla visita successiva è istantaneo. */
-async function storeWasmInCache(blob) {
+async function storeWasmInCache(blob, { force = false } = {}) {
   try {
-    if (!import.meta.env.PROD || typeof caches === 'undefined' || globalThis.navigator?.serviceWorker?.controller) {
+    if (!import.meta.env.PROD || typeof caches === 'undefined') {
+      return;
+    }
+    if (!force && globalThis.navigator?.serviceWorker?.controller) {
       // Con il SW attivo la CacheFirst ha già salvato la risposta: niente doppia scrittura.
       return;
     }
@@ -118,6 +151,11 @@ export function useFfmpegEngine() {
   // pubblicato da un'istanza già terminata.
   const generationRef = useRef(0);
   const downloadAbortRef = useRef(null);
+  // Download anticipato senza compilazione (mobile/PC deboli): nessun worker
+  // né heap wasm residente, solo byte in Cache Storage.
+  const prefetchRef = useRef(null);
+  const prefetchAbortRef = useRef(null);
+  const cachedRef = useRef(false);
 
   const createInstance = useCallback(() => {
     const ffmpeg = new FFmpeg();
@@ -164,26 +202,35 @@ export function useFfmpegEngine() {
         }
       };
       loadPromiseRef.current = (async () => {
+        // Download anticipato in corso (mobile): lo si aspetta invece di
+        // raddoppiarlo. La barra continua a mostrare i suoi byte reali.
+        if (prefetchRef.current) {
+          await prefetchRef.current.catch(() => {});
+          assertCurrent();
+        }
         const startedAt = Date.now();
         let wasmUrl = ffmpegWasmUrl;
         let blobUrl = '';
         if (await isWasmServedFromCache()) {
           publish({ phase: 'compiling', loaded: ENGINE_WASM_BYTES, total: ENGINE_WASM_BYTES, startedAt, error: '' });
         } else {
-          publish({ phase: 'downloading', loaded: 0, total: ENGINE_WASM_BYTES, startedAt, error: '' });
-          const blob = await downloadEngineWasm(ffmpegWasmUrl, {
-            expectedBytes: ENGINE_WASM_BYTES,
-            signal: downloadAbort.signal,
-            onBytes: (loaded, total) => {
-              const now = Date.now();
-              if (now - lastBytesReportRef.current < PROGRESS_THROTTLE_MS && loaded < total) {
-                return;
-              }
-              lastBytesReportRef.current = now;
-              publish({ phase: 'downloading', loaded, total, startedAt, error: '' });
-            },
-          });
-          storeWasmInCache(blob);
+          let blob = await readCachedWasmBlob();
+          if (!blob) {
+            publish({ phase: 'downloading', loaded: 0, total: ENGINE_WASM_BYTES, startedAt, error: '' });
+            blob = await downloadEngineWasm(ffmpegWasmUrl, {
+              expectedBytes: ENGINE_WASM_BYTES,
+              signal: downloadAbort.signal,
+              onBytes: (loaded, total) => {
+                const now = Date.now();
+                if (now - lastBytesReportRef.current < PROGRESS_THROTTLE_MS && loaded < total) {
+                  return;
+                }
+                lastBytesReportRef.current = now;
+                publish({ phase: 'downloading', loaded, total, startedAt, error: '' });
+              },
+            });
+            storeWasmInCache(blob);
+          }
           assertCurrent();
           blobUrl = URL.createObjectURL(blob);
           wasmUrl = blobUrl;
@@ -203,6 +250,7 @@ export function useFfmpegEngine() {
           }
           // Cache avvelenata o Blob rifiutato: purga e riprova UNA volta da rete/statico.
           await purgeWasmCaches();
+          cachedRef.current = false;
           try {
             instance.terminate();
           } catch {
@@ -224,10 +272,14 @@ export function useFfmpegEngine() {
           }
         }
         assertCurrent();
+        if (import.meta.env.PROD) {
+          cachedRef.current = true;
+        }
         publish({ phase: 'ready', loaded: 0, total: 0, startedAt, error: '' });
       })().catch(async (error) => {
         if (generationRef.current === generation && /incompleto|corrotto|dimensione/i.test(String(error?.message ?? error))) {
           await purgeWasmCaches();
+          cachedRef.current = false;
         }
         if (generationRef.current === generation) {
           setEngineInfo({ ...IDLE_ENGINE, phase: 'error', error: error?.message || 'Motore non disponibile.' });
@@ -264,6 +316,82 @@ export function useFfmpegEngine() {
     return ready;
   }, [createInstance]);
 
+  /**
+   * Scarica il wasm nella Cache Storage SENZA compilarlo. Su mobile toglie
+   * dall'export la parte lenta (rete), senza il costo residente di worker e
+   * heap: la compilazione resta al primo uso. Solo in produzione (in dev non
+   * c'è una cache da cui rileggerlo).
+   */
+  const prefetchEngine = useCallback(() => {
+    if (prefetchRef.current) {
+      return prefetchRef.current;
+    }
+    if (!import.meta.env.PROD || cachedRef.current || loadPromiseRef.current || ffmpegRef.current?.loaded) {
+      return Promise.resolve();
+    }
+    const abort = new AbortController();
+    prefetchAbortRef.current = abort;
+    // Mai sovrascrivere compilazione/pronto/errore di un load vero.
+    const publish = (info) => setEngineInfo((previous) => (
+      previous.phase === 'idle' || previous.phase === 'downloading' ? info : previous
+    ));
+    const job = (async () => {
+      if (await findCachedWasm()) {
+        cachedRef.current = true;
+        publish({ ...IDLE_ENGINE, cached: true });
+        return;
+      }
+      const startedAt = Date.now();
+      publish({ phase: 'downloading', loaded: 0, total: ENGINE_WASM_BYTES, startedAt, error: '' });
+      try {
+        let blob = await downloadEngineWasm(ffmpegWasmUrl, {
+          expectedBytes: ENGINE_WASM_BYTES,
+          signal: abort.signal,
+          onBytes: (loaded, total) => {
+            const now = Date.now();
+            if (now - lastBytesReportRef.current < PROGRESS_THROTTLE_MS && loaded < total) {
+              return;
+            }
+            lastBytesReportRef.current = now;
+            publish({ phase: 'downloading', loaded, total, startedAt, error: '' });
+          },
+        });
+        // Anche con il SW attivo: il suo put asincrono potrebbe non essere
+        // ancora visibile quando parte l'export.
+        if (!(await findCachedWasm())) {
+          await storeWasmInCache(blob, { force: true });
+        }
+        blob = null;
+        cachedRef.current = Boolean(await findCachedWasm());
+        publish({ ...IDLE_ENGINE, cached: cachedRef.current });
+      } catch (error) {
+        // Il vero load riproverà con i suoi messaggi: qui niente stato d'errore.
+        publish({ ...IDLE_ENGINE, cached: cachedRef.current });
+        throw error;
+      }
+    })();
+    prefetchRef.current = job;
+    job.catch(() => {}).finally(() => {
+      if (prefetchRef.current === job) prefetchRef.current = null;
+      if (prefetchAbortRef.current === abort) prefetchAbortRef.current = null;
+    });
+    return job;
+  }, []);
+
+  useEffect(() => {
+    // Motore già in cache da una visita precedente: la UI lo dice subito
+    // ("si avvia in pochi secondi") invece di promettere un download.
+    let cancelled = false;
+    findCachedWasm().then((cached) => {
+      if (cancelled || !cached) return;
+      cachedRef.current = true;
+      setEngineInfo((previous) => (previous.phase === 'idle' ? { ...previous, cached: true } : previous));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     // Niente preload del wasm (32MB + compilazione) al boot su mobile / save-data:
     // su quei dispositivi parte dopo il caricamento del file (vedi App).
@@ -299,6 +427,8 @@ export function useFfmpegEngine() {
       generationRef.current += 1;
       downloadAbortRef.current?.abort();
       downloadAbortRef.current = null;
+      prefetchAbortRef.current?.abort();
+      prefetchAbortRef.current = null;
       loadPromiseRef.current = null;
       try {
         ffmpegRef.current?.terminate();
@@ -321,7 +451,7 @@ export function useFfmpegEngine() {
     }
     ffmpegRef.current = null;
     loadPromiseRef.current = null;
-    setEngineInfo(IDLE_ENGINE);
+    setEngineInfo({ ...IDLE_ENGINE, cached: cachedRef.current });
   }, []);
 
   return {
@@ -330,6 +460,7 @@ export function useFfmpegEngine() {
     technicalLog,
     setTechnicalLog,
     ensureReady,
+    prefetchEngine,
     resetAfterAbort,
   };
 }

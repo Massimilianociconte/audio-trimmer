@@ -25,13 +25,18 @@ Web app statica per tagliare file audio direttamente nel browser, senza ri-uploa
 - **file pronto subito**: se il browser legge il formato (MP3, M4A, WAV, OGG…) ascolto, forma d'onda
   e tagli sono disponibili in meno di un secondo, senza aspettare il motore
 - **motore adattivo**: sui desktop adeguati il wasm FFmpeg (32 MB) si prepara in background;
-  su mobile e PC deboli parte solo per un’elaborazione esplicita. Download con avanzamento,
-  timeout e retry con Range quando possibile; la cache evita trasferimenti ripetuti
+  su mobile e PC deboli viene solo **scaricato in cache** appena c’è un file (nessuna RAM
+  residente) e si compila al primo uso, così l’export non aspetta la rete. Download con
+  avanzamento, timeout e retry con Range quando possibile; la cache evita trasferimenti ripetuti
 - **taglio senza ricodifica di default** per sorgenti MP3/M4A/AAC: qualità identica, decine di volte
   più veloce della conversione (precisione al frame, ~0,03 s); «Converti» resta a un clic
 - **input senza copia integrale**: l'audio viene montato nel motore via WORKERFS.
-  Il fallback MEMFS è consentito soltanto per piccoli file; l’output conserva comunque
-  un segmento in memoria e una copia durante `readFile`, con limiti distinti per dispositivo
+  Il fallback MEMFS ha lo stesso budget di una parte; l’output conserva comunque
+  un segmento in memoria e una copia durante `readFile`
+- **parti grandi ovunque**: ogni dispositivo accetta parti da almeno 160 MiB (256 MiB senza
+  dato di memoria, es. iPhone/iPad; 512 MiB con 8 GB dichiarati). Il limite dipende solo dalla
+  RAM dichiarata dal browser, non da telefono/tablet/desktop: una registrazione da 160–180 MB
+  divisa in due si esporta anche da tablet. Se una parte non ci sta, l’errore indica quante parti servono
 - **avanzamento reale** su export, silenzi, pulizia e copia per AI (`-progress pipe:1`): percentuale,
   velocità "× tempo reale", ETA, stato di ogni parte, pannello fisso sempre visibile, annulla immediato
 - AAC con coder `fast` (2-9× più veloce del `twoloop` nel core single-thread), stima dei tempi

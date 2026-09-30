@@ -90,6 +90,15 @@ export function shouldWarmEngineInBackground(env = globalThis) {
   return !isMobileDevice(env) && !isLowMemoryDevice(env) && !isSaveData(env) && !isSlowConnection(env);
 }
 
+/**
+ * Scaricare i byte del motore (senza compilarli) non occupa RAM residente:
+ * su mobile/PC deboli si fa appena c'è un file, così l'export non aspetta
+ * la rete. Mai con Risparmio dati o reti 2G.
+ */
+export function shouldPrefetchEngine(env = globalThis) {
+  return !isSaveData(env) && !isSlowConnection(env);
+}
+
 export function isLowMemoryDevice(env = globalThis) {
   const mem = deviceMemoryGB(env);
   if (Number.isFinite(mem) && mem <= 4) {

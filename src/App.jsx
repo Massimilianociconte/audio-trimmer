@@ -85,6 +85,7 @@ import {
   isMobileDevice,
   mobileLoadLimitBytes,
   resolveExportModeForDevice,
+  shouldPrefetchEngine,
   shouldUseNativePreview,
   shouldWarmEngineInBackground,
   waveformSampleRate,
@@ -194,7 +195,9 @@ function downloadBlob(blob, filename) {
   document.body.appendChild(link);
   link.click();
   link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 1200);
+  // Safari (iPad/iPhone) e alcuni download manager Android leggono il Blob DOPO
+  // il click: revocarlo subito tronca/annulla i file da centinaia di MB.
+  window.setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
 async function assertStorageFor(bytes) {
@@ -303,6 +306,7 @@ export default function App() {
     technicalLog,
     setTechnicalLog,
     ensureReady: ensureEngineReady,
+    prefetchEngine,
     resetAfterAbort,
   } = useFfmpegEngine();
 
@@ -1376,6 +1380,22 @@ export default function App() {
     }, 600);
     return () => window.clearTimeout(handle);
   }, [audioFile, waveformPending, waveformDecodePending, engineInfo.phase, ensureEngineReady]);
+
+  // Mobile/PC deboli: niente compilazione anticipata, ma i 32 MB del motore si
+  // scaricano subito in cache (zero RAM residente). "Taglia e scarica" non
+  // aspetta più la rete: resta solo l'avvio del motore, pochi secondi.
+  useEffect(() => {
+    if (!audioFile || waveformPending || waveformDecodePending || engineInfo.phase !== 'idle' || engineInfo.cached
+      || shouldWarmEngineInBackground() || !shouldPrefetchEngine()) {
+      return undefined;
+    }
+    const handle = window.setTimeout(() => {
+      prefetchEngine().catch(() => {
+        // il download vero, al primo uso, riproverà con i suoi messaggi
+      });
+    }, 600);
+    return () => window.clearTimeout(handle);
+  }, [audioFile, waveformPending, waveformDecodePending, engineInfo.phase, engineInfo.cached, prefetchEngine]);
 
   const taskAbortRef = useRef(false);
   const taskGateRef = useRef(null);
@@ -2672,10 +2692,14 @@ export default function App() {
       for (const segment of jobSegments) {
         assertOutputBudget(jobFastCopy
           ? jobAudio.size * segment.duration / jobAudio.duration
-          : estimateExportBytes({ durationSeconds: segment.duration, bitrateKbps: jobBitrate, formatId: jobFormatId }));
+          : estimateExportBytes({ durationSeconds: segment.duration, bitrateKbps: jobBitrate, formatId: jobFormatId }),
+        globalThis, { totalBytes: totalEstimate, partCount: jobSegments.length });
       }
       if (destMode === 'zip-classic' && totalEstimate * 1.15 > memoryBudget.archiveBytes) {
-        throw new Error('ZIP troppo grande per il budget di memoria di questo dispositivo. Usa cartella/ZIP su disco se disponibili, oppure esporta una selezione più corta in M4A/MP3.');
+        throw new Error(
+          `ZIP troppo grande (~${formatBytes(totalEstimate)}): qui lo ZIP si crea in memoria e il massimo è ~${formatBytes(memoryBudget.archiveBytes / 1.15)}. `
+          + 'Esporta una metà della registrazione alla volta (selezione) oppure converti in M4A/MP3 a bitrate più basso.',
+        );
       }
     } catch (error) {
       isBusyRef.current = false;
@@ -3005,7 +3029,7 @@ export default function App() {
           : destMode === 'zip-stream'
             ? `Fatto in ${elapsedLabel}. ZIP scritto su disco con ${exportedParts.length} parti.`
             : destMode === 'zip-classic'
-              ? `Fatto in ${elapsedLabel}. ZIP scaricato con ${exportedParts.length} parti.${retainBlobs ? ' I singoli restano riscaricabili sotto.' : ''}`
+              ? `Fatto in ${elapsedLabel}. ZIP scaricato con ${exportedParts.length} parti.${zipUrl ? ' Se il download non è partito, usa «Riscarica ZIP».' : ''}`
               : `Fatto in ${elapsedLabel}. Ho scaricato ogni parte come file ${format.label} già rinominato.${retainBlobs ? '' : ' (Re-download disattivato per risparmiare memoria.)'}`),
       );
       flashDone(
@@ -3102,9 +3126,11 @@ export default function App() {
       measured,
       engineMissing,
       label,
-      text: `${measured ? 'Tempo stimato' : 'Stima'}: ${label}${engineMissing ? ' + download motore (solo la prima volta)' : ''}`,
+      text: `${measured ? 'Tempo stimato' : 'Stima'}: ${label}${engineMissing
+        ? (engineInfo.cached ? ' + avvio motore (pochi secondi)' : ' + download motore (solo la prima volta)')
+        : ''}`,
     };
-  }, [audioFile, plan.segments, effectiveFastCopy, effectiveFormatId, engineInfo.phase]);
+  }, [audioFile, plan.segments, effectiveFastCopy, effectiveFormatId, engineInfo.phase, engineInfo.cached]);
 
   // Una sola "attività in corso" alla volta nel dock fisso, con priorità:
   // export > operazioni del motore > caricamento bloccante.

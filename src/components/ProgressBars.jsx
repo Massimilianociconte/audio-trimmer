@@ -126,6 +126,14 @@ export function describeEngine(engineInfo) {
         frac: null,
       };
     default:
+      if (info.cached) {
+        return {
+          title: 'Motore già scaricato: si avvia in pochi secondi',
+          short: 'Motore scaricato · pronto all’uso',
+          detail: 'Si avvia in pochi secondi alla prima elaborazione.',
+          frac: null,
+        };
+      }
       return {
         title: 'Motore di taglio',
         short: 'Motore: si attiva al primo uso',

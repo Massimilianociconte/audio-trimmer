@@ -8,6 +8,7 @@ import {
   shouldPreloadEngine,
   mobileLoadLimitBytes,
   shouldUseNativePreview,
+  shouldPrefetchEngine,
   shouldWarmEngineInBackground,
   resolveExportModeForDevice,
   waveformSampleRate,
@@ -105,6 +106,14 @@ describe('device', () => {
     assert.equal(shouldWarmEngineInBackground({ navigator: { connection: { saveData: true } } }), false);
     assert.equal(shouldWarmEngineInBackground({ navigator: { connection: { effectiveType: '2g' } } }), false);
     assert.equal(shouldWarmEngineInBackground({}), true);
+  });
+
+  it('mobile e tablet scaricano in anticipo il motore (senza compilarlo) tranne con Risparmio dati o 2G', () => {
+    assert.equal(shouldPrefetchEngine(android), true);
+    assert.equal(shouldPrefetchEngine(iPad), true);
+    assert.equal(shouldPrefetchEngine(desktop), true);
+    assert.equal(shouldPrefetchEngine({ navigator: { connection: { saveData: true } } }), false);
+    assert.equal(shouldPrefetchEngine({ navigator: { connection: { effectiveType: 'slow-2g' } } }), false);
   });
 
   it('PC deboli usano l’anteprima leggera prima dei PC potenti', () => {
