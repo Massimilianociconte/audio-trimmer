@@ -340,7 +340,7 @@ export function ExportProgressBar({ detail, engineInfo, wakeHeld, onCancel }) {
  * trascorso che scorre ogni secondo (mai uno schermo "muto") e annulla.
  * Aggiorna anche il titolo della scheda per chi cambia tab.
  */
-export function ActivityDock({ activity, done = null }) {
+export function ActivityDock({ activity }) {
   const active = Boolean(activity);
   const elapsed = useElapsedSeconds(activity?.startedAt, active);
   const pct = active ? percentText(activity.frac) : null;
@@ -366,20 +366,7 @@ export function ActivityDock({ activity, done = null }) {
   }, []);
 
   if (!active) {
-    if (!done) {
-      return null;
-    }
-    return (
-      <div className="activity-dock activity-dock-done" role="status" aria-live="polite" key={done.at}>
-        <div className="activity-head">
-          <span className="activity-spinner activity-spinner-done" aria-hidden="true">✓</span>
-          <div className="activity-text">
-            <strong>{done.title}</strong>
-            {done.detail ? <span>{done.detail}</span> : null}
-          </div>
-        </div>
-      </div>
-    );
+    return null;
   }
 
   return (

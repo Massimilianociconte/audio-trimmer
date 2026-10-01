@@ -318,6 +318,8 @@ export default function App() {
   const touchUi = useMemo(() => isMobileDevice(), []);
   const exportButtonRef = useRef(null);
   const [exportButtonInView, setExportButtonInView] = useState(false);
+  const summaryStackRef = useRef(null);
+  const [summaryInView, setSummaryInView] = useState(false);
   const [dragActive, setDragActive] = useState(false);
   const [isBusy, setIsBusy] = useState(false);
   const [errorText, setErrorText] = useState('');
@@ -392,8 +394,6 @@ export default function App() {
   const [cleanupPreview, setCleanupPreview] = useState(null);
   // { presetId, label, shortenPauses } della pulizia applicata al file corrente.
   const [appliedCleanup, setAppliedCleanup] = useState(null);
-  // Conferma breve a fine lavoro nel dock ("Fatto in 3 s").
-  const [doneNote, setDoneNote] = useState(null);
   const [originalAudioBackup, setOriginalAudioBackup] = useState(null);
   const [lastDetectionSummary, setLastDetectionSummary] = useState('');
   const [activeCapture, setActiveCapture] = useState('none');
@@ -1458,13 +1458,11 @@ export default function App() {
     }
   }, [cleanupPreview]);
 
-  const doneTimerRef = useRef(null);
+  // Conferme di fine operazione negli avvisi in alto: il dock in basso resta
+  // solo per l'avanzamento e non copre più il pannello «Scarica».
   const flashDone = useCallback((title, detail = '') => {
-    window.clearTimeout(doneTimerRef.current);
-    setDoneNote({ title, detail, at: Date.now() });
-    doneTimerRef.current = window.setTimeout(() => setDoneNote(null), 5000);
-  }, []);
-  useEffect(() => () => window.clearTimeout(doneTimerRef.current), []);
+    notify({ kind: 'success', title, detail, duration: 5000 });
+  }, [notify]);
 
   // Avviso di ripresa se un export precedente è stato interrotto.
   useEffect(() => {
@@ -1553,6 +1551,35 @@ export default function App() {
     observer.observe(target);
     return () => observer.disconnect();
   }, [audioFile, isExporting]);
+
+  // Colonna «Scarica» sticky (da 981 px) senza scroll interno: se è più alta
+  // dello schermo si aggancia dal fondo (top negativo), così il pulsante finale
+  // non esce mai dalla vista. Serve anche a sapere se il pannello è a vista.
+  useEffect(() => {
+    const column = summaryStackRef.current;
+    if (!column) {
+      setSummaryInView(false);
+      return undefined;
+    }
+    const GAP = 24;
+    const place = () => {
+      const top = Math.min(GAP, window.innerHeight - column.offsetHeight - GAP);
+      column.style.setProperty('--summary-top', `${Math.round(top)}px`);
+    };
+    place();
+    const resizeObserver = typeof ResizeObserver === 'function' ? new ResizeObserver(place) : null;
+    resizeObserver?.observe(column);
+    window.addEventListener('resize', place);
+    const viewObserver = typeof IntersectionObserver === 'function'
+      ? new IntersectionObserver(([entry]) => setSummaryInView(Boolean(entry?.isIntersecting)))
+      : null;
+    viewObserver?.observe(column);
+    return () => {
+      resizeObserver?.disconnect();
+      viewObserver?.disconnect();
+      window.removeEventListener('resize', place);
+    };
+  }, [audioFile]);
 
   const taskAbortRef = useRef(false);
   const taskGateRef = useRef(null);
@@ -3283,7 +3310,8 @@ export default function App() {
     const { speed, measured } = expectedSpeed(exportSpeedKey({ fastCopy: effectiveFastCopy, formatId: effectiveFormatId }));
     const workSeconds = totalSeconds / speed + plan.segments.length * 0.15;
     const engineMissing = engineInfo.phase !== 'ready';
-    const label = workSeconds < 8 ? 'pochi secondi' : `~${formatDurationShort(workSeconds)}`;
+    // Spazi non separabili: «~8 s» non va a capo lasciando la «s» da sola.
+    const label = workSeconds < 8 ? 'pochi secondi' : `~${formatDurationShort(workSeconds).replace(/ /g, '\u00a0')}`;
     return {
       workSeconds,
       measured,
@@ -3360,11 +3388,14 @@ export default function App() {
   })();
 
   // La barra fissa sparisce quando il pulsante vero è già sullo schermo: mai due "Taglia e scarica" visibili.
-  const showStickyCta = Boolean(audioFile) && canExport && !isExporting && !activity && !doneNote && !exportButtonInView;
+  // La barra flottante compare solo quando il pannello «Scarica» è fuori
+  // schermo: mentre è a vista finirebbe sopra le sue parti e il suo pulsante.
+  const showStickyCta = Boolean(audioFile) && canExport && !isExporting && !activity
+    && !exportButtonInView && !summaryInView;
   const deviceLoadLimit = mobileLoadLimitBytes();
 
   return (
-    <div className={`shell${showStickyCta || activity || doneNote ? ' shell-has-cta' : ''}`}>
+    <div className={`shell${showStickyCta || activity ? ' shell-has-cta' : ''}`}>
       <div className="aurora aurora-left" />
       <div className="aurora aurora-right" />
 
@@ -3905,7 +3936,7 @@ export default function App() {
               )}
             </div>
 
-            <div className="summary-stack">
+            <div className="summary-stack" ref={summaryStackRef}>
             <ExportPanel
               plan={plan}
               audioFile={audioFile}
@@ -4122,7 +4153,9 @@ export default function App() {
         disabled={!canExport}
         onExport={processAndDownload}
       />
-      <ActivityDock activity={activity} done={activity ? null : doneNote} />
+      {/* Durante l'export il pannello «Scarica» mostra già avanzamento e «Annulla»:
+          il dock fisso gli finirebbe sopra, quindi compare solo a pannello fuori schermo. */}
+      <ActivityDock activity={isExporting && summaryInView ? null : activity} />
       <Toaster
         toasts={toasts}
         onDismiss={(id) => {

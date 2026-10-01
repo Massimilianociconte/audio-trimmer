@@ -46,10 +46,14 @@ Web app statica per tagliare file audio direttamente nel browser, senza ri-uploa
 - **niente falsi "motore bloccato"**: le scadenze di export, analisi e download del motore contano
   solo il tempo in cui la pagina è attiva (cambiare app o bloccare lo schermo non fa fallire nulla)
 - **ogni azione ha un riscontro**: avvisi fissi in alto per errori (restano finché non li chiudi) e
-  conferme (tagli e segnalibri con «Annulla»); dopo l'export l'app dice dove trovare i file
-  sul tuo dispositivo; su Android le parti arrivano come file separati, su iPhone/iPad in uno ZIP
+  conferme (tagli e segnalibri con «Annulla», fine export e operazioni); dopo l'export l'app dice
+  dove trovare i file sul tuo dispositivo; su Android le parti arrivano come file separati, su
+  iPhone/iPad in uno ZIP
+- **niente si sovrappone al pannello «Scarica»**: su desktop la colonna destra non ha scroll interno
+  e, se è più alta dello schermo, si aggancia dal fondo (il pulsante finale resta visibile); barra
+  «Taglia e scarica» e pannello di avanzamento fissi compaiono solo quando il pannello è fuori schermo
 - **avanzamento reale** su export, silenzi, pulizia e copia per AI (`-progress pipe:1`): percentuale,
-  velocità "× tempo reale", ETA, stato di ogni parte, pannello fisso sempre visibile, annulla immediato
+  velocità "× tempo reale", ETA, stato di ogni parte, pannello fisso quando scorri altrove, annulla immediato
 - AAC con coder `fast` (2-9× più veloce del `twoloop` nel core single-thread), stima dei tempi
   imparata dalle esportazioni precedenti sul dispositivo
 - UI leggera: niente blur animati/`backdrop-filter`, aggiornamenti del tempo di riproduzione

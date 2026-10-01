@@ -1278,8 +1278,6 @@ kbd {
 }
 
 .summary-column {
-  position: sticky;
-  top: 20px;
   display: grid;
   gap: 18px;
 }
@@ -1437,10 +1435,6 @@ code {
   .status-strip p {
     max-width: none;
     text-align: left;
-  }
-
-  .summary-column {
-    position: static;
   }
 
   /* Ordine naturale 01 → 02 → 03: la CTA resta raggiungibile dalla barra fissa. */
@@ -2020,6 +2014,11 @@ select.text-input {
   background: rgba(255, 255, 255, 0.5);
   border: 1px dashed var(--line-strong);
   padding: 0 16px;
+}
+
+/* Nelle colonne a griglia lo spazio lo dà già il gap: niente margine doppio. */
+.summary-column > .advanced-disclosure {
+  margin-top: 0;
 }
 
 .advanced-disclosure > summary {
@@ -2615,28 +2614,6 @@ input[type=range]::-moz-range-thumb {
   }
 }
 
-.activity-dock-done {
-  background: #0f5f45;
-  animation: dock-in 220ms ease-out;
-}
-
-.activity-spinner-done {
-  border-color: rgba(255, 255, 255, 0.9);
-  background: rgba(255, 255, 255, 0.16);
-  font-size: 1.1rem;
-}
-
-@keyframes dock-in {
-  from {
-    transform: translateY(12px);
-    opacity: 0;
-  }
-  to {
-    transform: none;
-    opacity: 1;
-  }
-}
-
 .dropzone-limit {
   font-size: 0.78rem;
   color: var(--muted);
@@ -2676,8 +2653,7 @@ input[type=range]::-moz-range-thumb {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .waveform-skeleton,
-  .activity-dock-done {
+  .waveform-skeleton {
     animation: none !important;
   }
 }
@@ -3075,11 +3051,6 @@ input[type='range']::-moz-range-track {
     order: 0;
   }
 
-  .summary-column {
-    position: sticky;
-    top: 16px;
-  }
-
   .automation {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3161,11 +3132,12 @@ input[type='range']::-moz-range-track {
     gap: 20px;
   }
 
-  .summary-column {
-    top: 24px;
-    max-height: calc(100vh - 48px);
-    overflow: auto;
-    scrollbar-gutter: stable;
+  /* Colonna destra: un solo blocco sticky, senza scroll interno. Se è più
+     alta dello schermo, --summary-top (calcolato in App) diventa negativo e
+     la colonna si aggancia dal fondo: il pulsante finale resta sempre visibile. */
+  .summary-stack {
+    position: sticky;
+    top: var(--summary-top, 24px);
   }
 
   .studio {
