@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   buildPlan,
   buildVirtualSegmentName,
+  cutsFromEqualPlan,
 } from './lib/segments.js';
 import {
   buildExportArgs,
@@ -1023,7 +1024,13 @@ export default function App() {
       }
 
       const safeSeconds = clamp(seconds, 0.25, Math.max(0.25, audioFile.duration - 0.25));
-      const alreadyNear = customCuts.some(
+      const wasEqual = mode === 'equal';
+      // In "Parti uguali" i tagli visibili vengono dal piano, non da
+      // customCuts (vuoto): vanno conservati, altrimenti aggiungere un
+      // taglio farebbe collassare il piano a 2 parti (su tablet è il gesto
+      // principale: preset «3 parti» + «Taglia qui» per la quarta).
+      const baseCuts = wasEqual ? cutsFromEqualPlan(plan.cutPoints, createPointId) : customCuts;
+      const alreadyNear = baseCuts.some(
         (point) =>
           typeof point.position === 'number' &&
           Math.abs(point.position - safeSeconds) < 0.1,
@@ -1032,11 +1039,10 @@ export default function App() {
         notify({ kind: 'info', title: `C’è già un taglio a ${formatClock(safeSeconds)}` });
         return;
       }
-      const wasEqual = mode === 'equal';
       pushCutsHistory(customCuts);
       setMode('custom');
       const nextCuts = [
-        ...customCuts,
+        ...baseCuts,
         {
           id: createPointId(),
           value: formatClock(safeSeconds),
@@ -1058,7 +1064,7 @@ export default function App() {
         },
       });
     },
-    [audioFile?.duration, customCuts, pushCutsHistory, mode, notify],
+    [audioFile?.duration, customCuts, pushCutsHistory, mode, notify, plan.cutPoints],
   );
 
   const handleUndoCuts = useCallback(() => {
@@ -2867,7 +2873,12 @@ export default function App() {
       preference: exportDest,
     });
     // Su iPhone/iPad i download multipli sono bloccati (1 per gesto): un unico ZIP.
-    const deviceMode = resolveExportModeForDevice(advice.mode, globalThis, { preference: exportDest });
+    // Su Android oltre 2 parti i download in sequenza vengono bloccati dopo il
+    // primo: unico ZIP anche lì (vedi resolveExportModeForDevice).
+    const deviceMode = resolveExportModeForDevice(advice.mode, globalThis, {
+      preference: exportDest,
+      segmentCount: jobSegments.length,
+    });
     const destMode = deviceMode.mode;
     setAdvisorNote([...advice.reasons, ...advice.warnings, ...(deviceMode.note ? [deviceMode.note] : [])].join(' '));
     // Trattiene i Blob per il re-download solo sotto soglia: sopra, solo metadati.
@@ -3184,7 +3195,12 @@ export default function App() {
         const zipBlob = await zipWriter.close();
         zipWriter = null;
         zipName = `${sanitizeFileName(jobBaseName)} - ${exportedParts.length} parti.zip`;
-        if (zipBlob.size <= memoryBudget.retainBytes) {
+        // Su tablet/telefono il download automatico parte senza gesto utente
+        // (dopo minuti di taglio) e Safari/Chrome possono bloccarlo in
+        // silenzio: l'URL va tenuto SEMPRE, così «Riscarica ZIP» (tocco vero)
+        // resta disponibile anche per ZIP grandi. L'ObjectURL non copia i
+        // byte: trattiene solo il riferimento al Blob già creato.
+        if (zipBlob.size <= memoryBudget.retainBytes || isMobileDevice()) {
           zipUrl = URL.createObjectURL(zipBlob);
           lastResultUrlsRef.current.push(zipUrl);
         }
@@ -3216,7 +3232,7 @@ export default function App() {
             ? `Fatto in ${elapsedLabel}. ZIP scritto su disco con ${exportedParts.length} parti.`
             : destMode === 'zip-classic'
               ? `Fatto in ${elapsedLabel}. ZIP scaricato con ${exportedParts.length} parti.${zipUrl ? ' Se il download non è partito, usa «Riscarica ZIP».' : ''}`
-              : `Fatto in ${elapsedLabel}. Ho scaricato ogni parte come file ${format.label} già rinominato.${retainBlobs ? '' : ' (Re-download disattivato per risparmiare memoria.)'}`),
+              : `Fatto in ${elapsedLabel}. Ho scaricato ogni parte come file ${format.label} già rinominato.${retainBlobs ? '' : ' (Re-download disattivato per risparmiare memoria.)'}${touchUi && retainBlobs && exportedParts.length > 1 ? ' Se nei Download manca qualche parte (il browser può bloccare i download multipli), riscaricala dai pulsanti «Scarica» qui sotto.' : ''}`),
       );
       flashDone(
         `Fatto in ${elapsedLabel}: ${exportedParts.length} parti ${destMode === 'folder' ? 'nella cartella' : destMode === 'singles' ? 'scaricate' : 'nello ZIP'}`,
@@ -3812,7 +3828,7 @@ export default function App() {
               ) : (
                 <div className="control-panel">
                   <div className="custom-actions">
-                    <button type="button" onClick={() => addCutAt(currentTime)}>
+                    <button type="button" onClick={handleAddCutHere}>
                       Usa la posizione corrente
                     </button>
                     <button
@@ -3872,7 +3888,7 @@ export default function App() {
 
                   <p className="helper-text">
                     Puoi scrivere i punti in secondi oppure in formato <code>mm:ss</code>{' '}
-                    o <code>hh:mm:ss</code>. Doppio click sulla waveform per aggiungere un taglio.
+                    o <code>hh:mm:ss</code>. {touchUi ? 'Doppio tocco sulla forma d’onda' : 'Doppio click sulla waveform'} per aggiungere un taglio.
                     Trascina le linee arancioni per spostarli.
                   </p>
 
@@ -3880,7 +3896,7 @@ export default function App() {
                     {customCuts.length === 0 ? (
                       <p className="empty-text">
                         Nessun punto inserito. Premi «Usa la posizione corrente»,
-                        doppio click sulla forma d’onda, oppure aggiungi un tempo manuale.
+                        {touchUi ? ' doppio tocco sulla forma d’onda,' : ' doppio click sulla forma d’onda,'} oppure aggiungi un tempo manuale.
                       </p>
                     ) : null}
 

@@ -29,6 +29,7 @@ async function componentFixture(t, file, target, dependencies = {}) {
   source = source.replace(/import \{([^}]+)\} from 'react';/, 'const {$1} = globalThis.__previewReact;');
   source = source.replace(/import (\w+) from 'wavesurfer[^']*';/g, 'const $1 = globalThis.__previewDependencies.$1;');
   source = source.replace(/from '\.\.\/lib\/device.js'/g, `from '${new URL('./device.js', import.meta.url).href}'`);
+  source = source.replace(/from '\.\.\/lib\/touch.js'/g, `from '${new URL('./touch.js', import.meta.url).href}'`);
   const { code } = await transform(source, { loader: 'jsx', jsxFactory: 'globalThis.__previewReact.createElement' });
   const module = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}#${Math.random()}`);
   const cleanups = [];

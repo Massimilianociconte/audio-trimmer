@@ -3091,7 +3091,13 @@ input[type='range']::-moz-range-track {
   .mini-button:hover:not(:disabled),
   .preset-card:hover:not(:disabled),
   .preset-chip:hover:not(:disabled),
-  .capture-tab:hover:not(:disabled) {
+  .capture-tab:hover:not(:disabled),
+  .mode-switch button:hover,
+  .quick-presets button:hover,
+  .custom-actions button:hover,
+  .add-manual:hover,
+  .cut-row button:hover,
+  .primary-button:hover {
     transform: none;
   }
 
@@ -3690,4 +3696,50 @@ input[type='range']:disabled {
   border-radius: 12px;
   background: rgba(15, 140, 98, 0.08);
   color: #0b5e42;
+}
+
+/* =====================================================================
+   Tablet (iPad/Android): gesti e target a misura di dito.
+   Solo media (any-)pointer: coarse — layout e comportamento col mouse
+   restano identici.
+   ===================================================================== */
+
+/* Doppio tocco sulla forma d'onda = aggiungi taglio, non zoom della pagina.
+   manipulation lascia scorrimento e pinch-zoom, toglie solo il doppio-tocco-zoom. */
+@media (any-pointer: coarse) {
+  .waveform-container {
+    touch-action: manipulation;
+  }
+
+  /* viewport-fit=cover: la pagina arriva ai bordi fisici; i contenuti
+     restano fuori da tacche/cornici (sui desktop env() vale 0: invariato). */
+  .shell {
+    padding-left: calc(20px + env(safe-area-inset-left, 0px));
+    padding-right: calc(20px + env(safe-area-inset-right, 0px));
+  }
+}
+
+@media (any-pointer: coarse) and (max-width: 720px) {
+  .shell {
+    padding-left: calc(14px + env(safe-area-inset-left, 0px));
+    padding-right: calc(14px + env(safe-area-inset-right, 0px));
+  }
+}
+
+@media (pointer: coarse) {
+  /* Slider: il pollice è 28 px ma l'area toccabile è l'altezza dell'input. */
+  input[type='range'] {
+    min-height: 44px;
+  }
+
+  /* Safari iOS zooma la pagina al focus se il testo è sotto i 16 px (e non
+     torna indietro): vale anche sui tablet sopra i 720 px, non solo telefoni. */
+  .text-input,
+  select.text-input,
+  textarea.text-input,
+  .cut-row input[type='text'],
+  .bookmark-note,
+  .segment-name-input {
+    font-size: 16px;
+  }
 }

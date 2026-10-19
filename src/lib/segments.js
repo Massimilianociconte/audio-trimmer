@@ -124,6 +124,27 @@ export function buildPlan({ duration, mode, equalParts, customCuts }) {
   };
 }
 
+/**
+ * Converte i punti di un piano "parti uguali" in punti personalizzati.
+ * Serve quando, restando in modalità equal, si aggiunge un taglio («Taglia
+ * qui», doppio tocco/click): i tagli uguali già visibili vanno conservati,
+ * altrimenti il piano collassa a 2 parti e dividere in più di 2 parti
+ * partendo dai preset diventa impossibile (il gesto tipico su tablet).
+ */
+export function cutsFromEqualPlan(cutPoints, createId) {
+  if (!Array.isArray(cutPoints)) {
+    return [];
+  }
+  return cutPoints
+    .filter((position) => Number.isFinite(position) && position > 0)
+    .sort((left, right) => left - right)
+    .map((position) => ({
+      id: createId(),
+      value: formatClock(position),
+      position,
+    }));
+}
+
 export function buildDownloadName(baseName, index, extension) {
   return `${baseName || 'audio'} - parte ${index}${normalizeExtension(extension)}`;
 }

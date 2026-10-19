@@ -31,7 +31,17 @@ export function isIOS(env = globalThis) {
 }
 
 export function isAndroid(env = globalThis) {
-  return /Android/.test(getUserAgent(env));
+  if (/Android/.test(getUserAgent(env))) {
+    return true;
+  }
+  // Tablet Android in modalità desktop (Samsung DeX, "sito desktop"): l'UA
+  // diventa Linux X11 senza "Android", ma UA-CH platform resta "Android".
+  // Un desktop vero (Windows/macOS/Linux) non dichiara mai platform Android.
+  try {
+    return env?.navigator?.userAgentData?.platform === 'Android';
+  } catch {
+    return false;
+  }
 }
 
 export function isCoarsePointer(env = globalThis) {
@@ -221,18 +231,28 @@ export function shouldUseNativePreview({ sizeBytes = 0, durationSeconds = 0, sam
  * iOS consente un solo download per gesto utente: la modalità "singles"
  * (N click programmatici) arriva a 1 parte e sembra "export rotto".
  */
-export function resolveExportModeForDevice(mode, env = globalThis, { preference = 'auto' } = {}) {
+export function resolveExportModeForDevice(mode, env = globalThis, { preference = 'auto', segmentCount = 0 } = {}) {
   if (mode === 'singles' && isIOS(env)) {
     return {
       mode: 'zip-classic',
       note: 'Su iPhone/iPad uso un unico ZIP (iOS blocca i download multipli).',
     };
   }
-  // Android: le parti singole finiscono subito in «Download», pronte da
-  // ascoltare o condividere; uno ZIP va estratto (passo in più per chi è poco
-  // pratico). Se Chrome blocca il secondo download restano i pulsanti «Scarica».
+  // Android con 2 parti: i file singoli finiscono subito in «Download»,
+  // pronti da ascoltare o condividere; uno ZIP va estratto (passo in più per
+  // chi è poco pratico). Oltre 2 parti però i click programmatici in sequenza
+  // (uno a fine di ogni taglio, senza gesto utente) vengono bloccati da
+  // Chrome Android dopo il primo e le parti 2..N si perderebbero in silenzio:
+  // un unico ZIP è un solo download e arriva sempre. Senza conteggio noto
+  // (segmentCount assente) vale la scelta sicura: ZIP.
   if (mode === 'zip-classic' && preference === 'auto' && isAndroid(env) && !isIOS(env)) {
-    return { mode: 'singles', note: 'Su Android scarico le parti come file separati nella cartella Download.' };
+    if (Number.isFinite(segmentCount) && segmentCount > 0 && segmentCount <= 2) {
+      return { mode: 'singles', note: 'Su Android scarico le parti come file separati nella cartella Download.' };
+    }
+    return {
+      mode: 'zip-classic',
+      note: 'Su Android con più di 2 parti uso un unico ZIP: i download multipli automatici verrebbero bloccati dal browser.',
+    };
   }
   return { mode, note: '' };
 }

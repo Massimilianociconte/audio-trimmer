@@ -95,11 +95,25 @@ describe('device', () => {
     });
     assert.deepEqual(resolveExportModeForDevice('singles', desktop).mode, 'singles');
     assert.deepEqual(resolveExportModeForDevice('zip-classic', iPad).mode, 'zip-classic');
-    // Android in automatico: parti singole in «Download», niente ZIP da estrarre.
+    // Android in automatico con 2 parti: file singoli in «Download», niente ZIP da estrarre.
     const androidPhone = { navigator: { userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8)' } };
-    assert.equal(resolveExportModeForDevice('zip-classic', androidPhone, { preference: 'auto' }).mode, 'singles');
+    assert.equal(
+      resolveExportModeForDevice('zip-classic', androidPhone, { preference: 'auto', segmentCount: 2 }).mode,
+      'singles',
+    );
+    // Oltre 2 parti i download programmatici in sequenza vengono bloccati da
+    // Chrome Android dopo il primo: unico ZIP (un solo download, affidabile).
+    const manyParts = resolveExportModeForDevice('zip-classic', androidPhone, { preference: 'auto', segmentCount: 4 });
+    assert.equal(manyParts.mode, 'zip-classic');
+    assert.match(manyParts.note, /ZIP/);
+    // Senza conteggio noto non si rischiano download multipli silenziosamente persi.
+    assert.equal(resolveExportModeForDevice('zip-classic', androidPhone, { preference: 'auto' }).mode, 'zip-classic');
     // Scelta esplicita dell'utente: si rispetta.
     assert.equal(resolveExportModeForDevice('zip-classic', androidPhone, { preference: 'zip-classic' }).mode, 'zip-classic');
+    assert.equal(
+      resolveExportModeForDevice('singles', androidPhone, { preference: 'singles', segmentCount: 6 }).mode,
+      'singles',
+    );
     assert.equal(resolveExportModeForDevice('zip-classic', desktop, { preference: 'auto' }).mode, 'zip-classic');
   });
 
@@ -163,6 +177,31 @@ describe('device', () => {
 it('waveform guards include compressed input copies in peak memory', () => {
  assert.equal(shouldUseNativePreview({sizeBytes:250*1024*1024,durationSeconds:1486},desktop),true);
  assert.equal(shouldUseNativePreview({sizeBytes:100*1024*1024,durationSeconds:594},iPad),true);
+});
+
+it('Android in modalità desktop (DeX/sito desktop) resta Android via UA-CH platform', () => {
+  // UA desktop senza "Android", ma Sec-CH-UA-Platform resta "Android".
+  const dexTablet = {
+    navigator: {
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36',
+      userAgentData: { platform: 'Android', mobile: true },
+      maxTouchPoints: 5,
+    },
+    matchMedia: () => ({ matches: false }),
+  };
+  assert.equal(isAndroid(dexTablet), true);
+  assert.equal(isMobileDevice(dexTablet), true);
+  // Un vero desktop Windows con touchscreen NON diventa "mobile".
+  const windowsTouch = {
+    navigator: {
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36',
+      userAgentData: { platform: 'Windows', mobile: false },
+      maxTouchPoints: 10,
+    },
+    matchMedia: () => ({ matches: false }),
+  };
+  assert.equal(isAndroid(windowsTouch), false);
+  assert.equal(isMobileDevice(windowsTouch), false);
 });
 
 it('native decoder staging also counts toward the preview budget', () => {

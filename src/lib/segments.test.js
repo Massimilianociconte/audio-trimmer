@@ -5,6 +5,7 @@ import {
   buildDownloadName,
   buildPlan,
   buildVirtualSegmentName,
+  cutsFromEqualPlan,
   normalizeExtension,
 } from './segments.js';
 
@@ -66,4 +67,34 @@ test('buildPlan builds valid equal and custom plans', () => {
   assert.equal(custom.error, '');
   assert.equal(custom.segments.length, 3);
   assert.deepEqual(custom.cutPoints, [30, 60]);
+});
+
+// Regressione tablet: «Taglia qui» mentre si è in "Parti uguali" deve
+// CONSERVARE i tagli uguali già presenti. Prima li scartava e si tornava
+// sempre a 2 parti, rendendo impossibile dividere in più di 2 parti
+// partendo dai preset (il gesto più naturale col dito).
+test('cutsFromEqualPlan preserves equal cuts when adding a cut beyond 2 parts', () => {
+  let seq = 0;
+  const createId = () => `cut-${(seq += 1)}`;
+  const equal = buildPlan({ duration: 3600, mode: 'equal', equalParts: 3, customCuts: [] });
+  assert.deepEqual(equal.cutPoints, [1200, 2400]);
+
+  const base = cutsFromEqualPlan(equal.cutPoints, createId);
+  assert.deepEqual(base.map((cut) => cut.position), [1200, 2400]);
+  assert.equal(base[0].value, '20:00');
+  assert.ok(base.every((cut) => typeof cut.id === 'string' && cut.id.length > 0));
+
+  const next = [...base, { id: createId(), value: '10:00', position: 600 }]
+    .sort((a, b) => a.position - b.position);
+  const plan = buildPlan({ duration: 3600, mode: 'custom', equalParts: 3, customCuts: next });
+  assert.equal(plan.error, '');
+  assert.equal(plan.segments.length, 4);
+  assert.deepEqual(plan.cutPoints, [600, 1200, 2400]);
+});
+
+test('cutsFromEqualPlan ignores invalid points and sorts ascending', () => {
+  const cuts = cutsFromEqualPlan([90, Number.NaN, 30, -5, Infinity], () => 'id');
+  assert.deepEqual(cuts.map((cut) => cut.position), [30, 90]);
+  assert.deepEqual(cutsFromEqualPlan([], () => 'id'), []);
+  assert.deepEqual(cutsFromEqualPlan(undefined, () => 'id'), []);
 });

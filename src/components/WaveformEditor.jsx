@@ -3,7 +3,8 @@ import WaveSurfer from 'wavesurfer.js';
 import RegionsPlugin from 'wavesurfer.js/dist/plugins/regions.esm.js';
 import TimelinePlugin from 'wavesurfer.js/dist/plugins/timeline.esm.js';
 import HoverPlugin from 'wavesurfer.js/dist/plugins/hover.esm.js';
-import { shouldUseNativePreview } from '../lib/device.js';
+import { isCoarsePointer, shouldUseNativePreview } from '../lib/device.js';
+import { isCoarsePointerAvailable, isDoubleTap } from '../lib/touch.js';
 
 const CUT_COLOR = 'rgba(239, 108, 47, 0.85)';
 const CUT_COLOR_SOFT = 'rgba(239, 108, 47, 0.25)';
@@ -21,6 +22,35 @@ export function timelineLabelStep(pxPerSec) {
 export function timelineTickStep(pxPerSec) {
   const label = timelineLabelStep(pxPerSec);
   return [...NICE_STEPS].reverse().find((step) => step <= label && label % step === 0 && step * pxPerSec >= 10) ?? label;
+}
+
+/**
+ * I marker di WaveSurfer (tagli/segnalibri) sono elementi larghi 2 px: col
+ * mouse si afferrano, col dito è impossibile. Su schermi touch si aggiunge
+ * una zona di presa invisibile da 44 px centrata sulla linea (la linea
+ * visibile non si sposta) e si blocca lo scroll del browser durante il
+ * trascinamento (touch-action: nessuno dei due senza l'altro funziona:
+ * senza, il browser ruba il gesto per scorrere e annulla il drag).
+ * Col solo mouse non cambia nulla.
+ */
+function attachTouchHitArea(element, cursor) {
+  if (!element || element.querySelector('[data-touch-hit]')) {
+    return;
+  }
+  const hit = document.createElement('div');
+  hit.dataset.touchHit = '1';
+  hit.setAttribute('aria-hidden', 'true');
+  Object.assign(hit.style, {
+    position: 'absolute',
+    top: '0',
+    height: '100%',
+    left: '-22px',
+    width: '44px',
+    touchAction: 'none',
+    cursor,
+  });
+  element.appendChild(hit);
+  element.style.touchAction = 'none';
 }
 
 export const WaveformEditor = forwardRef(function WaveformEditor(
@@ -155,7 +185,9 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     timelinePlugin.defaultTimeInterval = timelineTickStep;
     timelinePlugin.defaultPrimaryLabelInterval = timelineLabelStep;
     timelinePlugin.defaultSecondaryLabelInterval = timelineLabelStep;
-    const hoverPlugin = HoverPlugin.create({
+    // Niente hover dove il puntatore primario è un dito: l'etichetta
+    // inseguirebbe il polpastrello (invisibile e inutile) a ogni tocco.
+    const hoverPlugin = isCoarsePointer() ? null : HoverPlugin.create({
       lineColor: '#ef6c2f',
       lineWidth: 1,
       labelBackground: 'rgba(255, 252, 247, 0.94)',
@@ -178,7 +210,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       sampleRate: decodeRate,
       normalize: true,
       dragToSeek: true,
-      plugins: [regionsPlugin, timelinePlugin, hoverPlugin],
+      plugins: [regionsPlugin, timelinePlugin, hoverPlugin].filter(Boolean),
     });
 
     // WaveSurfer 7's non-abortable decode can finish after destroy() and call
@@ -401,6 +433,9 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
         const handle = region.element;
         handle.style.borderLeft = `2px solid ${CUT_COLOR}`;
         handle.style.cursor = 'ew-resize';
+        if (isCoarsePointerAvailable()) {
+          attachTouchHitArea(handle, 'ew-resize');
+        }
       }
       registry.set(regionId, region);
     });
@@ -452,6 +487,9 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
       });
       if (region?.element) {
         region.element.style.borderLeft = `2px dashed ${BOOKMARK_COLOR}`;
+        if (isCoarsePointerAvailable()) {
+          attachTouchHitArea(region.element, 'pointer');
+        }
       }
       registry.set(regionId, region);
     });
@@ -524,7 +562,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
     if (!container) {
       return undefined;
     }
-    const handleDoubleClick = (event) => {
+    const addCutFromClientX = (clientX) => {
       const ws = wsRef.current;
       const onAdd = callbacksRef.current.onAddCutAt;
       if (!ws || typeof onAdd !== 'function') {
@@ -549,7 +587,7 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
         if (!(totalWidth > 0)) {
           return;
         }
-        const ratio = (event.clientX - rect.left + scrollLeft) / totalWidth;
+        const ratio = (clientX - rect.left + scrollLeft) / totalWidth;
         const clamped = Math.min(1, Math.max(0, ratio));
         onAdd(clamped * duration);
       } catch {
@@ -557,13 +595,53 @@ export const WaveformEditor = forwardRef(function WaveformEditor(
         if (!(rect.width > 0)) {
           return;
         }
-        const ratio = (event.clientX - rect.left) / rect.width;
+        const ratio = (clientX - rect.left) / rect.width;
         onAdd(Math.min(1, Math.max(0, ratio)) * duration);
       }
     };
+    // Mouse: dblclick nativo, invariato. Dito/penna: il doppio tocco non
+    // genera un dblclick affidabile (fa zoomare la pagina), lo si riconosce
+    // dai PointerEvent. Il mouse è escluso dal detector per non raddoppiare.
+    const handleDoubleClick = (event) => addCutFromClientX(event.clientX);
+    let lastTap = null;
+    let downTap = null;
+    const handlePointerDown = (event) => {
+      if (event.pointerType === 'mouse' || event.isPrimary === false) {
+        return;
+      }
+      downTap = { x: event.clientX, y: event.clientY, time: event.timeStamp };
+    };
+    const handlePointerUp = (event) => {
+      if (event.pointerType === 'mouse' || event.isPrimary === false) {
+        return;
+      }
+      // Solo tocchi veri (brevi e quasi fermi): la fine di un trascinamento
+      // per cercare/spostare un taglio non deve mai diventare un taglio nuovo.
+      const down = downTap;
+      downTap = null;
+      if (!down) {
+        return;
+      }
+      const moved = Math.hypot(event.clientX - down.x, event.clientY - down.y);
+      if (moved > 12 || event.timeStamp - down.time > 300) {
+        lastTap = null;
+        return;
+      }
+      const tap = { x: event.clientX, y: event.clientY, time: event.timeStamp };
+      if (isDoubleTap(lastTap, tap)) {
+        lastTap = null;
+        addCutFromClientX(event.clientX);
+        return;
+      }
+      lastTap = tap;
+    };
     container.addEventListener('dblclick', handleDoubleClick);
+    container.addEventListener('pointerdown', handlePointerDown);
+    container.addEventListener('pointerup', handlePointerUp);
     return () => {
       container.removeEventListener('dblclick', handleDoubleClick);
+      container.removeEventListener('pointerdown', handlePointerDown);
+      container.removeEventListener('pointerup', handlePointerUp);
     };
   }, [src]);
 
