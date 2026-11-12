@@ -338,6 +338,53 @@ interruzione (`scripts/tablet-interruption-audit.mjs`): sul profilo Galaxy il pa
 (WAV → MP3, 4 parti). Test unitari: gate, ordine, finestra di anticipo, ripieghi, annullo,
 nessuna promessa rifiutata non gestita, motore tardivo chiuso (14 nuovi, **234 test** in totale).
 
+## Lavoro in background su Chrome Android — 12 novembre 2026
+
+Richiesta: sul Galaxy Tab S8 l’export deve proseguire mentre si usano altre app, anche più lentamente.
+Decisione e alternative: `.ai-harness/knowledge/decisions/2026-11-12-lavoro-in-background-android.md`.
+
+**Perché si fermava, dal sorgente Chromium.** Blink congela pagina e worker 1 minuto dopo che la pagina
+è nascosta (`kStopInBackground`), **salvo** se la pagina riproduce audio (`IsBackgrounded()` richiede
+`!IsAudioPlaying()`). Per Chrome l’audio è udibile sopra −72,25 dBFS (`kSilenceThresholdDBFS`,
+`services/audio/output_stream.cc`). Android congela i processi in cache: serve il servizio in primo
+piano della notifica multimediale, che Chrome avvia per un elemento audio di almeno 5 s.
+
+**Intervento** (`src/lib/backgroundWork.js`, `src/hooks/useBackgroundWork.js`, solo Chrome Android):
+durante export e operazioni del motore un elemento audio suona in loop un tono a 30 Hz, −50 dBFS di
+picco (potenza ≈ −53 dBFS, ~19 dB sopra la soglia di Chrome; sotto la soglia dell’udito e fuori dalla
+risposta degli altoparlanti). La notifica «Audio Cutter» mostra percentuale, parte e tempo residuo;
+a lavoro finito, se l’app è ancora nascosta, mostra l’esito. Interruttore nel pannello (acceso di
+default); se un’altra app prende l’audio il pannello lo dice e offre «Riattiva». Al ritorno:
+«Il lavoro è continuato in background — da X% a Y%», altrimenti il messaggio di pausa di prima.
+
+**Prove sul motore vero di Chrome** (Chrome 156 per macOS, headless, CDP diretto perché Playwright tiene
+«visibili» tutte le pagine; congelamento di Android attivato con `--enable-features=stop-in-background`;
+scheda resa nascosta aprendone e attivandone un’altra):
+
+| Pagina nascosta | Worker che conta ogni 250 ms |
+|---|---|
+| senza audio | congelato a ~60 s (anche nella prova da 6,5 min: fermo da 57 s) |
+| audio di silenzio digitale | congelato a ~60 s |
+| **tono 30 Hz −50 dBFS** | **attivo per 80 s e per 6,5 min**; timer della pagina a 1 s anche oltre i 5 min |
+
+App vera (UA Galaxy Tab S8, export 8 h mp3 → M4A in 4 parti, file singoli, CPU rallentata 4× per
+superare il minuto, scheda nascosta subito dopo «Taglia e scarica»):
+
+| Interruttore | Parti create mentre la scheda era nascosta | Fine export |
+|---|---|---|
+| spento | **0 in 7 min** (congelata; tutto dopo il ritorno) | 7 min 51 s |
+| **acceso** | **4 su 4** (a 34, 36, 75, 78 s dopo l’uscita) | 1 min 23 s |
+
+Ritorno a metà: avviso «Il lavoro è continuato in background — Mentre eri via: da 4% a 57%». Pannello
+provato in tutti gli stati: in corso, pausa da un’altra app → «Riattiva» → ripreso, spento (testo di
+prima, notifica tolta, preferenza ricordata), riacceso. Il tono parte con un tocco reale (attivazione
+utente), senza flag di autoplay. Test unitari: WAV (intestazione, livello rispetto alla soglia di
+Chrome, loop senza scatti), dispositivi ammessi, stati della sessione e della notifica (12 nuovi).
+
+**Non verificabile qui:** il servizio in primo piano e il congelamento dei processi di Android, la
+gestione del focus audio di Samsung, «Sospendi app inutilizzate»/ottimizzazione batteria di One UI,
+velocità in background con CPU a frequenza ridotta. Va provato sul tablet.
+
 ## Limiti e prove ancora necessarie
 
 1. **Dispositivi fisici non sono stati testati.** Dal 12 novembre 2026 i flussi tablet girano anche
@@ -364,13 +411,20 @@ nessuna promessa rifiutata non gestita, motore tardivo chiuso (14 nuovi, **234 t
 7. Non sono stati raccolti heap snapshot completi né eseguiti soak test di ore. Test deterministici
    coprono teardown e richieste tardive, ma non equivalgono a provare ogni leak su hardware reale.
    L’ErrorBoundary non può intercettare la terminazione della tab da parte del sistema operativo.
-8. **Il lavoro in secondo piano resta sospeso dal sistema** (iPadOS, Chrome Android): l’export riprende
+8. **Il lavoro in secondo piano resta sospeso dal sistema su iPadOS** (e su Chrome Android con il lavoro
+   in background spento o messo in pausa da un'altra app): l’export riprende
    al ritorno o, se la scheda è stata chiusa, dalle parti salvate. Ripresa non disponibile in Safari
    privato, per lavori stimati sotto 15 s, per destinazioni su disco (cartella/ZIP su file) e per
    pulizia/analisi dei silenzi. Va riaperto lo stesso file (nome, dimensione, data, durata): la
    riapertura da «Progetti salvati» non è stata verificata. Le chiamate al motore di pulizia e analisi
    non hanno ancora la scadenza aggiunta all’export.
-9. **Due motori non provati su un Galaxy Tab S8 reale.** Da misurare: tempo effettivo (stima ~2×
+9. **Lavoro in background non provato su un tablet Android reale.** Le prove usano il codice di
+   congelamento di Chrome su macOS; il servizio in primo piano della notifica e il congelamento dei
+   processi di Android/One UI vanno verificati sul Galaxy Tab S8. Dipende da euristiche di Chrome che
+   Google può cambiare (in quel caso si torna a pausa e ripresa). Musica o video in altre app lo
+   fermano. Se un motore muore mentre l’app è nascosta, il ripiego scatta al ritorno (le scadenze
+   contano solo il tempo con la pagina visibile).
+10. **Due motori non provati su un Galaxy Tab S8 reale.** Da misurare: tempo effettivo (stima ~2×
    solo se i due motori finiscono su core grandi), calo per calore su conversioni lunghe, memoria
    della scheda con due motori, valore reale di `hardwareConcurrency`. Nessun guadagno con una sola
    parte, nel taglio senza ricodifica e nella pulizia. Se il motore principale muore a metà comando,

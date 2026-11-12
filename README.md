@@ -52,6 +52,14 @@ Web app statica per tagliare file audio direttamente nel browser, senza ri-uploa
   stessi tagli crea solo le parti mancanti (riaprendo il file, tagli e impostazioni tornano da soli).
   A riposo, con l’app in secondo piano, il motore viene liberato per ridurre il rischio di chiusura.
   Desktop invariato
+- **lavoro in background su Chrome Android**: durante export e pulizia la pagina riproduce un tono a
+  30 Hz e −50 dBFS (per Chrome è audio udibile, sopra la soglia di −72 dBFS; per le orecchie e gli
+  altoparlanti di tablet è nullo) e la notifica multimediale «Audio Cutter» mostra l’avanzamento. Così
+  Chrome non congela pagina e worker dopo 1 minuto e Android tiene vivo il processo: si possono usare
+  altre app o spegnere lo schermo, più lentamente. Nelle prove su Chrome 156 con il congelamento di
+  Android attivo, export di 8 h nascosto: 4 parti su 4 create da nascosto (prima: 0 in 7 minuti).
+  Interruttore nel pannello di avanzamento; musica o video di altre app lo mettono in pausa («Riattiva»).
+  iPad/iPhone e desktop invariati
 - **motore mobile con meno copie**: su telefoni e tablet il worker FFmpeg preassegna l’uscita alla
   dimensione prevista e la consegna per trasferimento, senza copia. Nelle prove emulate, taglio senza
   ricodifica: Galaxy Tab −14% di tempo e −12% di picco, iPad (WebKit) −14% di picco; le conversioni

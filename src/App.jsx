@@ -27,6 +27,7 @@ import {
   yieldToUI,
 } from './lib/streamExport.js';
 import { useWakeLock } from './hooks/useWakeLock.js';
+import { useBackgroundWork } from './hooks/useBackgroundWork.js';
 import {
   clamp,
   formatBytes,
@@ -1639,6 +1640,39 @@ export default function App() {
   const longWorkActive = isExporting || Boolean(task) || engineInfo.phase === 'downloading'
     || engineInfo.phase === 'compiling' || Boolean(loadJob?.active && loadJob.stage !== 'waveform');
   const wakeHeld = useWakeLock(longWorkActive);
+
+  // Chrome Android: export e operazioni del motore continuano con l'app in
+  // secondo piano (tono a 30 Hz + notifica multimediale, lib/backgroundWork.js).
+  // iPad/iPhone e desktop: nulla cambia.
+  const backgroundOutcomeRef = useRef(null);
+  const backgroundActive = isExporting || Boolean(task && task.kind !== 'storage');
+  const backgroundProgress = exportDetail?.active
+    ? (exportDetail.stage === 'segments' ? exportDetail.frac : null)
+    : (task && Number.isFinite(task.frac) ? task.frac : null);
+  let backgroundMeta = null;
+  if (exportDetail?.active) {
+    const partNumber = Math.min((exportDetail.segIndex ?? 0) + 1, exportDetail.segCount || 1);
+    const eta = Number.isFinite(exportDetail.etaMs) ? formatDurationShort(exportDetail.etaMs / 1000) : null;
+    backgroundMeta = exportDetail.stage === 'engine'
+      ? { title: 'Preparo il motore…', artist: `${exportDetail.segCount} parti da creare` }
+      : exportDetail.stage === 'finalizing'
+        ? { title: 'Finalizzo…', artist: `${exportDetail.segCount} parti pronte` }
+        : {
+          title: `Taglio in corso · ${Math.floor((backgroundProgress ?? 0) * 100)}%`,
+          artist: `Parte ${partNumber} di ${exportDetail.segCount}${eta ? ` · restano ~${eta}` : ''}`,
+        };
+  } else if (task) {
+    backgroundMeta = {
+      title: `${task.title}${backgroundProgress !== null ? ` · ${Math.floor(backgroundProgress * 100)}%` : ''}`,
+      artist: 'Audio Cutter',
+    };
+  }
+  const background = useBackgroundWork({ active: backgroundActive, meta: backgroundMeta, outcomeRef: backgroundOutcomeRef });
+  const backgroundProgressRef = useRef(null);
+  backgroundProgressRef.current = backgroundProgress;
+  const backgroundStateRef = useRef('off');
+  backgroundStateRef.current = background.supported && background.enabled ? background.state : 'off';
+
   useEffect(() => {
     if (!isExporting && !task) {
       return undefined;
@@ -1651,11 +1685,12 @@ export default function App() {
     return () => window.removeEventListener('beforeunload', handler);
   }, [isExporting, task]);
 
-  // Telefoni/tablet in secondo piano. Nessuna API web garantisce che il
-  // lavoro continui (iPadOS sospende Safari in pochi secondi, Chrome Android
-  // congela pagina e worker): a riposo si libera subito la memoria del motore,
-  // così il sistema chiude la scheda molto più di rado; durante un lavoro, al
-  // ritorno si dice che è ripreso (export e analisi contano solo il tempo attivo).
+  // Telefoni/tablet in secondo piano. iPadOS sospende Safari in pochi secondi;
+  // Chrome Android congela pagina e worker, salvo con il lavoro in background
+  // attivo (sopra). A riposo si libera subito la memoria del motore, così il
+  // sistema chiude la scheda molto più di rado; durante un lavoro, al ritorno
+  // si dice se è continuato o se era in pausa (export e analisi contano solo
+  // il tempo attivo).
   const longWorkRef = useRef(false);
   longWorkRef.current = longWorkActive;
   useEffect(() => {
@@ -1664,10 +1699,14 @@ export default function App() {
     }
     let hiddenAt = 0;
     let hiddenDuringWork = false;
+    let progressAtHide = null;
+    let backgroundAtHide = 'off';
     const onVisibility = () => {
       if (document.visibilityState === 'hidden') {
         hiddenAt = Date.now();
         hiddenDuringWork = longWorkRef.current;
+        progressAtHide = backgroundProgressRef.current;
+        backgroundAtHide = backgroundStateRef.current;
         if (!isBusyRef.current && !waveformDecodePendingRef.current && !isRecorderBusyRef.current && releaseIdleEngine()) {
           mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
         }
@@ -1675,7 +1714,31 @@ export default function App() {
       }
       const away = hiddenAt ? Date.now() - hiddenAt : 0;
       hiddenAt = 0;
-      if (hiddenDuringWork && longWorkRef.current && away >= 3000) {
+      if (!hiddenDuringWork || !longWorkRef.current || away < 3000) {
+        return;
+      }
+      const progressNow = backgroundProgressRef.current;
+      const measured = Number.isFinite(progressAtHide) && Number.isFinite(progressNow);
+      const advanced = measured && progressNow - progressAtHide >= 0.01;
+      const backgroundNow = backgroundStateRef.current;
+      const backgroundWasOn = backgroundAtHide === 'running' || backgroundAtHide === 'starting';
+      if (advanced) {
+        notify({
+          kind: 'info',
+          title: 'Il lavoro è continuato in background',
+          detail: `Mentre eri via: da ${Math.floor(progressAtHide * 100)}% a ${Math.floor(progressNow * 100)}%.`,
+          duration: 5000,
+        });
+      } else if (backgroundNow === 'interrupted' || backgroundNow === 'blocked') {
+        notify({
+          kind: 'info',
+          title: 'Lavoro in pausa mentre eri via',
+          detail: 'Un’altra app ha usato l’audio (o l’hai messo in pausa dalla notifica): tocca «Riattiva» nel pannello per farlo continuare anche fuori dall’app.',
+          duration: 8000,
+        });
+      } else if (measured || !backgroundWasOn) {
+        // Fermo anche con il lavoro in background attivo (il sistema ha sospeso
+        // Chrome lo stesso): stesso messaggio onesto di prima.
         notify({
           kind: 'info',
           title: 'Elaborazione ripresa',
@@ -1803,8 +1866,11 @@ export default function App() {
           ? { ...previous, frac: frac === null ? null : Math.min(0.99, frac), speed, etaMs, processedSeconds: seconds }
           : previous);
       };
-      return await work({ ffmpeg, inputPath, onProgress });
+      const result = await work({ ffmpeg, inputPath, onProgress });
+      backgroundOutcomeRef.current = { title: `${title}: fatto`, artist: 'Audio Cutter' };
+      return result;
     } catch (error) {
+      backgroundOutcomeRef.current = { title: `${title}: interrotto`, artist: 'Apri Audio Cutter' };
       if (taskAbortRef.current) {
         const cancelled = new Error('Operazione annullata.');
         cancelled.cancelled = true;
@@ -3128,6 +3194,7 @@ export default function App() {
     const startedAt = Date.now();
     setIsBusy(true);
     setIsExporting(true);
+    backgroundOutcomeRef.current = null;
     exportAbortRef.current = false;
     const ioAbort = new AbortController();
     exportIOAbortRef.current = ioAbort;
@@ -3669,12 +3736,19 @@ export default function App() {
         `Fatto in ${elapsedLabel}: ${exportedParts.length} parti ${destMode === 'folder' ? 'nella cartella' : destMode === 'singles' ? 'scaricate' : 'nello ZIP'}`,
         `${format.label}${jobFastCopy ? ' · qualità originale' : ''} · ${formatBytes(exportedParts.reduce((sum, part) => sum + (part.size || 0), 0))}`,
       );
+      backgroundOutcomeRef.current = {
+        title: `Taglio completato in ${elapsedLabel}`,
+        artist: `${exportedParts.length} parti pronte · apri Audio Cutter`,
+      };
       setTechnicalLog(
         `Export ${format.id} ${jobFastCopy ? 'senza ricodifica' : format.bitrates.length ? `${jobBitrate}k` : 'lossless'}${jobFade ? ` fade ${jobFade}s` : ''} via ${destMode}${parallelUsed ? ' con 2 motori' : ''}: ${exportedParts.length} file, ${formatSpeedFactor(speedFactor(workedSeconds, workMs)) ?? '—'} tempo reale.`,
       );
     } catch (error) {
       console.error(error);
       const cancelled = exportAbortRef.current || error?.message === 'Export annullato.';
+      backgroundOutcomeRef.current = cancelled
+        ? { title: 'Export annullato', artist: 'Audio Cutter' }
+        : { title: 'Taglio interrotto', artist: 'Apri Audio Cutter per riprendere' };
       for (const url of lastResultUrlsRef.current) {
         try {
           URL.revokeObjectURL(url);
@@ -4417,6 +4491,7 @@ export default function App() {
               advisorNote={advisorNote}
               wakeHeld={wakeHeld}
               touchUi={touchUi}
+              background={background}
               baseName={baseNameOverride}
               onBaseNameChange={setBaseNameOverride}
               segmentNames={segmentNames}

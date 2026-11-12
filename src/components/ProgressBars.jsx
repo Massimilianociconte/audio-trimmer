@@ -265,7 +265,48 @@ const PART_STATE_LABEL = {
  * Barra di SCARICAMENTO/export: fase (motore → parti → finalizzazione),
  * parte i/N con stato per parte, % su secondi audio reali, velocità ×, ETA.
  */
-export function ExportProgressBar({ detail, engineInfo, wakeHeld, touchUi = false, onCancel }) {
+/**
+ * Chrome Android: il lavoro continua con l'app in secondo piano (tono a 30 Hz
+ * + notifica multimediale). Testo onesto sullo stato e interruttore.
+ */
+function BackgroundNote({ background, wakeHeld }) {
+  const { enabled, state, setEnabled, resume } = background;
+  const paused = enabled && (state === 'interrupted' || state === 'blocked');
+  return (
+    <>
+      {!enabled ? (
+        <p className="helper-text">
+          Tieni Audio Cutter in primo piano{wakeHeld ? ' (schermo tenuto acceso)' : ''}: se cambi app, Android
+          mette in pausa il lavoro, che riprende quando torni. Le parti già pronte restano salvate.
+        </p>
+      ) : paused ? (
+        <>
+          <p className="helper-text">
+            {state === 'blocked'
+              ? 'Il browser non ha avviato il lavoro in background: finché resti qui il taglio continua.'
+              : 'Lavoro in background in pausa: un’altra app ha usato l’audio (o l’hai messo in pausa dalla notifica). Finché resti qui il taglio continua.'}
+          </p>
+          <button type="button" className="ghost-button" onClick={resume}>
+            Riattiva il lavoro in background
+          </button>
+        </>
+      ) : (
+        <p className="helper-text">
+          Puoi usare altre app o spegnere lo schermo: il taglio continua in background, più lentamente, e
+          l’avanzamento resta nella notifica «Audio Cutter». Musica o video in altre app lo mettono in pausa.
+        </p>
+      )}
+      <label className="check-row">
+        <input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} />
+        <span>
+          Continua anche con l’app in background <em>(notifica visibile; ferma la musica di altre app)</em>
+        </span>
+      </label>
+    </>
+  );
+}
+
+export function ExportProgressBar({ detail, engineInfo, wakeHeld, touchUi = false, background = null, onCancel }) {
   const active = Boolean(detail?.active);
   const elapsed = useElapsedSeconds(detail?.startedAt, active);
   if (!active) {
@@ -321,7 +362,9 @@ export function ExportProgressBar({ detail, engineInfo, wakeHeld, touchUi = fals
         </ol>
       ) : null}
 
-      {touchUi ? (
+      {touchUi && background?.supported ? (
+        <BackgroundNote background={background} wakeHeld={wakeHeld} />
+      ) : touchUi ? (
         // iPad e Android sospendono le pagine in secondo piano: nessuna API web
         // garantisce che il lavoro continui. Le parti pronte restano salvate.
         <p className="helper-text">

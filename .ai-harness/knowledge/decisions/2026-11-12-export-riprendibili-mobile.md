@@ -64,6 +64,8 @@ Solo telefoni/tablet (`isMobileDevice()`); desktop invariato.
   di calcolo wasm, niente `FileReaderSync`, limiti di vita.
 - **Audio silenzioso per restare attivi**: fragile, viola le linee guida
   delle piattaforme, consuma batteria; iPadOS lo interrompe comunque.
+  *Rivista per Chrome Android*: vedi `2026-11-12-lavoro-in-background-android.md`
+  (tono a 30 Hz udibile per Chrome + notifica multimediale, su richiesta esplicita).
 - **ffmpeg core multi-thread**: richiede COOP/COEP (su GitHub Pages solo via
   hack del Service Worker), più RAM per thread; instabile su iPad.
 - **Più worker in parallelo**: moltiplica i picchi di memoria (crash già
