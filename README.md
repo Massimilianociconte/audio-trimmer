@@ -56,6 +56,12 @@ Web app statica per tagliare file audio direttamente nel browser, senza ri-uploa
   dimensione prevista e la consegna per trasferimento, senza copia. Nelle prove emulate, taglio senza
   ricodifica: Galaxy Tab −14% di tempo e −12% di picco, iPad (WebKit) −14% di picco; le conversioni
   restano limitate dalla CPU. Si attiva solo dopo un controllo e ripiega sul worker originale
+- **conversioni su due motori sui tablet Android capaci** (8 GB e 8 core dichiarati, es. Galaxy Tab S8):
+  gli encoder audio usano un solo core, quindi con almeno 2 parti da convertire (M4A/MP3/OGG) un
+  secondo motore prepara la parte successiva. Parti identiche byte per byte, consegna nello stesso
+  ordine; nelle prove emulate 2 h mp3 → m4a passa da 33 a 17 s (+30–230 MiB durante l’export).
+  Se il secondo motore non parte o si ferma, si prosegue con uno. Desktop, iPad, taglio senza
+  ricodifica e WAV/FLAC invariati
 - **nessuna attesa infinita**: se il worker del motore muore tra un comando e l’altro, l’export si
   ferma con un messaggio dopo 90 s di tempo attivo invece di restare bloccato
 - **ogni azione ha un riscontro**: avvisi fissi in alto per errori (restano finché non li chiudi) e

@@ -267,7 +267,8 @@ Playwright, rumorosa (±10–15% tra lanci identici): contano le differenze più
 | Desktop Chrome | M4A copia, 2 parti, motore già pronto (n=8) | 1552 → 1604 ms (nel rumore) | 750 → 763 MiB (nel rumore) |
 
 Lettura onesta: la conversione (MP3/AAC) è limitata dalla CPU del core wasm single-thread e
-**non** accelera; il guadagno è sulle copie di memoria (taglio senza ricodifica, uscite grandi).
+con queste modifiche **non** accelera; il guadagno è sulle copie di memoria (taglio senza
+ricodifica, uscite grandi). Per i tablet Android 8 GB / 8 core vedi la sezione successiva.
 In WebKit, con più export di fila nella stessa scheda, i picchi crescono a ogni export in entrambe
 le build (Blob trattenuti per il «Riscarica») e il confronto è inconcludente (mediana 1662 → 1838
 MiB, n=6/14): nessun miglioramento dichiarato per quel caso. Desktop: stesso worker e stesso
@@ -290,6 +291,52 @@ Il primo tentativo di simulare il congelamento con `Page.setWebLifecycleState` n
 nulla in headless (export finito durante il «freeze»): scartato a favore di SIGSTOP, che ferma
 davvero pagina e worker come fa il sistema. Suite: **220 test** (28 nuovi: store dei job con
 IndexedDB finto, impronte, scadenze, patch MEMFS, consegna senza copia e ripieghi, ZIP da Blob).
+
+## Conversioni su due motori (Android 8 GB / 8 core) — 12 novembre 2026
+
+Obiettivo: Galaxy Tab S8 (Snapdragon 8 Gen 1, 8 GB) su Chrome. Le fasi lente rimaste sono
+conversione e pulizia, limitate dalla CPU: gli encoder audio di FFmpeg sono single-thread
+(anche nel core multi-thread), quindi un export usa un core su otto. Decisione, alternative
+scartate e motivi: `.ai-harness/knowledge/decisions/2026-11-12-conversioni-parallele-android.md`.
+
+**Intervento** (`src/lib/parallelExport.js` + ciclo di export in `App.jsx`): con almeno 2 parti
+da convertire in M4A/MP3/OGG, un secondo motore ffmpeg.wasm prepara la parte successiva mentre
+il principale lavora. Consumo (ZIP, salvataggi per la ripresa, download) sequenziale e in ordine;
+al massimo 2 uscite vive; stessi comandi ⇒ parti identiche byte per byte.
+
+| Condizione per il secondo motore | Perché |
+|---|---|
+| Android, `deviceMemory` ≥ 8 e `hardwareConcurrency` ≥ 8, niente risparmio dati | Solo tablet/telefoni con margine; desktop e iPad invariati |
+| Conversione M4A/MP3/OGG, ≥ 2 parti da creare, destinazione non cartella | Taglio senza ricodifica già veloce; WAV/FLAC limitati da I/O e memoria |
+| Due uscite stimate entro il budget di una parte (es. 256 MiB ciascuna con 8 GB) | La memoria massima dichiarata resta quella di prima |
+| wasm già servito dalla cache del service worker; input via WORKERFS | Mai un secondo download da 32 MB né una copia integrale dell’input |
+
+Ripieghi: secondo motore assente ⇒ un motore come prima; secondo motore in errore o fermo per
+30 s attivi ⇒ chiuso e parte rifatta sul principale; errore del principale ⇒ percorso di sempre.
+Annullo, fine export ed errori chiudono il secondo motore. La velocità imparata per le stime
+resta quella di un motore.
+
+**Misure** (Chromium, profilo Galaxy Tab con UA SM-X700, 8 GB dichiarati; stessa build, gate
+spento con 6 core dichiarati e acceso con 8; host M5 Pro, circa 2,5× un core del tablet):
+
+| Lavoro | 1 motore → 2 motori | Picco RSS | Uscite |
+|---|---:|---:|---|
+| 2 h mp3 → M4A, 2 parti (file singoli) | 32,7 → 16,7 s (**−49%**) | 672 → 699 MiB | identiche (SHA-256) |
+| 2 h mp3 → M4A, 4 parti (ZIP) | 33,8 → 17,1 s (**−49%**) | 562 → 796 MiB | identiche, anche dentro lo ZIP |
+| 12 min mp3 → MP3, 3 parti (ZIP) | 3,56 → 2,56 s (−28%) | 595 → 674 MiB | identiche |
+| Desktop Chrome, 2 h → M4A, 4 parti, 8 core | 33,7 s, un motore attivo | — | — |
+| iPad (WebKit), 2 h → M4A, 4 parti, 8 core | 33,9 s, un motore attivo | — | identiche al Galaxy |
+
+Prova preliminare con motori indipendenti (6 parti): 1/2/3/4 motori 34,5/17,4/12,6/12,5 s,
+picco 381/600/753/735 MiB: si resta a 2 per calore e memoria del tablet.
+
+**Guasti e interruzioni** sul flusso reale (4 parti → ZIP, 2 h → M4A): secondo motore chiuso a
+metà ⇒ export completato in 56 s su un motore, ZIP identico; annullo con due motori attivi ⇒
+fermo in 2,2 s, export successivo su due motori (17,8 s) identico; ricaricamento dopo 2 parti
+salvate ⇒ ripresa delle sole mancanti su due motori (9,5 s), ZIP identico. Suite di
+interruzione (`scripts/tablet-interruption-audit.mjs`): sul profilo Galaxy il parallelo è attivo
+(WAV → MP3, 4 parti). Test unitari: gate, ordine, finestra di anticipo, ripieghi, annullo,
+nessuna promessa rifiutata non gestita, motore tardivo chiuso (14 nuovi, **234 test** in totale).
 
 ## Limiti e prove ancora necessarie
 
@@ -323,6 +370,11 @@ IndexedDB finto, impronte, scadenze, patch MEMFS, consegna senza copia e ripiegh
    pulizia/analisi dei silenzi. Va riaperto lo stesso file (nome, dimensione, data, durata): la
    riapertura da «Progetti salvati» non è stata verificata. Le chiamate al motore di pulizia e analisi
    non hanno ancora la scadenza aggiunta all’export.
+9. **Due motori non provati su un Galaxy Tab S8 reale.** Da misurare: tempo effettivo (stima ~2×
+   solo se i due motori finiscono su core grandi), calo per calore su conversioni lunghe, memoria
+   della scheda con due motori, valore reale di `hardwareConcurrency`. Nessun guadagno con una sola
+   parte, nel taglio senza ricodifica e nella pulizia. Se il motore principale muore a metà comando,
+   resta il comportamento di sempre (errore dopo 90 s attivi, parti salvate tenute).
 
 ## Ripetere le prove
 

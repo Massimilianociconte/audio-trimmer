@@ -541,6 +541,35 @@ export function useFfmpegEngine() {
     return true;
   }, []);
 
+  /**
+   * Motore aggiuntivo per le conversioni in parallelo (lib/parallelExport.js):
+   * stessa configurazione del principale, mai un secondo download da 32MB
+   * (solo con il wasm già servito dalla cache). null se non è pronto: l'export
+   * prosegue con il solo motore principale. Chi lo riceve lo chiude.
+   */
+  const createHelperEngine = useCallback(async () => {
+    if (import.meta.env.PROD && !(await isWasmServedFromCache())) {
+      return null;
+    }
+    const helper = new FFmpeg();
+    try {
+      helper.acOutputTransfer = isMobileDevice() ? await probeMobileWorker() : false;
+      await withActiveTimeout(
+        helper.load(engineLoadConfig(helper, ffmpegWasmUrl)),
+        ENGINE_LOAD_TIMEOUT_MS,
+        'Il motore aggiuntivo non risponde.',
+      );
+      return helper;
+    } catch {
+      try {
+        helper.terminate();
+      } catch {
+        // ignore
+      }
+      return null;
+    }
+  }, []);
+
   return {
     ffmpegRef,
     engineInfo,
@@ -550,6 +579,7 @@ export function useFfmpegEngine() {
     prefetchEngine,
     resetAfterAbort,
     releaseIdleEngine,
+    createHelperEngine,
   };
 }
 

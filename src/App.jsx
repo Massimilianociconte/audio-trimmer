@@ -101,6 +101,7 @@ import {
   sameSource,
 } from './lib/exportJobs.js';
 import { withActiveTimeout } from './lib/activityWatch.js';
+import { createEncodeAhead, exportEngineCount } from './lib/parallelExport.js';
 import { hardResetApp } from './lib/cacheReset.js';
 import { splitMessage } from './lib/messages.js';
 import { computeWaveformPeaks } from './lib/peaks.js';
@@ -203,12 +204,13 @@ function getFormatLabel(file, extension) {
 // da exec (che ha già il suo controllo di inattività) ha quindi una scadenza in
 // tempo ATTIVO; scaduta, il motore viene chiuso e ricreato al prossimo uso.
 const ENGINE_CALL_TIMEOUT_MS = 90000;
+const HELPER_STALL_TIMEOUT_MS = 30000;
 
-async function engineCall(ffmpeg, promise) {
+async function engineCall(ffmpeg, promise, timeoutMs = ENGINE_CALL_TIMEOUT_MS) {
   try {
     return await withActiveTimeout(
       promise,
-      ENGINE_CALL_TIMEOUT_MS,
+      timeoutMs,
       'Il motore ha smesso di rispondere (probabilmente memoria piena): riprova, verrà riavviato.',
     );
   } catch (error) {
@@ -342,7 +344,11 @@ export default function App() {
     prefetchEngine,
     resetAfterAbort,
     releaseIdleEngine,
+    createHelperEngine,
   } = useFfmpegEngine();
+  // Motori aggiuntivi dell'export in corso (conversioni in parallelo, Android):
+  // chiusi a fine export e su annullo.
+  const exportHelpersRef = useRef(new Set());
 
   const [statusText, setStatusText] = useState(INITIAL_MESSAGE);
   // Testi "tocca"/"clicca" e scorciatoie da tastiera secondo il dispositivo.
@@ -2670,11 +2676,23 @@ export default function App() {
     link.remove();
   }
 
+  function terminateExportHelpers() {
+    for (const helper of exportHelpersRef.current) {
+      try {
+        helper.terminate();
+      } catch {
+        // già chiuso
+      }
+    }
+    exportHelpersRef.current.clear();
+  }
+
   function handleCancelExport() {
     exportAbortRef.current = true;
     exportIOAbortRef.current?.abort();
     setStatusText('Annullamento export in corso…');
     exportGateRef.current?.abort();
+    terminateExportHelpers();
     if (exportStageRef.current !== 'engine') {
       // Interrompe un exec FFmpeg in corso; il motore verrà ricreato al prossimo uso
       // e l'audio rimontato (zero copie) da ensureInputMounted. Durante il download
@@ -3189,6 +3207,7 @@ export default function App() {
     let zipWriter = null;
     let zipWritable = null;
     let engineCrashed = false;
+    let encodeAhead = null;
 
     const gate = createAbortGate();
     exportGateRef.current = gate;
@@ -3253,15 +3272,190 @@ export default function App() {
           : previous);
       };
 
+      // Crea una parte su un motore. Sul principale: stessi passi ed errori di
+      // sempre (motore da ricreare, parte fallita). Su un motore aggiuntivo
+      // l'errore risale alla coda, che lo chiude e rifà la parte sul principale.
+      const encodeSegment = async (lane, index, onProgress) => {
+        const engine = lane.engine;
+        // Motore aggiuntivo morto senza avvisi: si passa al principale presto.
+        const callTimeoutMs = lane.main ? ENGINE_CALL_TIMEOUT_MS : HELPER_STALL_TIMEOUT_MS;
+        const segment = jobSegments[index];
+        const virtualName = buildVirtualSegmentName(runPrefix, index, outputExtension);
+        const args = buildExportArgs({
+          segment,
+          inputName: lane.path,
+          outputName: virtualName,
+          formatId: format.id,
+          bitrateKbps: jobBitrate,
+          fastCopy: jobFastCopy,
+          fadeSeconds: jobFade,
+        });
+
+        // Motore mobile: dimensione prevista dell'uscita (un'allocazione sola
+        // invece di decine). Nessun effetto sul motore desktop.
+        try {
+          await engineCall(engine, hintOutputBytes(
+            engine,
+            virtualName,
+            jobFastCopy
+              ? jobAudio.size * segment.duration / Math.max(0.001, jobAudio.duration || segment.duration)
+              : estimateExportBytes({ durationSeconds: segment.duration, bitrateKbps: jobBitrate, formatId: jobFormatId }),
+            memoryBudget.segmentBytes,
+          ), callTimeoutMs);
+        } catch (hintError) {
+          if (!hintError?.isTimeout) throw hintError;
+          if (lane.main) engineCrashed = true;
+          hintError.failedIndex = index;
+          throw hintError;
+        }
+
+        // Avanzamento intra-segmento reale (secondi di output scritti da ffmpeg).
+        let result;
+        if (lane.main) createdVirtualNames.push(virtualName);
+        try {
+          result = await runFfmpeg(engine, args, {
+            durationSeconds: segment.duration,
+            onProgress,
+            maxOutputBytes: memoryBudget.segmentBytes,
+            // Motore aggiuntivo fermo (worker morto senza avvisi): dopo 30 s
+            // attivi senza avanzamento la parte passa al principale.
+            stallTimeoutMs: lane.main ? undefined : HELPER_STALL_TIMEOUT_MS,
+          });
+        } catch (execError) {
+          if (lane.main && !exportAbortRef.current) {
+            // Il worker è morto (OOM, abort wasm): va ricreato al prossimo uso.
+            engineCrashed = true;
+          }
+          const failed = new Error(
+            exportAbortRef.current
+              ? 'Export annullato.'
+              : describeFfmpegFailure(execError?.message) || `Il motore si è fermato alla parte ${index + 1}. Riprova: riparte da capo in pochi secondi.`,
+          );
+          failed.failedIndex = index;
+          throw failed;
+        }
+
+        if (exportAbortRef.current) {
+          throw new Error('Export annullato.');
+        }
+
+        if (result.exitCode !== 0) {
+          // Il segmento parziale resterebbe orfano nella FS: eliminalo subito.
+          await safeDelete(engine, virtualName);
+          const reason = describeFfmpegFailure(result.tailText);
+          const failed = new Error(
+            `Non sono riuscito a esportare la parte ${index + 1} in ${format.label}.${reason ? ` ${reason}` : ''}`,
+          );
+          failed.failedIndex = index;
+          throw failed;
+        }
+
+        let data;
+        try {
+          data = await engineCall(engine, readAudioOutput(engine, virtualName), callTimeoutMs);
+          // Libera SUBITO il segmento dalla memoria wasm: mai più di uno in RAM.
+          await engineCall(engine, safeDelete(engine, virtualName), callTimeoutMs);
+        } catch (readError) {
+          if (readError?.isTimeout) {
+            if (lane.main) engineCrashed = true;
+            readError.failedIndex = index;
+          }
+          throw readError;
+        }
+        if (lane.main) {
+          const at = createdVirtualNames.lastIndexOf(virtualName);
+          if (at >= 0) createdVirtualNames.splice(at, 1);
+        }
+        return data;
+      };
+      const mainLane = { id: 'main', main: true, engine: ffmpeg, path: inputPath };
+
+      // Android con 8 GB e 8 core: conversioni su due motori (vedi
+      // lib/parallelExport.js). Le parti escono identiche; la consegna resta
+      // in ordine e una alla volta. Ovunque altro: flusso sequenziale invariato.
+      const plannedIndexes = jobSegments.map((_, index) => index).filter((index) => {
+        const previousPart = persistedJob?.done?.[index];
+        if (previousPart?.delivered && persistMode === 'delivery') return false;
+        if (previousPart?.stored && persistMode === 'blobs' && zipWriter) return false;
+        return true;
+      });
+      const engineCount = exportEngineCount({
+        fastCopy: jobFastCopy,
+        formatId: format.id,
+        pendingParts: plannedIndexes.length,
+        maxPartBytes: Math.max(0, ...plannedIndexes.map((index) => estimateExportBytes({
+          durationSeconds: jobSegments[index].duration,
+          bitrateKbps: jobBitrate,
+          formatId: jobFormatId,
+        }))),
+        segmentBudgetBytes: memoryBudget.segmentBytes,
+        destMode,
+      });
+      const inflightSeconds = new Map();
+      let headIndex = 0;
+      const publishParallel = (force = false) => {
+        let extra = 0;
+        for (const seconds of inflightSeconds.values()) extra += seconds;
+        publish(headIndex, 1, extra, force);
+      };
+      if (engineCount > 1) {
+        encodeAhead = createEncodeAhead({
+          plan: plannedIndexes,
+          encode: (lane, index) => encodeSegment(lane, index, (frac) => {
+            inflightSeconds.set(index, (frac ?? 0) * jobSegments[index].duration);
+            publishParallel();
+          }),
+          isAborted: () => exportAbortRef.current,
+          onStart: (index) => {
+            partStates[index] = 'active';
+            inflightSeconds.set(index, 0);
+          },
+        });
+        encodeAhead.addLane(mainLane);
+        // Il secondo motore si prepara mentre il principale lavora già: se non
+        // arriva (memoria, cache), si prosegue con uno solo.
+        const queue = encodeAhead;
+        (async () => {
+          const helper = await createHelperEngine();
+          if (!helper) return;
+          exportHelpersRef.current.add(helper);
+          const drop = () => {
+            exportHelpersRef.current.delete(helper);
+            try {
+              helper.terminate();
+            } catch {
+              // già chiuso
+            }
+          };
+          const stillCurrent = () => !exportAbortRef.current && exportGateRef.current === gate;
+          if (!stillCurrent()) {
+            drop();
+            return;
+          }
+          mountSequence += 1;
+          const mounted = await mountAudioInput(helper, jobAudio, mountSequence).catch(() => null);
+          // Mai una copia integrale del file in un secondo motore.
+          if (!mounted || mounted.memfs || !stillCurrent()) {
+            drop();
+            return;
+          }
+          queue.addLane({ id: 'helper', main: false, engine: helper, path: mounted.path, kill: drop });
+        })().catch(() => {});
+      }
+
       for (let index = 0; index < jobSegments.length; index += 1) {
         if (exportAbortRef.current) {
           throw new Error('Export annullato.');
         }
         const segment = jobSegments[index];
         const downloadName = jobNames[index];
-        const virtualName = buildVirtualSegmentName(runPrefix, index, outputExtension);
         partStates[index] = 'active';
-        publish(index, 0, segment.duration, true);
+        if (encodeAhead) {
+          headIndex = index;
+          publishParallel(true);
+        } else {
+          publish(index, 0, segment.duration, true);
+        }
 
         // Modalità cartella + ripresa: salta i file già presenti e validi.
         if (destMode === 'folder' && skipExisting) {
@@ -3313,85 +3507,11 @@ export default function App() {
           }
         }
 
-        const args = buildExportArgs({
-          segment,
-          inputName: inputPath,
-          outputName: virtualName,
-          formatId: format.id,
-          bitrateKbps: jobBitrate,
-          fastCopy: jobFastCopy,
-          fadeSeconds: jobFade,
-        });
-
-        // Motore mobile: dimensione prevista dell'uscita (un'allocazione sola
-        // invece di decine). Nessun effetto sul motore desktop.
-        try {
-          await engineCall(ffmpeg, hintOutputBytes(
-            ffmpeg,
-            virtualName,
-            jobFastCopy
-              ? jobAudio.size * segment.duration / Math.max(0.001, jobAudio.duration || segment.duration)
-              : estimateExportBytes({ durationSeconds: segment.duration, bitrateKbps: jobBitrate, formatId: jobFormatId }),
-            memoryBudget.segmentBytes,
-          ));
-        } catch (hintError) {
-          if (!hintError?.isTimeout) throw hintError;
-          engineCrashed = true;
-          hintError.failedIndex = index;
-          throw hintError;
-        }
-
-        // Avanzamento intra-segmento reale (secondi di output scritti da ffmpeg).
-        let result;
-        createdVirtualNames.push(virtualName);
-        try {
-          result = await runFfmpeg(ffmpeg, args, {
-            durationSeconds: segment.duration,
-            onProgress: (frac) => publish(index, frac ?? 0, segment.duration),
-            maxOutputBytes: memoryBudget.segmentBytes,
-          });
-        } catch (execError) {
-          if (!exportAbortRef.current) {
-            // Il worker è morto (OOM, abort wasm): va ricreato al prossimo uso.
-            engineCrashed = true;
-          }
-          const failed = new Error(
-            exportAbortRef.current
-              ? 'Export annullato.'
-              : describeFfmpegFailure(execError?.message) || `Il motore si è fermato alla parte ${index + 1}. Riprova: riparte da capo in pochi secondi.`,
-          );
-          failed.failedIndex = index;
-          throw failed;
-        }
-
-        if (exportAbortRef.current) {
-          throw new Error('Export annullato.');
-        }
-
-        if (result.exitCode !== 0) {
-          // Il segmento parziale resterebbe orfano nella FS: eliminalo subito.
-          await safeDelete(ffmpeg, virtualName);
-          const reason = describeFfmpegFailure(result.tailText);
-          const failed = new Error(
-            `Non sono riuscito a esportare la parte ${index + 1} in ${format.label}.${reason ? ` ${reason}` : ''}`,
-          );
-          failed.failedIndex = index;
-          throw failed;
-        }
-
-        let outputData;
-        try {
-          outputData = await engineCall(ffmpeg, readAudioOutput(ffmpeg, virtualName));
-          // Libera SUBITO il segmento dalla memoria wasm: mai più di uno in RAM.
-          await engineCall(ffmpeg, safeDelete(ffmpeg, virtualName));
-        } catch (readError) {
-          if (readError?.isTimeout) {
-            engineCrashed = true;
-            readError.failedIndex = index;
-          }
-          throw readError;
-        }
-        createdVirtualNames.pop();
+        // Android capaci: la parte può essere già pronta (preparata dal secondo
+        // motore mentre si consegnava la precedente). Altrimenti flusso di sempre.
+        let outputData = encodeAhead
+          ? await encodeAhead.take(index)
+          : await encodeSegment(mainLane, index, (frac) => publish(index, frac ?? 0, segment.duration));
         const outputBytes = outputData.length;
 
         if (exportAbortRef.current) throw new Error('Export annullato.');
@@ -3452,10 +3572,16 @@ export default function App() {
 
         bytesDone += outputBytes;
         outputData = null;
+        inflightSeconds.delete(index);
         doneSeconds += segment.duration;
         workedSeconds += segment.duration;
         partStates[index] = 'done';
-        publish(Math.min(index + 1, jobSegments.length - 1), 0, 0, true);
+        if (encodeAhead) {
+          headIndex = Math.min(index + 1, jobSegments.length - 1);
+          publishParallel(true);
+        } else {
+          publish(Math.min(index + 1, jobSegments.length - 1), 0, 0, true);
+        }
         await yieldToUI();
         writeCheckpoint({
           baseName: jobBaseName,
@@ -3470,7 +3596,10 @@ export default function App() {
 
       if (exportAbortRef.current) throw new Error('Export annullato.');
       const workMs = performance.now() - workStartedAt;
-      if (workedSeconds > 0) {
+      const parallelUsed = Boolean(encodeAhead?.usedParallel());
+      // La velocità imparata resta quella di un motore: stime prudenti anche
+      // quando il secondo motore non c'è (una sola parte, poca memoria).
+      if (workedSeconds > 0 && !parallelUsed) {
         rememberSpeed(speedKey, speedFactor(workedSeconds, workMs));
       }
 
@@ -3541,7 +3670,7 @@ export default function App() {
         `${format.label}${jobFastCopy ? ' · qualità originale' : ''} · ${formatBytes(exportedParts.reduce((sum, part) => sum + (part.size || 0), 0))}`,
       );
       setTechnicalLog(
-        `Export ${format.id} ${jobFastCopy ? 'senza ricodifica' : format.bitrates.length ? `${jobBitrate}k` : 'lossless'}${jobFade ? ` fade ${jobFade}s` : ''} via ${destMode}: ${exportedParts.length} file, ${formatSpeedFactor(speedFactor(workedSeconds, workMs)) ?? '—'} tempo reale.`,
+        `Export ${format.id} ${jobFastCopy ? 'senza ricodifica' : format.bitrates.length ? `${jobBitrate}k` : 'lossless'}${jobFade ? ` fade ${jobFade}s` : ''} via ${destMode}${parallelUsed ? ' con 2 motori' : ''}: ${exportedParts.length} file, ${formatSpeedFactor(speedFactor(workedSeconds, workMs)) ?? '—'} tempo reale.`,
       );
     } catch (error) {
       console.error(error);
@@ -3594,6 +3723,15 @@ export default function App() {
           // ignore
         }
       }
+      // Coda parallela: niente nuovo lavoro; i motori aggiuntivi si chiudono.
+      // Se il principale stava ancora preparando una parte (errore altrove),
+      // lo si ricrea al prossimo uso invece di lasciargli un lavoro orfano.
+      if (encodeAhead) {
+        if (encodeAhead.mainBusy()) engineCrashed = true;
+        encodeAhead.dispose();
+        encodeAhead = null;
+      }
+      terminateExportHelpers();
       if (ffmpeg && !engineCrashed && !exportAbortRef.current) {
         for (const virtualName of createdVirtualNames) {
           await safeDelete(ffmpeg, virtualName);
