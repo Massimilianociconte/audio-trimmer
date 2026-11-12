@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { outputMemoryPolicy, assertOutputBudget, mountAudioInput, readAudioOutput, MIN_PART_BYTES } from './memoryPolicy.js';
+import { outputMemoryPolicy, assertOutputBudget, mountAudioInput, readAudioOutput, hintOutputBytes, MIN_PART_BYTES } from './memoryPolicy.js';
+import { OUTPUT_HINT_DIR, TAKE_ENCODING } from './outputTransfer.js';
 
 const MB = 1000 * 1000;
 const MiB = 1024 * 1024;
@@ -117,4 +118,60 @@ test('successful output is also removed before returning transferred bytes', asy
   let deleted = false;
   assert.equal(await readAudioOutput({ readFile: async () => bytes, deleteFile: async () => { deleted = true; } }, 'out', 16), bytes);
   assert.equal(deleted, true);
+});
+
+// Motore mobile (worker esteso): consegna senza copia con ripiego classico.
+test('mobile engine output is taken without a second read', async () => {
+  const bytes = new Uint8Array(4);
+  const calls = [];
+  const ffmpeg = {
+    acOutputTransfer: true,
+    readFile: async (path, encoding) => { calls.push(['read', path, encoding]); return bytes; },
+    deleteFile: async (path) => { calls.push(['delete', path]); },
+  };
+  assert.equal(await readAudioOutput(ffmpeg, 'out.m4a', 16), bytes);
+  assert.deepEqual(calls, [['read', 'out.m4a', TAKE_ENCODING]]);
+});
+
+test('a failed take falls back to the classic read and delete', async () => {
+  const bytes = new Uint8Array(4);
+  const calls = [];
+  const ffmpeg = {
+    acOutputTransfer: true,
+    readFile: async (path, encoding) => {
+      calls.push(['read', encoding ?? 'binary']);
+      if (encoding === TAKE_ENCODING) throw new Error('unknown encoding');
+      return bytes;
+    },
+    deleteFile: async () => { calls.push(['delete']); },
+  };
+  assert.equal(await readAudioOutput(ffmpeg, 'out.m4a', 16), bytes);
+  assert.deepEqual(calls, [['read', TAKE_ENCODING], ['read', 'binary'], ['delete']]);
+
+  // Il worker originale ignora l'encoding sconosciuto e restituisce una stringa.
+  const stringy = { ...ffmpeg, readFile: async (path, encoding) => (encoding === TAKE_ENCODING ? 'text' : bytes) };
+  assert.equal(await readAudioOutput(stringy, 'out.m4a', 16), bytes);
+});
+
+test('a taken output over the part limit is still rejected', async () => {
+  const ffmpeg = { acOutputTransfer: true, readFile: async () => new Uint8Array(16), deleteFile: async () => {} };
+  await assert.rejects(readAudioOutput(ffmpeg, 'out.m4a', 16), /limite/);
+});
+
+test('output size hints are sent only to the mobile engine, clamped to the part budget', async () => {
+  const writes = [];
+  const stock = { writeFile: async (...args) => writes.push(args) };
+  assert.equal(await hintOutputBytes(stock, 'out.m4a', 50 * MiB, 256 * MiB), false);
+  assert.equal(writes.length, 0);
+
+  const mobileEngine = { acOutputTransfer: true, writeFile: async (path, data) => writes.push([path, new TextDecoder().decode(data)]) };
+  assert.equal(await hintOutputBytes(mobileEngine, 'out.m4a', 50 * MiB, 256 * MiB), true);
+  assert.deepEqual(writes.at(-1), [`${OUTPUT_HINT_DIR}out.m4a`, String(Math.ceil(50 * MiB * 1.03))]);
+  assert.equal(await hintOutputBytes(mobileEngine, 'out.m4a', 300 * MiB, 256 * MiB), true);
+  assert.equal(writes.at(-1)[1], String(256 * MiB));
+  // Uscite minuscole o stime non valide: nessuna preassegnazione.
+  assert.equal(await hintOutputBytes(mobileEngine, 'out.m4a', 100 * 1024, 256 * MiB), false);
+  assert.equal(await hintOutputBytes(mobileEngine, 'out.m4a', NaN, 256 * MiB), false);
+  const failing = { acOutputTransfer: true, writeFile: async () => { throw new Error('terminated'); } };
+  assert.equal(await hintOutputBytes(failing, 'out.m4a', 50 * MiB, 256 * MiB), false);
 });

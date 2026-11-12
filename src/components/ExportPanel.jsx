@@ -35,6 +35,7 @@ export function ExportPanel({
   onSkipExistingChange,
   advisorNote,
   wakeHeld,
+  touchUi = false,
   baseName,
   onBaseNameChange,
   segmentNames,
@@ -300,7 +301,7 @@ export function ExportPanel({
 
       {isExporting ? (
         <div className="export-progress">
-          <ExportProgressBar detail={exportDetail} engineInfo={engineInfo} wakeHeld={wakeHeld} onCancel={onCancelExport} />
+          <ExportProgressBar detail={exportDetail} engineInfo={engineInfo} wakeHeld={wakeHeld} touchUi={touchUi} onCancel={onCancelExport} />
         </div>
       ) : (
         <>

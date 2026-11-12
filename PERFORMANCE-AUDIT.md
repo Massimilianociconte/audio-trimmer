@@ -228,11 +228,76 @@ scrittura filesystem pendente, metadati dopo cleanup, sessioni Recorder, Wake Lo
 cache corrotta e transazioni IndexedDB. Ha individuato e corretto gli abort dei writer bloccati
 e la race finale della cleanup. Nessuna riscrittura di FFmpeg, waveform o storage.
 
+## Tablet: secondo piano, ripresa e velocità — 12 novembre 2026
+
+Obiettivo: iPad e tablet Samsung. Priorità: nessun nuovo crash, desktop invariato,
+interruzioni in secondo piano recuperabili, poi velocità e risorse.
+
+**Perché il lavoro si ferma.** Non è un bug dell’app: iPadOS sospende Safari pochi secondi
+dopo il cambio di app; Chrome Android congela pagina e worker dedicati dopo 1 minuto in
+secondo piano (5 minuti prima di Chrome 139) e Android 14+ congela i processi in cache;
+con poca memoria il sistema chiude per prime le schede in secondo piano. I Web Worker
+seguono la pagina, i Service Worker non possono eseguire ore di wasm (niente `FileReaderSync`,
+vita limitata), il Wake Lock vale solo a pagina visibile. Nessuna API web garantisce
+l’esecuzione in background: la soluzione adottata è rendere l’interruzione **recuperabile**.
+Decisione e alternative scartate (server, audio silenzioso, core multi-thread, worker
+paralleli, WebCodecs): `.ai-harness/knowledge/decisions/2026-11-12-export-riprendibili-mobile.md`.
+
+**Interventi (solo telefoni/tablet, desktop invariato):**
+
+| Problema | Intervento | Ripiego |
+|---|---|---|
+| Scheda chiusa dal sistema: ZIP in memoria perso, si ricominciava da capo | Ogni parte pronta salvata in IndexedDB (`exportJobs.js`, database separato); file singoli: annotate le parti già scaricate. Stesso file + stessi tagli/impostazioni ⇒ si rifanno solo le parti mancanti; riaprendo il file tagli e impostazioni tornano da soli | Senza IndexedDB/quota (es. Safari privato) l’export procede come prima |
+| Motore residente in secondo piano: scheda più esposta alla chiusura | A riposo, con pagina nascosta, il motore viene terminato; si ricompila dalla cache al prossimo uso | Non tocca caricamenti o lavori in corso |
+| Testo «il lavoro continua» falso su tablet | Su tablet: tenere l’app in primo piano, le parti pronte restano salvate; al ritorno «Elaborazione ripresa» | — |
+| Uscita MEMFS cresciuta a passi del 12,5% e copiata da `readFile` | Worker mobile: preassegnazione alla dimensione prevista e consegna per trasferimento (`outputTransfer.js`) | Sonda di avvio (ping), ripiego sul worker originale per la sessione; lettura classica se la consegna fallisce |
+| **Bug esistente**: worker morto tra due comandi ⇒ promesse in attesa per sempre, UI ferma | Scadenza di 90 s in tempo attivo su suggerimento dimensione, lettura e cancellazione dell’uscita; scaduta, motore ricreato e messaggio con le parti salvate | Vale anche su desktop (solo nel caso di blocco) |
+
+**Misure A/B** (stessa macchina, build precedente vs nuova servite in locale, contesto fresco
+e un solo export per lancio, alternando le due build; mediane). RSS = somma dei renderer
+Playwright, rumorosa (±10–15% tra lanci identici): contano le differenze più grandi del rumore.
+
+| Profilo emulato | Lavoro | Tempo prima → dopo | Picco RSS prima → dopo |
+|---|---|---:|---:|
+| Galaxy Tab S9, Chromium, 2 GB dichiarati | M4A 120 min, copia, 2 parti (n=3) | 1333 → 1149 ms (**−14%**) | 791 → 693 MiB (**−12%**) |
+| Galaxy Tab S9, 2 GB | WAV 20 min → MP3, 2 parti (n=2) | 6149 → 6200 ms (=) | 500 → 428 MiB (**−14%**) |
+| Galaxy Tab S9, 8 GB | M4A copia (n=2, stessa scheda) | 1654 → 1538 ms (−7%) | 799 → 715 MiB (−10%) |
+| iPad (gen 11), WebKit | M4A 120 min, copia, 2 parti (n=6) | 2222 → 2178 ms (−2%) | 1616 → 1396 MiB (**−14%**) |
+| iPad, WebKit | WAV 20 min → MP3, 2 parti (n=3 e n=4) | 7258 → 7269 / 9840 → 8964 ms | 976 → 1036 / 636 → 668 MiB (nel rumore) |
+| Desktop Chrome | M4A copia, 2 parti, motore già pronto (n=8) | 1552 → 1604 ms (nel rumore) | 750 → 763 MiB (nel rumore) |
+
+Lettura onesta: la conversione (MP3/AAC) è limitata dalla CPU del core wasm single-thread e
+**non** accelera; il guadagno è sulle copie di memoria (taglio senza ricodifica, uscite grandi).
+In WebKit, con più export di fila nella stessa scheda, i picchi crescono a ogni export in entrambe
+le build (Blob trattenuti per il «Riscarica») e il confronto è inconcludente (mediana 1662 → 1838
+MiB, n=6/14): nessun miglioramento dichiarato per quel caso. Desktop: stesso worker e stesso
+percorso; tre serie A/B danno −2%/+3%/+12% sul tempo e −1%/+2%/+7% sul picco, cioè rumore.
+
+**Scenari di interruzione** sul flusso reale dell’app (`scripts/tablet-interruption-audit.mjs`,
+WAV 20 min → MP3 in 4 parti; WebKit con profilo su disco come Safari normale):
+
+| Scenario | Galaxy Tab S9 (Chromium, senza picker) | iPad (WebKit) |
+|---|---|---|
+| Processo della scheda ucciso dopo 2 parti, poi nuova scheda e stesso file | avviso di ripresa, tagli ripristinati, 2 parti saltate, ZIP **identico** (CRC) a un export completo | idem |
+| Ricaricamento a metà export | idem | idem |
+| Worker del motore chiuso a metà export | prima: UI ferma per sempre; ora errore dopo ~90 s attivi con «parti salvate», «Taglia e scarica» rifà solo le mancanti | idem |
+| Processo sospeso 30 s (SIGSTOP/SIGCONT, pagina nascosta) | riprende da solo, «Elaborazione ripresa», nessun falso timeout | idem |
+| App nascosta a riposo | motore terminato; export successivo corretto | idem |
+| File singoli (2 parti) e ricaricamento dopo la prima | si scarica solo la parte 2 | non applicabile (iPad usa lo ZIP) |
+| Safari in navigazione privata (contesto effimero) | — | export corretto; WebKit rifiuta i Blob in IndexedDB ⇒ niente ripresa, nessun avviso |
+
+Il primo tentativo di simulare il congelamento con `Page.setWebLifecycleState` non ha congelato
+nulla in headless (export finito durante il «freeze»): scartato a favore di SIGSTOP, che ferma
+davvero pagina e worker come fa il sistema. Suite: **220 test** (28 nuovi: store dei job con
+IndexedDB finto, impronte, scadenze, patch MEMFS, consegna senza copia e ripieghi, ZIP da Blob).
+
 ## Limiti e prove ancora necessarie
 
-1. **Safari/WebKit e dispositivi fisici non sono stati testati.** L’emulazione iPhone in Chrome
-   non valida jetsam iOS, limiti RAM della tab, decoder Safari, background/screen lock o cambio rete
-   reale. Nessuna garanzia universale di export 500 MiB su Android economici o vecchi iPhone.
+1. **Dispositivi fisici non sono stati testati.** Dal 12 novembre 2026 i flussi tablet girano anche
+   in WebKit emulato (Playwright), ma l’emulazione non valida jetsam iOS, limiti RAM reali della tab,
+   decoder Safari, quota IndexedDB per Blob da centinaia di MB su iPad, Samsung Internet (non Chrome),
+   background/screen lock reali o cambio rete. Nessuna garanzia universale di export 500 MiB su
+   Android economici o vecchi iPhone.
 2. WORKERFS limita le copie dell’input, ma codec, demuxer e heap WASM possono comunque avere
    picchi elevati. Il limite output non è un limite assoluto del processo. FFmpeg.wasm documenta
    inoltre un limite massimo di 2 GB; non è stato aumentato. [FAQ FFmpeg.wasm](https://ffmpegwasm.netlify.app/docs/faq/).
@@ -252,6 +317,12 @@ e la race finale della cleanup. Nessuna riscrittura di FFmpeg, waveform o storag
 7. Non sono stati raccolti heap snapshot completi né eseguiti soak test di ore. Test deterministici
    coprono teardown e richieste tardive, ma non equivalgono a provare ogni leak su hardware reale.
    L’ErrorBoundary non può intercettare la terminazione della tab da parte del sistema operativo.
+8. **Il lavoro in secondo piano resta sospeso dal sistema** (iPadOS, Chrome Android): l’export riprende
+   al ritorno o, se la scheda è stata chiusa, dalle parti salvate. Ripresa non disponibile in Safari
+   privato, per lavori stimati sotto 15 s, per destinazioni su disco (cartella/ZIP su file) e per
+   pulizia/analisi dei silenzi. Va riaperto lo stesso file (nome, dimensione, data, durata): la
+   riapertura da «Progetti salvati» non è stata verificata. Le chiamate al motore di pulizia e analisi
+   non hanno ancora la scadenza aggiunta all’export.
 
 ## Ripetere le prove
 
@@ -267,6 +338,14 @@ In un altro terminale, con Chrome e Playwright disponibili:
 AUDIO_CUTTER_PLAYWRIGHT=/percorso/assoluto/playwright \
 AUDIO_CUTTER_EXPORT=1 AUDIO_CUTTER_DISK=1 AUDIO_CUTTER_RSS=1 \
 node scripts/performance-audit.mjs
+```
+
+Interruzioni su tablet emulati (kill, reload, crash del worker, sospensione, rilascio a riposo,
+file singoli), stessa build in preview:
+
+```bash
+AUDIO_CUTTER_PLAYWRIGHT=/percorso/assoluto/playwright \
+AUDIO_CUTTER_URL=http://localhost:4173/ node scripts/tablet-interruption-audit.mjs
 ```
 
 Playwright è uno strumento di test, non una nuova dipendenza runtime. Variabili opzionali:

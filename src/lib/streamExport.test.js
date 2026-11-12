@@ -219,3 +219,20 @@ test('folder cancellation rejects a stalled write before the sink completes',asy
  const outcome=await Promise.race([pending.then(()=> 'success',()=> 'aborted'),new Promise(r=>setTimeout(()=>r('pending'),50))]);
  releaseWrite?.();assert.equal(outcome,'aborted');assert.equal(committed,false);
 });
+
+test('ZIP accepts saved parts as Blob next to fresh Uint8Array parts', async () => {
+  const { createZipBlobWriter } = await import('./streamExport.js');
+  const { ZipReader, BlobReader, Uint8ArrayWriter } = await import('@zip.js/zip.js');
+  const writer = await createZipBlobWriter();
+  const saved = new Uint8Array(300_000).map((_, index) => index % 7);
+  const fresh = new Uint8Array([9, 8, 7]);
+  await writer.add('parte-1.m4a', new Blob([saved]));
+  await writer.add('parte-2.m4a', fresh);
+  const zip = await writer.close();
+  const reader = new ZipReader(new BlobReader(zip));
+  const entries = await reader.getEntries();
+  assert.deepEqual(entries.map((entry) => entry.filename), ['parte-1.m4a', 'parte-2.m4a']);
+  assert.deepEqual(await entries[0].getData(new Uint8ArrayWriter()), saved);
+  assert.deepEqual(await entries[1].getData(new Uint8ArrayWriter()), fresh);
+  await reader.close();
+});

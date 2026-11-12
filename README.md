@@ -45,6 +45,19 @@ Web app statica per tagliare file audio direttamente nel browser, senza ri-uploa
   il passaggio alla forma d'onda avviene alla prima pausa, dalla stessa posizione
 - **niente falsi "motore bloccato"**: le scadenze di export, analisi e download del motore contano
   solo il tempo in cui la pagina è attiva (cambiare app o bloccare lo schermo non fa fallire nulla)
+- **export riprendibili su telefoni e tablet**: in secondo piano iPadOS sospende Safari in pochi
+  secondi e Chrome Android congela pagina e worker (nessuna API web lo impedisce). Per questo ogni
+  parte pronta di uno ZIP viene salvata in IndexedDB e i file singoli già scaricati vengono annotati:
+  se il sistema chiude la scheda o il motore si ferma, «Taglia e scarica» con lo stesso file e gli
+  stessi tagli crea solo le parti mancanti (riaprendo il file, tagli e impostazioni tornano da soli).
+  A riposo, con l’app in secondo piano, il motore viene liberato per ridurre il rischio di chiusura.
+  Desktop invariato
+- **motore mobile con meno copie**: su telefoni e tablet il worker FFmpeg preassegna l’uscita alla
+  dimensione prevista e la consegna per trasferimento, senza copia. Nelle prove emulate, taglio senza
+  ricodifica: Galaxy Tab −14% di tempo e −12% di picco, iPad (WebKit) −14% di picco; le conversioni
+  restano limitate dalla CPU. Si attiva solo dopo un controllo e ripiega sul worker originale
+- **nessuna attesa infinita**: se il worker del motore muore tra un comando e l’altro, l’export si
+  ferma con un messaggio dopo 90 s di tempo attivo invece di restare bloccato
 - **ogni azione ha un riscontro**: avvisi fissi in alto per errori (restano finché non li chiudi) e
   conferme (tagli e segnalibri con «Annulla», fine export e operazioni); dopo l'export l'app dice
   dove trovare i file sul tuo dispositivo; su Android le parti arrivano come file separati, su

@@ -2,10 +2,12 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import ffmpegCoreUrl from '@ffmpeg/core?url';
 import ffmpegWasmUrl from '@ffmpeg/core/wasm?url';
-import { shouldPreloadEngine } from '../lib/device.js';
+import mobileWorkerUrl from '../workers/ffmpegMobileWorker.js?worker&url';
+import { isMobileDevice, shouldPreloadEngine } from '../lib/device.js';
 import { isFfmpegProgressLine } from '../lib/progress.js';
 import { downloadEngineWasm } from '../lib/engineDownload.js';
-import { withActiveTimeout } from '../lib/activityWatch.js';
+import { createActivityWatch, withActiveTimeout } from '../lib/activityWatch.js';
+import { PING_TYPE, PONG_TYPE } from '../lib/outputTransfer.js';
 
 // Peso esatto del wasm, iniettato a build time (vite.config.js): serve per una %
 // corretta anche quando il server comprime la risposta (content-length ≠ bytes letti).
@@ -127,6 +129,61 @@ function withTimeout(promise, ms, message) {
 
 const IDLE_ENGINE = { phase: 'idle', loaded: 0, total: 0, startedAt: 0, error: '' };
 
+// Worker mobile (uscite senza copie, vedi lib/outputTransfer.js): prima di
+// usarlo si verifica che parta e risponda. La libreria non intercetta gli
+// errori di avvio del worker: senza sonda un problema costerebbe minuti di
+// attesa. Esito ricordato per la sessione; in caso di dubbio, worker originale.
+const MOBILE_WORKER_PROBE_MS = 10000;
+let mobileWorkerProbe = null;
+
+function absoluteWorkerUrl() {
+  return absoluteUrl(mobileWorkerUrl);
+}
+
+function probeMobileWorker() {
+  if (!mobileWorkerProbe) {
+    mobileWorkerProbe = new Promise((resolve) => {
+      let worker = null;
+      let watch = null;
+      let settled = false;
+      const finish = (ok) => {
+        if (settled) return;
+        settled = true;
+        watch?.stop();
+        try {
+          worker?.terminate();
+        } catch {
+          // ignore
+        }
+        resolve(ok);
+      };
+      try {
+        worker = new Worker(absoluteWorkerUrl(), { type: 'module' });
+      } catch {
+        finish(false);
+        return;
+      }
+      worker.onmessage = ({ data }) => finish(data?.type === PONG_TYPE);
+      worker.onerror = () => finish(false);
+      worker.onmessageerror = () => finish(false);
+      watch = createActivityWatch({ limitMs: MOBILE_WORKER_PROBE_MS, onExpire: () => finish(false) });
+      try {
+        worker.postMessage({ id: -1, type: PING_TYPE });
+      } catch {
+        finish(false);
+      }
+    });
+  }
+  return mobileWorkerProbe;
+}
+
+/** Config di load(): worker mobile solo se richiesto e verificato. */
+function engineLoadConfig(instance, wasmURL) {
+  return instance.acOutputTransfer
+    ? { coreURL: ffmpegCoreUrl, wasmURL, classWorkerURL: absoluteWorkerUrl() }
+    : { coreURL: ffmpegCoreUrl, wasmURL };
+}
+
 /**
  * Motore FFmpeg condiviso con stato osservabile:
  * engineInfo.phase = idle | downloading | compiling | ready | error,
@@ -195,6 +252,9 @@ export function useFfmpegEngine() {
         }
       };
       loadPromiseRef.current = (async () => {
+        // Telefoni/tablet: sonda del worker con uscite senza copie, in
+        // parallelo al download o alla lettura dalla cache. Desktop invariato.
+        const workerProbe = isMobileDevice() ? probeMobileWorker() : Promise.resolve(false);
         // Download anticipato in corso (mobile): lo si aspetta invece di
         // raddoppiarlo. La barra continua a mostrare i suoi byte reali.
         if (prefetchRef.current) {
@@ -230,20 +290,31 @@ export function useFfmpegEngine() {
           publish({ phase: 'compiling', loaded: blob.size, total: blob.size, startedAt, error: '' });
         }
         assertCurrent();
+        instance.acOutputTransfer = await workerProbe;
+        assertCurrent();
         try {
           await withTimeout(
-            instance.load({ coreURL: ffmpegCoreUrl, wasmURL: wasmUrl }),
+            instance.load(engineLoadConfig(instance, wasmUrl)),
             ENGINE_LOAD_TIMEOUT_MS,
             'Il motore non risponde (memoria insufficiente?). Chiudi altre schede e riprova.',
           );
         } catch (loadError) {
+          const usedMobileWorker = Boolean(instance.acOutputTransfer);
+          const corrupt = isCorruptEngineError(loadError);
           // Timeout = worker morto (OOM): un secondo tentativo costerebbe altri minuti.
-          if (loadError?.isTimeout || (!isCorruptEngineError(loadError) && !blobUrl)) {
+          if (loadError?.isTimeout || (!corrupt && !blobUrl && !usedMobileWorker)) {
             throw loadError;
           }
+          // Il worker mobile non ha caricato il core: da qui in poi, per tutta
+          // la sessione, worker originale.
+          if (usedMobileWorker) {
+            mobileWorkerProbe = Promise.resolve(false);
+          }
           // Cache avvelenata o Blob rifiutato: purga e riprova UNA volta da rete/statico.
-          await purgeWasmCaches();
-          cachedRef.current = false;
+          if (corrupt || blobUrl) {
+            await purgeWasmCaches();
+            cachedRef.current = false;
+          }
           try {
             instance.terminate();
           } catch {
@@ -251,9 +322,10 @@ export function useFfmpegEngine() {
           }
           assertCurrent();
           const fresh = createInstance();
+          fresh.acOutputTransfer = false;
           ffmpegRef.current = fresh;
           await withTimeout(
-            fresh.load({ coreURL: ffmpegCoreUrl, wasmURL: ffmpegWasmUrl }),
+            fresh.load(engineLoadConfig(fresh, ffmpegWasmUrl)),
             ENGINE_LOAD_TIMEOUT_MS,
             'Il motore non risponde (memoria insufficiente?). Chiudi altre schede e riprova.',
           );
@@ -447,6 +519,28 @@ export function useFfmpegEngine() {
     setEngineInfo({ ...IDLE_ENGINE, cached: cachedRef.current });
   }, []);
 
+  /**
+   * Libera worker e memoria wasm di un motore pronto e inattivo (telefoni e
+   * tablet quando l'app va in secondo piano): una scheda leggera è molto meno
+   * esposta alla chiusura da parte del sistema. Il prossimo uso lo ricompila
+   * dalla cache. Non tocca un caricamento in corso. true = rilasciato.
+   */
+  const releaseIdleEngine = useCallback(() => {
+    const current = ffmpegRef.current;
+    if (!current?.loaded || loadPromiseRef.current) {
+      return false;
+    }
+    generationRef.current += 1;
+    try {
+      current.terminate();
+    } catch {
+      // ignore
+    }
+    ffmpegRef.current = null;
+    setEngineInfo({ ...IDLE_ENGINE, cached: cachedRef.current });
+    return true;
+  }, []);
+
   return {
     ffmpegRef,
     engineInfo,
@@ -455,6 +549,7 @@ export function useFfmpegEngine() {
     ensureReady,
     prefetchEngine,
     resetAfterAbort,
+    releaseIdleEngine,
   };
 }
 

@@ -183,7 +183,7 @@ function sanitizeEntryName(name) {
  * L'audio è già compresso: usa STORE (level 0), nessun retry dopo errori.
  */
 export async function createZipStreamWriter(writable, { signal } = {}) {
-  const { ZipWriter, Uint8ArrayReader } = await import('@zip.js/zip.js');
+  const { ZipWriter, Uint8ArrayReader, BlobReader } = await import('@zip.js/zip.js');
   const controller = new AbortController();
   const sink = writable.getWriter();
   let settled = false;
@@ -213,9 +213,14 @@ export async function createZipStreamWriter(writable, { signal } = {}) {
   const writer = new ZipWriter(relay, { level: 0, bufferedWrite: false, signal: controller.signal });
   const detach = () => signal?.removeEventListener('abort', cancel);
   return {
-    async add(name, uint8Data) {
+    // Uint8Array (parte appena prodotta) oppure Blob (parte salvata per la
+    // ripresa: letta a blocchi, senza ricaricarla tutta in memoria).
+    async add(name, data) {
       controller.signal.throwIfAborted();
-      await writer.add(sanitizeEntryName(name), new Uint8ArrayReader(uint8Data));
+      const reader = typeof Blob !== 'undefined' && data instanceof Blob
+        ? new BlobReader(data)
+        : new Uint8ArrayReader(data);
+      await writer.add(sanitizeEntryName(name), reader);
       controller.signal.throwIfAborted();
     },
     async close() {

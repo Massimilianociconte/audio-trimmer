@@ -91,7 +91,16 @@ import {
   shouldWarmEngineInBackground,
   waveformSampleRate,
 } from './lib/device.js';
-import { assertOutputBudget, outputMemoryPolicy, mountAudioInput, readAudioOutput } from './lib/memoryPolicy.js';
+import { assertOutputBudget, hintOutputBytes, outputMemoryPolicy, mountAudioInput, readAudioOutput } from './lib/memoryPolicy.js';
+import {
+  completedParts,
+  createExportJobStore,
+  exportJobFingerprint,
+  exportPersistenceMode,
+  hasStorageRoomFor,
+  sameSource,
+} from './lib/exportJobs.js';
+import { withActiveTimeout } from './lib/activityWatch.js';
 import { hardResetApp } from './lib/cacheReset.js';
 import { splitMessage } from './lib/messages.js';
 import { computeWaveformPeaks } from './lib/peaks.js';
@@ -189,6 +198,26 @@ function getFormatLabel(file, extension) {
   return 'audio';
 }
 
+// Un worker che muore tra un comando e l'altro non avvisa: le sue promesse
+// resterebbero in attesa per sempre (UI ferma). Ogni richiesta al motore fuori
+// da exec (che ha già il suo controllo di inattività) ha quindi una scadenza in
+// tempo ATTIVO; scaduta, il motore viene chiuso e ricreato al prossimo uso.
+const ENGINE_CALL_TIMEOUT_MS = 90000;
+
+async function engineCall(ffmpeg, promise) {
+  try {
+    return await withActiveTimeout(
+      promise,
+      ENGINE_CALL_TIMEOUT_MS,
+      'Il motore ha smesso di rispondere (probabilmente memoria piena): riprova, verrà riavviato.',
+    );
+  } catch (error) {
+    if (error?.isTimeout) {
+      try { ffmpeg?.terminate(); } catch { /* già chiuso */ }
+    }
+    throw error;
+  }
+}
 
 function downloadBlob(blob, filename) {
   const url = URL.createObjectURL(blob);
@@ -312,11 +341,22 @@ export default function App() {
     ensureReady: ensureEngineReady,
     prefetchEngine,
     resetAfterAbort,
+    releaseIdleEngine,
   } = useFfmpegEngine();
 
   const [statusText, setStatusText] = useState(INITIAL_MESSAGE);
   // Testi "tocca"/"clicca" e scorciatoie da tastiera secondo il dispositivo.
   const touchUi = useMemo(() => isMobileDevice(), []);
+  // Export riprendibili (solo telefoni/tablet, vedi lib/exportJobs.js).
+  const exportJobStoreRef = useRef(null);
+  const getExportJobStore = useCallback(() => {
+    if (!exportJobStoreRef.current) {
+      exportJobStoreRef.current = createExportJobStore();
+    }
+    return exportJobStoreRef.current;
+  }, []);
+  // Export interrotto da una chiusura della scheda, in attesa dello stesso file.
+  const pendingJobRef = useRef(null);
   const exportButtonRef = useRef(null);
   const [exportButtonInView, setExportButtonInView] = useState(false);
   const summaryStackRef = useRef(null);
@@ -657,6 +697,39 @@ export default function App() {
     };
   }, []);
 
+  /**
+   * Stesso file di un export interrotto (scheda chiusa dal sistema): tornano
+   * tagli e impostazioni audio di allora, così l'impronta del lavoro coincide
+   * e «Taglia e scarica» riusa le parti già pronte. Ritorna il job o null.
+   */
+  function restoreInterruptedJob(nextAudio) {
+    const job = pendingJobRef.current;
+    if (!job || !sameSource(job.source, nextAudio)) {
+      return null;
+    }
+    const ui = job.ui ?? {};
+    if (ui.mode === 'custom' && Array.isArray(ui.customCuts) && ui.customCuts.length > 0) {
+      setMode('custom');
+      setCustomCuts(ui.customCuts.map((cut) => ({
+        id: createPointId(),
+        value: String(cut?.value ?? ''),
+        position: typeof cut?.position === 'number' && Number.isFinite(cut.position) ? cut.position : null,
+      })));
+    } else if (Number.isInteger(ui.equalParts) && ui.equalParts >= 2) {
+      setMode('equal');
+      setEqualParts(ui.equalParts);
+    } else {
+      return null;
+    }
+    if (typeof ui.exportFormat === 'string') setExportFormat(getExportFormat(ui.exportFormat).id);
+    if (typeof ui.exportBitrate === 'number' && ui.exportBitrate > 0) setExportBitrate(ui.exportBitrate);
+    setFastCopy(Boolean(ui.fastCopy) && Boolean(naturalCopyFormat(nextAudio.extension)));
+    if (typeof ui.fadeSeconds === 'number' && ui.fadeSeconds >= 0) setFadeSeconds(Math.min(2, ui.fadeSeconds));
+    if (ui.segmentNames && typeof ui.segmentNames === 'object') setSegmentNames(ui.segmentNames);
+    if (typeof ui.baseNameOverride === 'string') setBaseNameOverride(ui.baseNameOverride);
+    return job;
+  }
+
   async function analyzeFile(file) {
     if (!file) {
       return false;
@@ -838,6 +911,21 @@ export default function App() {
         }
         return null;
       });
+
+      const resumedJob = touchUi ? restoreInterruptedJob(nextAudio) : null;
+      if (resumedJob) {
+        const done = completedParts(resumedJob).length;
+        const total = Number(resumedJob.total) || done;
+        setResumeNotice(
+          `Tagli e impostazioni dell’export interrotto ripristinati: ${done} di ${total} parti sono già pronte. Premi «Taglia e scarica» per completare.`,
+        );
+        notify({
+          kind: 'success',
+          title: 'Export ripristinato',
+          detail: `${done} di ${total} parti già pronte: «Taglia e scarica» crea solo quelle mancanti.`,
+          duration: 7000,
+        });
+      }
 
       setStatusText(
         browserDurationOk
@@ -1473,7 +1561,8 @@ export default function App() {
   // Avviso di ripresa se un export precedente è stato interrotto.
   useEffect(() => {
     const checkpoint = readCheckpoint();
-    if (checkpoint && checkpoint.total >= 2) {
+    const showCheckpointNotice = () => {
+      if (!checkpoint || !(checkpoint.total >= 2)) return;
       const done = checkpoint.doneCount ?? checkpoint.doneNames?.length ?? 0;
       // Il browser ha chiuso la pagina durante un export (quasi sempre memoria
       // piena su telefono/tablet): lo si dice subito, con cosa fare.
@@ -1492,8 +1581,52 @@ export default function App() {
       if (checkpoint.destMode !== 'folder') {
         clearCheckpoint();
       }
+    };
+    if (!touchUi) {
+      showCheckpointNotice();
+      return undefined;
     }
-  }, [notify]);
+    // Telefoni/tablet: se le parti pronte sono salvate, l'avviso dice come
+    // riprendere davvero (stesso file → tagli ripristinati → parti saltate).
+    let cancelled = false;
+    getExportJobStore().getPending().then(async (job) => {
+      if (cancelled) return;
+      // Niente da riprendere (nessuna parte salvata, es. Safari in navigazione
+      // privata che rifiuta i Blob in IndexedDB) o audio ripulito: avviso classico.
+      if (!job || job.ui?.cleaned || completedParts(job).length === 0) {
+        if (job) await getExportJobStore().discard();
+        showCheckpointNotice();
+        return;
+      }
+      pendingJobRef.current = job;
+      if (checkpoint?.destMode !== 'folder') clearCheckpoint();
+      const done = completedParts(job).length;
+      const total = Number(job.total) || done;
+      const name = job.source?.name || 'audio';
+      const where = job.persist === 'delivery' ? 'sono già nella cartella Download' : 'sono salvate su questo dispositivo';
+      const next = done > 0 ? `riparte dalla parte ${Math.min(total, done + 1)}` : 'riparte da capo';
+      setResumeNotice(
+        `Export interrotto (${done} di ${total} parti pronte). Riapri «${name}»: tagli e impostazioni tornano come prima e «Taglia e scarica» ${next}.`,
+      );
+      notify({
+        kind: 'info',
+        title: 'Export interrotto: puoi riprenderlo',
+        detail: `${done} di ${total} parti di «${name}» ${where}. Riapri lo stesso file: tagli e impostazioni tornano come prima e «Taglia e scarica» ${next}.`,
+        action: {
+          label: 'Elimina parti salvate',
+          onClick: () => {
+            pendingJobRef.current = null;
+            setResumeNotice('');
+            getExportJobStore().discard();
+          },
+        },
+        duration: 0,
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [notify, touchUi, getExportJobStore]);
 
   // Wake lock + avviso uscita durante QUALUNQUE elaborazione lunga (export,
   // pulizia, silenzi, download motore): lo schermo spento sospende la tab.
@@ -1511,6 +1644,43 @@ export default function App() {
     window.addEventListener('beforeunload', handler);
     return () => window.removeEventListener('beforeunload', handler);
   }, [isExporting, task]);
+
+  // Telefoni/tablet in secondo piano. Nessuna API web garantisce che il
+  // lavoro continui (iPadOS sospende Safari in pochi secondi, Chrome Android
+  // congela pagina e worker): a riposo si libera subito la memoria del motore,
+  // così il sistema chiude la scheda molto più di rado; durante un lavoro, al
+  // ritorno si dice che è ripreso (export e analisi contano solo il tempo attivo).
+  const longWorkRef = useRef(false);
+  longWorkRef.current = longWorkActive;
+  useEffect(() => {
+    if (!touchUi) {
+      return undefined;
+    }
+    let hiddenAt = 0;
+    let hiddenDuringWork = false;
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        hiddenAt = Date.now();
+        hiddenDuringWork = longWorkRef.current;
+        if (!isBusyRef.current && !waveformDecodePendingRef.current && !isRecorderBusyRef.current && releaseIdleEngine()) {
+          mountRef.current = { ffmpeg: null, blob: null, dir: '', path: '', memfs: false };
+        }
+        return;
+      }
+      const away = hiddenAt ? Date.now() - hiddenAt : 0;
+      hiddenAt = 0;
+      if (hiddenDuringWork && longWorkRef.current && away >= 3000) {
+        notify({
+          kind: 'info',
+          title: 'Elaborazione ripresa',
+          detail: 'Con l’app in secondo piano il sistema mette in pausa il lavoro: ora continua da dove era arrivato.',
+          duration: 5000,
+        });
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => document.removeEventListener('visibilitychange', onVisibility);
+  }, [touchUi, releaseIdleEngine, notify]);
 
   // Motore in background appena il file è pronto (e la forma d'onda ha finito
   // di decodificare, per non sommare i picchi di memoria): quando l'utente
@@ -2968,6 +3138,51 @@ export default function App() {
           : 'come file singoli';
     setStatusText(`Creo ${jobSegments.length} parti in ${modeLabel} ${destLabel}…`);
 
+    // Telefoni/tablet: ogni parte pronta viene salvata (ZIP) o segnata come
+    // scaricata (file singoli). Se il sistema chiude la scheda in background o
+    // il motore si ferma, «Taglia e scarica» riparte dalla prima parte mancante.
+    // Desktop: nessun salvataggio, flusso invariato.
+    const estimatedWorkSeconds = totalSeconds / expectedSpeed(speedKey).speed + jobSegments.length * 0.15;
+    const persistMode = exportPersistenceMode({ mobile: touchUi, destMode, estimatedWorkSeconds });
+    const jobStore = persistMode ? getExportJobStore() : null;
+    const jobReady = persistMode
+      ? (async () => {
+        if (persistMode === 'blobs' && !(await hasStorageRoomFor(totalEstimate))) return null;
+        return jobStore.begin({
+          fingerprint: exportJobFingerprint({
+            source: jobAudio,
+            segments: jobSegments,
+            formatId: jobFormatId,
+            bitrateKbps: jobBitrate,
+            fastCopy: jobFastCopy,
+            fadeSeconds: jobFade,
+            outputExtension,
+          }),
+          persist: persistMode,
+          source: jobAudio,
+          ui: {
+            mode,
+            equalParts,
+            customCuts: customCuts.map((cut) => ({ value: cut.value, position: cut.position ?? null })),
+            exportFormat,
+            exportBitrate,
+            fastCopy,
+            fadeSeconds,
+            segmentNames,
+            baseNameOverride,
+            cleaned: Boolean(appliedCleanup),
+          },
+          settings: { formatId: jobFormatId, bitrateKbps: jobBitrate, fastCopy: jobFastCopy, fadeSeconds: jobFade, outputExtension },
+          names: jobNames,
+          total: jobSegments.length,
+          destMode,
+        });
+      })().catch(() => null)
+      : Promise.resolve(null);
+    pendingJobRef.current = null;
+    let persistedJob = null;
+    let savedPartCount = 0;
+
     const runPrefix = `segment-${Date.now()}`;
     let ffmpeg = null;
     const createdVirtualNames = [];
@@ -2986,6 +3201,9 @@ export default function App() {
       exportStageRef.current = 'segments';
       const inputPath = await ensureInputMounted(ffmpeg, jobAudio);
       if (exportAbortRef.current) throw new Error('Export annullato.');
+      persistedJob = await Promise.race([jobReady, gate.promise]);
+      if (exportAbortRef.current) throw new Error('Export annullato.');
+      savedPartCount = completedParts(persistedJob).length;
       if (destMode === 'zip-stream') {
         zipWritable = await zipFileHandle.createWritable();
         zipWriter = await createZipStreamWriter(zipWritable, { signal: ioAbort.signal });
@@ -3068,6 +3286,33 @@ export default function App() {
           }
         }
 
+        // Ripresa (telefoni/tablet): parte già scaricata in un tentativo
+        // precedente → non si riscarica; parte salvata → entra nello ZIP
+        // senza passare dal motore.
+        const previousPart = persistedJob?.done?.[index];
+        if (previousPart?.delivered && persistMode === 'delivery') {
+          exportedParts.push({ name: downloadName, size: previousPart.size || 0, duration: segment.duration, skipped: true });
+          partStates[index] = 'skipped';
+          doneSeconds += segment.duration;
+          publish(index, 0, 0, true);
+          await yieldToUI();
+          continue;
+        }
+        if (previousPart?.stored && persistMode === 'blobs' && zipWriter) {
+          const savedBlob = await jobStore.loadPart(persistedJob.id, index);
+          if (exportAbortRef.current) throw new Error('Export annullato.');
+          if (savedBlob && !(destMode === 'zip-classic' && bytesDone + savedBlob.size > memoryBudget.archiveBytes)) {
+            await zipWriter.add(downloadName, savedBlob);
+            exportedParts.push({ name: downloadName, size: savedBlob.size, duration: segment.duration, skipped: true });
+            bytesDone += savedBlob.size;
+            partStates[index] = 'skipped';
+            doneSeconds += segment.duration;
+            publish(index, 0, 0, true);
+            await yieldToUI();
+            continue;
+          }
+        }
+
         const args = buildExportArgs({
           segment,
           inputName: inputPath,
@@ -3077,6 +3322,24 @@ export default function App() {
           fastCopy: jobFastCopy,
           fadeSeconds: jobFade,
         });
+
+        // Motore mobile: dimensione prevista dell'uscita (un'allocazione sola
+        // invece di decine). Nessun effetto sul motore desktop.
+        try {
+          await engineCall(ffmpeg, hintOutputBytes(
+            ffmpeg,
+            virtualName,
+            jobFastCopy
+              ? jobAudio.size * segment.duration / Math.max(0.001, jobAudio.duration || segment.duration)
+              : estimateExportBytes({ durationSeconds: segment.duration, bitrateKbps: jobBitrate, formatId: jobFormatId }),
+            memoryBudget.segmentBytes,
+          ));
+        } catch (hintError) {
+          if (!hintError?.isTimeout) throw hintError;
+          engineCrashed = true;
+          hintError.failedIndex = index;
+          throw hintError;
+        }
 
         // Avanzamento intra-segmento reale (secondi di output scritti da ffmpeg).
         let result;
@@ -3116,23 +3379,50 @@ export default function App() {
           throw failed;
         }
 
-        let outputData = await readAudioOutput(ffmpeg, virtualName);
-        // Libera SUBITO il segmento dalla memoria wasm: mai più di uno in RAM.
-        await safeDelete(ffmpeg, virtualName);
+        let outputData;
+        try {
+          outputData = await engineCall(ffmpeg, readAudioOutput(ffmpeg, virtualName));
+          // Libera SUBITO il segmento dalla memoria wasm: mai più di uno in RAM.
+          await engineCall(ffmpeg, safeDelete(ffmpeg, virtualName));
+        } catch (readError) {
+          if (readError?.isTimeout) {
+            engineCrashed = true;
+            readError.failedIndex = index;
+          }
+          throw readError;
+        }
         createdVirtualNames.pop();
+        const outputBytes = outputData.length;
 
         if (exportAbortRef.current) throw new Error('Export annullato.');
-        if (destMode === 'zip-classic' && bytesDone + outputData.length > memoryBudget.archiveBytes) {
+        if (destMode === 'zip-classic' && bytesDone + outputBytes > memoryBudget.archiveBytes) {
           throw new Error('Il risultato supera il budget dello ZIP in memoria. Usa cartella/ZIP su disco o riduci la durata/il bitrate.');
         }
         if (destMode === 'folder') {
           const fileHandle = await dirHandle.getFileHandle(downloadName, { create: true });
           // Scrittura diretta dei byte: niente Blob intermedio da ~1 segmento.
           await writeBlobToFileHandle(fileHandle, outputData, { signal: ioAbort.signal });
-          exportedParts.push({ name: downloadName, size: outputData.length, duration: segment.duration });
+          exportedParts.push({ name: downloadName, size: outputBytes, duration: segment.duration });
+        } else if ((destMode === 'zip-stream' || destMode === 'zip-classic') && persistMode === 'blobs' && persistedJob) {
+          // Una sola copia viva: i byte diventano il Blob salvato e lo ZIP lo
+          // legge a blocchi da lì.
+          let partBlob = new Blob([outputData], { type: format.mime });
+          outputData = null;
+          const saved = await jobStore.savePart(persistedJob.id, index, {
+            blob: partBlob,
+            name: downloadName,
+            size: outputBytes,
+            duration: segment.duration,
+          });
+          if (saved) savedPartCount += 1;
+          else persistedJob = null;
+          if (exportAbortRef.current) throw new Error('Export annullato.');
+          await zipWriter.add(downloadName, partBlob);
+          partBlob = null;
+          exportedParts.push({ name: downloadName, size: outputBytes, duration: segment.duration });
         } else if (destMode === 'zip-stream' || destMode === 'zip-classic') {
           await zipWriter.add(downloadName, outputData);
-          exportedParts.push({ name: downloadName, size: outputData.length, duration: segment.duration });
+          exportedParts.push({ name: downloadName, size: outputBytes, duration: segment.duration });
         } else {
           const blob = new Blob([outputData], { type: format.mime });
           let url = null;
@@ -3148,9 +3438,19 @@ export default function App() {
             ...(url ? { url, blob } : {}),
           });
           downloadBlob(blob, downloadName);
+          if (persistMode === 'delivery' && persistedJob) {
+            const saved = await jobStore.savePart(persistedJob.id, index, {
+              name: downloadName,
+              size: outputBytes,
+              duration: segment.duration,
+              delivered: true,
+            });
+            if (saved) savedPartCount += 1;
+            else persistedJob = null;
+          }
         }
 
-        bytesDone += outputData.length;
+        bytesDone += outputBytes;
         outputData = null;
         doneSeconds += segment.duration;
         workedSeconds += segment.duration;
@@ -3209,6 +3509,8 @@ export default function App() {
 
       if (exportAbortRef.current) throw new Error('Export annullato.');
       clearCheckpoint();
+      // Export completo: le parti salvate per la ripresa non servono più.
+      if (persistMode) jobStore.discard();
       const elapsedLabel = formatDurationShort((Date.now() - startedAt) / 1000);
       setLastResult({
         archiveName: destMode === 'folder'
@@ -3258,6 +3560,8 @@ export default function App() {
         clearCheckpoint();
       }
       if (cancelled) {
+        // Annullo esplicito: niente parti tenute da parte a sua insaputa.
+        if (persistMode) jobReady.then(() => jobStore.discard());
         setErrorText('');
         setFailedExportIndex(null);
         setStatusText('Export annullato. Puoi rilanciarlo quando vuoi.');
@@ -3265,7 +3569,11 @@ export default function App() {
         if (Number.isInteger(error?.failedIndex)) {
           setFailedExportIndex(error.failedIndex);
         }
-        setErrorText(failureMessage(error, 'Non sono riuscito a esportare le parti.'));
+        // Parti pronte salvate: il prossimo tentativo non le rifà.
+        const keptNote = persistedJob && savedPartCount > 0
+          ? ` ${savedPartCount === 1 ? 'La parte già pronta resta salvata' : `Le ${savedPartCount} parti già pronte restano salvate`}: premi di nuovo «Taglia e scarica» per creare solo quelle mancanti.`
+          : '';
+        setErrorText(`${failureMessage(error, 'Non sono riuscito a esportare le parti.')}${keptNote}`);
         setStatusText('Esportazione non completata.');
       }
     } finally {
@@ -3970,6 +4278,7 @@ export default function App() {
               onSkipExistingChange={setSkipExisting}
               advisorNote={advisorNote}
               wakeHeld={wakeHeld}
+              touchUi={touchUi}
               baseName={baseNameOverride}
               onBaseNameChange={setBaseNameOverride}
               segmentNames={segmentNames}

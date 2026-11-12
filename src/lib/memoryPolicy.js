@@ -1,8 +1,12 @@
 import { deviceMemoryGB } from './device.js';
+import { TAKE_ENCODING, outputHintPath, sanitizeHintBytes } from './outputTransfer.js';
 
 const MiB = 1024 * 1024;
 // Margine per header del container, bitrate variabile ed errore di stima.
 const OUTPUT_MARGIN = 1.15;
+// Preassegnazione: poco sopra la stima (moov/faststart, VBR). Se l'uscita la
+// supera, MEMFS riprende la crescita normale da lì.
+const OUTPUT_HINT_MARGIN = 1.03;
 
 /**
  * Requisito di prodotto: su QUALUNQUE dispositivo (telefono, tablet, desktop)
@@ -98,12 +102,45 @@ export async function mountAudioInput(ffmpeg, source, sequence, env = globalThis
   }
 }
 
+const OUTPUT_TOO_LARGE = 'Il risultato ha raggiunto il limite di memoria per parte. Aumenta il numero di parti o usa M4A/MP3 a bitrate più basso.';
+
+/**
+ * Solo motore mobile (vedi outputTransfer.js): comunica la dimensione
+ * prevista dell'uscita, così il worker alloca il buffer una volta sola.
+ * Best effort: false se non applicabile o non riuscito.
+ */
+export async function hintOutputBytes(ffmpeg, outputName, bytes, limit = outputMemoryPolicy().segmentBytes) {
+  if (!ffmpeg?.acOutputTransfer) return false;
+  const size = sanitizeHintBytes(Math.min(Number(bytes) * OUTPUT_HINT_MARGIN, limit));
+  if (!size) return false;
+  try {
+    await ffmpeg.writeFile(outputHintPath(outputName), new TextEncoder().encode(String(size)));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function readAudioOutput(ffmpeg, path, limit = outputMemoryPolicy().segmentBytes) {
+  if (ffmpeg?.acOutputTransfer) {
+    // Consegna senza copia: il worker trasferisce il buffer e rimuove il file.
+    // Qualunque problema → lettura classica qui sotto (il file è ancora lì).
+    let taken = null;
+    try {
+      taken = await ffmpeg.readFile(path, TAKE_ENCODING);
+    } catch {
+      taken = null;
+    }
+    if (taken instanceof Uint8Array) {
+      if (taken.byteLength >= limit) throw new Error(OUTPUT_TOO_LARGE);
+      return taken;
+    }
+  }
   try {
     const bytes = await ffmpeg.readFile(path);
     // -fs can exit successfully after truncating the file. Never offer it as success.
     if (bytes.byteLength >= limit) {
-      throw new Error('Il risultato ha raggiunto il limite di memoria per parte. Aumenta il numero di parti o usa M4A/MP3 a bitrate più basso.');
+      throw new Error(OUTPUT_TOO_LARGE);
     }
     return bytes;
   } finally {

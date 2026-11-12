@@ -265,7 +265,7 @@ const PART_STATE_LABEL = {
  * Barra di SCARICAMENTO/export: fase (motore → parti → finalizzazione),
  * parte i/N con stato per parte, % su secondi audio reali, velocità ×, ETA.
  */
-export function ExportProgressBar({ detail, engineInfo, wakeHeld, onCancel }) {
+export function ExportProgressBar({ detail, engineInfo, wakeHeld, touchUi = false, onCancel }) {
   const active = Boolean(detail?.active);
   const elapsed = useElapsedSeconds(detail?.startedAt, active);
   if (!active) {
@@ -321,9 +321,18 @@ export function ExportProgressBar({ detail, engineInfo, wakeHeld, onCancel }) {
         </ol>
       ) : null}
 
-      <p className="helper-text">
-        Puoi cambiare scheda: tieni questa aperta{wakeHeld ? ' (schermo tenuto acceso)' : ''}, il lavoro continua.
-      </p>
+      {touchUi ? (
+        // iPad e Android sospendono le pagine in secondo piano: nessuna API web
+        // garantisce che il lavoro continui. Le parti pronte restano salvate.
+        <p className="helper-text">
+          Tieni Audio Cutter in primo piano{wakeHeld ? ' (schermo tenuto acceso)' : ''}: se cambi app, iPad e Android
+          mettono in pausa il lavoro, che riprende quando torni. Le parti già pronte restano salvate.
+        </p>
+      ) : (
+        <p className="helper-text">
+          Puoi cambiare scheda: tieni questa aperta{wakeHeld ? ' (schermo tenuto acceso)' : ''}, il lavoro continua.
+        </p>
+      )}
 
       {onCancel ? (
         <button type="button" className="ghost-button ghost-danger" onClick={onCancel}>
