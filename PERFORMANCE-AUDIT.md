@@ -383,12 +383,55 @@ Chrome, loop senza scatti), dispositivi ammessi, stati della sessione e della no
 
 **Non verificabile qui:** il servizio in primo piano e il congelamento dei processi di Android, la
 gestione del focus audio di Samsung, «Sospendi app inutilizzate»/ottimizzazione batteria di One UI,
-velocità in background con CPU a frequenza ridotta. Va provato sul tablet.
+velocità in background con CPU a frequenza ridotta. Va provato sul tablet (fatto il 13 novembre,
+sezione seguente).
+
+## Prove sul Galaxy Tab S8 reale — 13 novembre 2026
+
+Tablet della persona che usa l’app (SM-X700, Android 16 / One UI 8.0, Chrome 157, Snapdragon 8 Gen 1
+con 4+3+1 core, 7,5 GB), collegato al Mac in debug USB. Regola: nessun file creato sul tablet, nessuna
+impostazione cambiata. Metodo: build di produzione servita dal Mac (`adb reverse`, origine
+`http://localhost:4173`, separata dal sito pubblicato); Chrome guidato via DevTools
+(`adb forward … localabstract:chrome_devtools_remote`) in una scheda di prova; audio letto in memoria
+dal Mac; tocchi veri (`Input.dispatchTouchEvent`) per l’attivazione utente; selettori sostituiti da
+handle dello storage privato del sito (stessa interfaccia, OPFS) e download intercettati; tasto Home
+con `adb shell input keyevent`; stato di Android letto con `dumpsys` (oom/processi congelati,
+servizi in primo piano, sessione multimediale, temperatura). A fine prove: schede di prova chiuse,
+dati dell’origine di prova cancellati, inoltri adb rimossi.
+
+**Cosa espone Chrome sul tablet:** `deviceMemory` 8, `hardwareConcurrency` 8 (due motori ammessi);
+`showSaveFilePicker` e `showDirectoryPicker` **presenti** (selettori veri di Android, DocumentsUI:
+aperti e annullati con «Indietro», `AbortError`). Le prove emulate «Galaxy Tab senza selettori»
+seguivano quindi un percorso diverso da quello reale (file singoli / ZIP in memoria).
+
+| Prova (M4A, app nascosta dopo 15–20 s) | Destinazione | Motori | Tempo | Note |
+|---|---|---|---|---|
+| 2 h → 4 parti, sempre visibile | ZIP su disco | 2 | 1 min 9 s | 109× tempo reale |
+| 4 h → 4 parti, nascosta 2 min 25 s | ZIP su disco | 2 | 2 min 38 s | ~90× nascosta, 114× visibile; finita da nascosta |
+| 4 h → 4 parti, **background spento**, nascosta 4 min | ZIP su disco | 2 | 6 min 8 s | 112× → ~27× appena nascosta, evento `freeze` dopo ~1 min, ferma al 21% fino al ritorno |
+| 8 h → 2 parti, nascosta 9 min (prima di questa versione) | cartella | 1 | 9 min 6 s | ~55×; notifica finale con l’esito |
+| 8 h → 2 parti, nascosta (ZIP su disco, un motore) | ZIP su disco | 1 | 9 min 17 s | stessa velocità della cartella |
+| **8 h → 2 parti, nascosta (questa versione)** | **ZIP su disco** | **2** | **5 min 55 s** | ~87× costanti da nascosta, −35% |
+
+Con il background acceso Chrome passa a servizio in primo piano
+(`ChromeMediaNotificationControllerServices$PlaybackListenerService`, `isForeground=true`, priorità
+«percepibile»), nessun processo congelato in nessun campione, timer della pagina senza buchi. A lavoro
+finito con l’app nascosta la notifica mostra «Taglio completato in … · N parti pronte»; al ritorno
+sparisce. Memoria (RSS a campioni): scheda ~340 MB (2 h, due motori), ~600 MB (8 h, un motore),
+~940 MB (8 h, due motori su parti da 4 h); nessuna chiusura forzata. Temperatura pelle massima
+38,6 °C, stato termico sempre 0. ZIP identico byte per byte con uno o due motori. Forma d’onda:
+~7,7 s per ora di audio (non blocca taglio ed export).
+
+Intervento conseguente: `.ai-harness/knowledge/decisions/2026-11-13-android-zip-su-disco.md`.
+
+Non verificato: scrittura nel «Download» vero (creerebbe file sul tablet), schermo spento/bloccato,
+musica di altre app durante il lavoro, risparmio energetico, background oltre 15 minuti, file letto
+dal disco del tablet invece che dalla memoria.
 
 ## Limiti e prove ancora necessarie
 
-1. **Dispositivi fisici non sono stati testati.** Dal 12 novembre 2026 i flussi tablet girano anche
-   in WebKit emulato (Playwright), ma l’emulazione non valida jetsam iOS, limiti RAM reali della tab,
+1. **Un solo dispositivo fisico testato**: il Galaxy Tab S8 con Chrome 157 (13 novembre 2026). Gli altri
+   flussi tablet girano in WebKit emulato (Playwright), ma l’emulazione non valida jetsam iOS, limiti RAM reali della tab,
    decoder Safari, quota IndexedDB per Blob da centinaia di MB su iPad, Samsung Internet (non Chrome),
    background/screen lock reali o cambio rete. Nessuna garanzia universale di export 500 MiB su
    Android economici o vecchi iPhone.
@@ -418,17 +461,21 @@ velocità in background con CPU a frequenza ridotta. Va provato sul tablet.
    pulizia/analisi dei silenzi. Va riaperto lo stesso file (nome, dimensione, data, durata): la
    riapertura da «Progetti salvati» non è stata verificata. Le chiamate al motore di pulizia e analisi
    non hanno ancora la scadenza aggiunta all’export.
-9. **Lavoro in background non provato su un tablet Android reale.** Le prove usano il codice di
-   congelamento di Chrome su macOS; il servizio in primo piano della notifica e il congelamento dei
-   processi di Android/One UI vanno verificati sul Galaxy Tab S8. Dipende da euristiche di Chrome che
-   Google può cambiare (in quel caso si torna a pausa e ripresa). Musica o video in altre app lo
-   fermano. Se un motore muore mentre l’app è nascosta, il ripiego scatta al ritorno (le scadenze
-   contano solo il tempo con la pagina visibile).
-10. **Due motori non provati su un Galaxy Tab S8 reale.** Da misurare: tempo effettivo (stima ~2×
-   solo se i due motori finiscono su core grandi), calo per calore su conversioni lunghe, memoria
-   della scheda con due motori, valore reale di `hardwareConcurrency`. Nessun guadagno con una sola
-   parte, nel taglio senza ricodifica e nella pulizia. Se il motore principale muore a metà comando,
-   resta il comportamento di sempre (errore dopo 90 s attivi, parti salvate tenute).
+9. **Lavoro in background provato sul Galaxy Tab S8 solo con app nascosta tramite Home** (fino a
+   9 minuti, sezione «Prove sul Galaxy Tab S8 reale»). Non provati: schermo spento o bloccato,
+   musica o video in altre app (lo fermano per progetto), risparmio energetico e «Sospendi app
+   inutilizzate» di One UI, periodi oltre 15 minuti. Dipende da euristiche di Chrome che Google può
+   cambiare (in quel caso si torna a pausa e ripresa). Se un motore muore mentre l’app è nascosta, il
+   ripiego scatta al ritorno (le scadenze contano solo il tempo con la pagina visibile).
+10. **Due motori sul Galaxy Tab S8:** misurati 1 min 9 s per 2 h → 4 parti e 5 min 55 s per 8 h → 2
+   parti (da nascosta), senza calo per calore in 6 minuti; scheda fino a ~940 MB. Non misurati:
+   conversioni di oltre 10 minuti e memoria quando altre app pesanti sono aperte. Nessun guadagno con
+   una sola parte, nel taglio senza ricodifica e nella pulizia. Se il motore principale muore a metà
+   comando, resta il comportamento di sempre (errore dopo 90 s attivi, parti salvate tenute).
+11. **ZIP su disco su Android non è riprendibile**: dal 13 novembre anche i lavori pesanti su Android
+   vanno nello ZIP su disco (prima: cartella, riprendibile riscegliendo la stessa cartella). Se la
+   scheda viene chiusa a metà, l’export riparte da capo. Le prove scrivono nello storage privato del
+   sito, non nel «Download» vero: la velocità di scrittura reale va confermata con un export vero.
 
 ## Ripetere le prove
 

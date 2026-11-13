@@ -56,8 +56,9 @@ Web app statica per tagliare file audio direttamente nel browser, senza ri-uploa
   30 Hz e −50 dBFS (per Chrome è audio udibile, sopra la soglia di −72 dBFS; per le orecchie e gli
   altoparlanti di tablet è nullo) e la notifica multimediale «Audio Cutter» mostra l’avanzamento. Così
   Chrome non congela pagina e worker dopo 1 minuto e Android tiene vivo il processo: si possono usare
-  altre app o spegnere lo schermo, più lentamente. Nelle prove su Chrome 156 con il congelamento di
-  Android attivo, export di 8 h nascosto: 4 parti su 4 create da nascosto (prima: 0 in 7 minuti).
+  altre app o spegnere lo schermo, più lentamente. Provato sul Galaxy Tab S8 vero (Chrome 157): con
+  l’app nascosta Chrome resta un servizio in primo piano, nessun processo congelato, ~85–90% della
+  velocità in primo piano; senza il tono la pagina rallenta di 4 volte e dopo ~1 minuto si ferma.
   Interruttore nel pannello di avanzamento; musica o video di altre app lo mettono in pausa («Riattiva»).
   iPad/iPhone e desktop invariati
 - **motore mobile con meno copie**: su telefoni e tablet il worker FFmpeg preassegna l’uscita alla
@@ -67,15 +68,20 @@ Web app statica per tagliare file audio direttamente nel browser, senza ri-uploa
 - **conversioni su due motori sui tablet Android capaci** (8 GB e 8 core dichiarati, es. Galaxy Tab S8):
   gli encoder audio usano un solo core, quindi con almeno 2 parti da convertire (M4A/MP3/OGG) un
   secondo motore prepara la parte successiva. Parti identiche byte per byte, consegna nello stesso
-  ordine; nelle prove emulate 2 h mp3 → m4a passa da 33 a 17 s (+30–230 MiB durante l’export).
+  ordine; sul Galaxy Tab S8 vero 2 h mp3 → 4 parti m4a in 1 min 9 s (109× tempo reale).
   Se il secondo motore non parte o si ferma, si prosegue con uno. Desktop, iPad, taglio senza
   ricodifica e WAV/FLAC invariati
+- **su Android uno ZIP su disco invece della cartella**: Chrome Android recente ha i selettori «Salva
+  file» e «cartella»; per i lavori lunghi l’app sceglieva la cartella (più passaggi, un solo motore).
+  Ora salva un unico ZIP scritto man mano: un tocco su «Salva» in «Download» e due motori. Sul tablet,
+  lezione di 8 h in 2 parti con l’app nascosta: da 9 min 6 s a 5 min 55 s. Cartella scelta a mano,
+  desktop e iPad invariati
 - **nessuna attesa infinita**: se il worker del motore muore tra un comando e l’altro, l’export si
   ferma con un messaggio dopo 90 s di tempo attivo invece di restare bloccato
 - **ogni azione ha un riscontro**: avvisi fissi in alto per errori (restano finché non li chiudi) e
   conferme (tagli e segnalibri con «Annulla», fine export e operazioni); dopo l'export l'app dice
-  dove trovare i file sul tuo dispositivo; su Android le parti arrivano come file separati, su
-  iPhone/iPad in uno ZIP
+  dove trovare i file sul tuo dispositivo; su Android uno ZIP salvato dove scegli (senza selettore
+  «Salva file»: file separati in «Download»), su iPhone/iPad in uno ZIP
 - **niente si sovrappone al pannello «Scarica»**: su desktop la colonna destra non ha scroll interno
   e, se è più alta dello schermo, si aggancia dal fondo (il pulsante finale resta visibile); barra
   «Taglia e scarica» e pannello di avanzamento fissi compaiono solo quando il pannello è fuori schermo

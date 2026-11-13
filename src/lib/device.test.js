@@ -117,6 +117,39 @@ describe('device', () => {
     assert.equal(resolveExportModeForDevice('zip-classic', desktop, { preference: 'auto' }).mode, 'zip-classic');
   });
 
+  it('Android con «Salva file» (Chrome 157 su Galaxy Tab S8): niente cartella, ZIP su disco', () => {
+    const picker = () => Promise.resolve({});
+    const tabS8 = {
+      navigator: { userAgent: 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36' },
+      showSaveFilePicker: picker,
+      showDirectoryPicker: picker,
+    };
+    const heavy = resolveExportModeForDevice('folder', tabS8, { preference: 'auto', segmentCount: 2 });
+    assert.equal(heavy.mode, 'zip-stream');
+    assert.match(heavy.note, /Salva/);
+    assert.equal(resolveExportModeForDevice('folder', tabS8, { preference: 'auto', segmentCount: 12 }).mode, 'zip-stream');
+    // Cartella scelta a mano: si rispetta.
+    assert.equal(resolveExportModeForDevice('folder', tabS8, { preference: 'folder' }).mode, 'folder');
+    // ZIP su disco già scelto dall'advisor: invariato.
+    assert.equal(resolveExportModeForDevice('zip-stream', tabS8, { preference: 'auto' }).mode, 'zip-stream');
+    // Android senza «Salva file»: la cartella resta l'unica scrittura su disco.
+    const { showSaveFilePicker, ...noSavePicker } = tabS8;
+    assert.equal(typeof showSaveFilePicker, 'function');
+    assert.equal(resolveExportModeForDevice('folder', noSavePicker, { preference: 'auto' }).mode, 'folder');
+    // Desktop e iPad: invariati.
+    const desktopChrome = {
+      navigator: { userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36' },
+      showSaveFilePicker: picker,
+      showDirectoryPicker: picker,
+    };
+    assert.equal(resolveExportModeForDevice('folder', desktopChrome, { preference: 'auto' }).mode, 'folder');
+    const iPad = {
+      navigator: { userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15', platform: 'MacIntel', maxTouchPoints: 5 },
+      showSaveFilePicker: picker,
+    };
+    assert.equal(resolveExportModeForDevice('folder', iPad, { preference: 'auto' }).mode, 'folder');
+  });
+
   it('warm-up motore solo su desktop adeguati, senza risparmio dati / 2G', () => {
     assert.equal(shouldWarmEngineInBackground(desktop), true);
     assert.equal(shouldWarmEngineInBackground(android), false);

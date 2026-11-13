@@ -79,3 +79,12 @@ Chromium (novembre 2026):
   nascosta: 0 parti in 7 min con l'interruttore spento, 4 su 4 con quello acceso.
   Da verificare sul tablet: servizio in primo piano e congelamento dei processi di
   Android/One UI, focus audio Samsung, velocità reale in background.
+
+## Verifica sul tablet (2026-11-13)
+
+Galaxy Tab S8 vero, Chrome 157, app nascosta con il tasto Home (dettagli in
+`PERFORMANCE-AUDIT.md`, «Prove sul Galaxy Tab S8 reale»): con il tono Chrome è un
+servizio in primo piano, nessun processo congelato fino a 9 minuti, ~85–90% della
+velocità visibile; notifica finale con l'esito, tolta al ritorno. Con l'interruttore
+spento: 4 volte più lento appena nascosto, pagina congelata dopo ~1 minuto. Restano
+da provare schermo spento/bloccato, musica di altre app, risparmio energetico.

@@ -3128,13 +3128,17 @@ export default function App() {
     });
     // Su iPhone/iPad i download multipli sono bloccati (1 per gesto): un unico ZIP.
     // Su Android oltre 2 parti i download in sequenza vengono bloccati dopo il
-    // primo: unico ZIP anche lì (vedi resolveExportModeForDevice).
+    // primo: unico ZIP anche lì. Su Android con «Salva file» la cartella
+    // diventa ZIP su disco (vedi resolveExportModeForDevice).
     const deviceMode = resolveExportModeForDevice(advice.mode, globalThis, {
       preference: exportDest,
       segmentCount: jobSegments.length,
     });
     const destMode = deviceMode.mode;
-    setAdvisorNote([...advice.reasons, ...advice.warnings, ...(deviceMode.note ? [deviceMode.note] : [])].join(' '));
+    // Destinazione cambiata per il dispositivo: i motivi dell'advisor
+    // descriverebbero l'altra (es. «Cartella su disco…»); vale la nota.
+    const adviceReasons = destMode === advice.mode ? advice.reasons : [];
+    setAdvisorNote([...adviceReasons, ...advice.warnings, ...(deviceMode.note ? [deviceMode.note] : [])].join(' '));
     // Trattiene i Blob per il re-download solo sotto soglia: sopra, solo metadati.
     // Su mobile la soglia è molto più bassa (i Blob trattengono RAM per l'intera sessione).
     const memoryBudget = outputMemoryPolicy();

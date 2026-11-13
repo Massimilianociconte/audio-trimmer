@@ -63,3 +63,12 @@ picco 381 / 600 / 753 / 735 MiB. Uscite identiche byte per byte.
   memoria con due motori, valore effettivo di `hardwareConcurrency`.
 - Prove: `src/lib/parallelExport.test.js`; scenari di interruzione in
   `scripts/tablet-interruption-audit.mjs` (sul profilo Galaxy il parallelo è attivo).
+
+## Verifica sul tablet (2026-11-13)
+
+Galaxy Tab S8 vero, Chrome 157: `deviceMemory` 8 e `hardwareConcurrency` 8, due
+motori attivi. 2 h → 4 parti M4A in 1 min 9 s; 8 h → 2 parti da nascosta in 5 min
+55 s (un motore: 9 min 17 s), scheda fino a ~940 MB, nessun calo per calore. Il
+secondo motore parte solo con la pagina controllata dal service worker (prima visita
+esclusa, come previsto). Su Android la destinazione «cartella» non viene più scelta
+in automatico: vedi `2026-11-13-android-zip-su-disco.md`.

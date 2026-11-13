@@ -238,6 +238,19 @@ export function resolveExportModeForDevice(mode, env = globalThis, { preference 
       note: 'Su iPhone/iPad uso un unico ZIP (iOS blocca i download multipli).',
     };
   }
+  // Chrome Android (provato su Galaxy Tab S8, Chrome 157) ha sia il selettore
+  // cartella sia «Salva file». La cartella parte dalla radice («Impossibile
+  // usare questa cartella»): bisogna entrare in una cartella, confermare e
+  // concedere l'accesso. «Salva file» si apre già su «Download» con un solo
+  // tasto «Salva». Lo ZIP su disco scrive comunque una parte alla volta
+  // (stessa RAM della cartella) e permette i due motori (lib/parallelExport.js).
+  if (mode === 'folder' && preference === 'auto' && isAndroid(env) && !isIOS(env)
+    && typeof env?.showSaveFilePicker === 'function') {
+    return {
+      mode: 'zip-stream',
+      note: 'Su Android salvo un unico ZIP scritto su disco man mano: basta toccare «Salva», senza scegliere una cartella.',
+    };
+  }
   // Android con 2 parti: i file singoli finiscono subito in «Download»,
   // pronti da ascoltare o condividere; uno ZIP va estratto (passo in più per
   // chi è poco pratico). Oltre 2 parti però i click programmatici in sequenza
